@@ -1,4 +1,4 @@
-//! 3D Tiles 1.1 streaming plugin (BEVY-3D-TILES-PLAN, phase T0).
+//! 3D Tiles 1.1 streaming plugin (BEVY-3D-TILES-PLAN, phases T0/T1).
 //!
 //! One traversal engine for tiled meshes (T0/T1), point clouds (T2), and
 //! splats (T3) — the generalization of the basemap streamer's proven
@@ -11,29 +11,30 @@
 //! * [`traversal`] — flattened tile tree + the per-frame selection algorithm
 //!   (per-tile geometricError SSE, zoom-out protection, frame-history
 //!   kicking, Urgent/Normal/Preload priorities — plan §7).
-//! * [`fetch`] — byte sources (HTTP range / file / memory) + the
-//!   never-block-the-executor task spawning discipline.
-//! * [`content`] — tile GLB → Bevy mesh/material decode (T0: mesh only).
+//! * [`fetch`] — byte sources (HTTP range / file / memory), Cache-Storage CAS
+//!   for tile entries, abort plumbing, and the never-block-the-executor task
+//!   spawning discipline.
+//! * [`content`] — tile GLB → mesh / point / splat data (plan D5: one
+//!   decoder, three renderers).
 //! * this module — ECS wiring: per-frame selection, the request scheduler
-//!   (priorities recomputed each frame, out-of-cut requests cancelled),
-//!   time-boxed content spawning, visibility cut, eviction.
+//!   (priorities recomputed each frame, out-of-cut requests aborted),
+//!   time-boxed content spawning, visibility cut, eviction, and the
+//!   attach/detach surface the asset loader drives (D6).
 //!
-//! **T0 scope**: the plugin only activates through a dev trigger — native
-//! `TT_TILES3D=fixture|<path>|<url>` env var, wasm `?tiles3d=fixture|<url>`
-//! query param. Resolver integration (D6 `"3dtiles"` renditions) lands with
-//! T1; nothing here touches the twin/preview asset paths yet.
-//!
-//! Cancellation note: a request that falls out of the cut is cancelled by
-//! state (its slot leaves `InFlight`, so the landed result is dropped via the
-//! generation guard and the concurrency slot frees immediately); the network
-//! transfer itself runs to completion. AbortController wiring is a T1
-//! follow-up alongside the Front Door HTTP/2 work (D10).
+//! **Anchoring (T1)**: a tileset attaches to an *anchor entity* — the twin
+//! entity (ENU placement + per-frame twin transform) or a preview root. The
+//! tileset's root entity is parented under the anchor with the rendition
+//! correction as its local transform, so tiles inherit world placement the
+//! exact way whole-file scenes do. Selection math runs in the tileset's local
+//! frame: the camera is pulled into that frame per set, which keeps SSE exact
+//! under rigid/uniform anchor transforms without rebuilding tree volumes.
+//! Dev-trigger tilesets (`TT_TILES3D=…` / `?tiles3d=…`) stay world-anchored.
 
 use std::sync::Arc;
 
 use bevy::camera::primitives::{Frustum, Sphere};
 use bevy::camera::Projection;
-use bevy::math::Vec3A;
+use bevy::math::{DMat4, DVec3, Vec3A};
 use bevy::prelude::*;
 use bevy::window::RequestRedraw;
 use bevy_panorbit_camera::PanOrbitCamera;
@@ -45,9 +46,11 @@ pub mod schema;
 pub mod traversal;
 
 use archive::Archive3tz;
-use content::DecodedPrimitive;
+use content::DecodedItem;
 use fetch::{ByteSource, ExplodedBase, TilesetSource};
 use traversal::{History, SelectParams, TileContent, TileTree, ZUP_TO_BEVY};
+
+use crate::plugins::scene_layout::TwinMeshGroup;
 
 /// Committed demo tileset (see `examples/gen_tiles3d_fixture.rs`). The path
 /// doubles as a relative URL under Trunk (assets are `copy-dir`'d) and a
@@ -83,6 +86,33 @@ impl Default for Tiles3dConfig {
     }
 }
 
+/// Attach a streaming tileset under an anchor entity (D6 resolver routing —
+/// sent by the asset loader for `"3dtiles"` renditions).
+#[derive(Message, Debug, Clone)]
+pub struct Tiles3dAttach {
+    /// Entity the tileset root parents under (twin entity / preview root).
+    /// Tile placement = anchor's world transform × `local` × tile transforms.
+    pub anchor: Entity,
+    /// `.3tz` blob URL (SAS-signed) or an exploded `tileset.json` URL.
+    pub url: String,
+    /// Per-rendition correction transform (pivot/facing/unit fix-up).
+    pub local: Transform,
+    /// Owning twin, when anchored to one — spawned tile content gets
+    /// `TwinMeshGroup` so click-select / highlight / focus keep working, and
+    /// the twin's placeholder cube clears on the first rendered cut.
+    pub twin_id: Option<String>,
+    /// Display label for logs/debug (asset id, twin id…).
+    pub label: String,
+}
+
+/// Tear down any tileset anchored to this entity (rebind / mode switch).
+/// Despawning the anchor outright works too — sets garbage-collect when
+/// their root entity dies with the hierarchy.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct Tiles3dDetach {
+    pub anchor: Entity,
+}
+
 /// Marker on each spawned tile root entity.
 #[derive(Component, Debug)]
 pub struct Tiles3dTile {
@@ -95,7 +125,8 @@ pub struct Tiles3dTile {
 enum TileSlot {
     NotLoaded,
     /// Fetch+decode task running; results carry the generation so a
-    /// cancelled-then-reissued tile drops the stale payload.
+    /// cancelled-then-reissued tile drops the stale payload. The generation
+    /// also keys the abort registry (`fetch::trigger_abort`).
     InFlight { generation: u64 },
     /// Content spawned (hidden until selected by the render cut).
     Ready { entity: Entity },
@@ -114,8 +145,14 @@ pub struct ActiveTileset {
     /// Frame each tile was last in the wanted set (eviction clock).
     last_touched: Vec<u64>,
     root_entity: Entity,
+    /// Anchor entity when attached via D6 (None = world-anchored dev set).
+    anchor: Option<Entity>,
+    /// Owning twin id (TwinMeshGroup tagging + placeholder clearing).
+    twin_id: Option<String>,
+    /// Whether the anchor's placeholder cube has been stripped yet.
+    placeholder_cleared: bool,
     /// Last logged render-cut shape `(tiles, min_depth, max_depth)` —
-    /// transitions are the observable trace of LOD swaps (dev trigger only).
+    /// transitions are the observable trace of LOD swaps.
     last_cut: Option<(usize, u32, u32)>,
 }
 
@@ -123,6 +160,15 @@ pub struct ActiveTileset {
 #[derive(Resource, Default)]
 pub struct Tiles3dSets {
     sets: Vec<ActiveTileset>,
+    /// Anchors whose tileset open is still in flight — counted by
+    /// [`Tiles3dSets::has_anchor`] so the asset loader doesn't double-attach
+    /// while `tileset.json` streams, and cleared by a detach so the landing
+    /// open is dropped instead of resurrecting a torn-down anchor.
+    pending_anchors: std::collections::HashSet<Entity>,
+    /// Anchors whose open failed terminally — never retried for the same
+    /// entity (no per-frame retry storms; a respawned twin is a new entity
+    /// and gets a fresh attempt).
+    failed_anchors: std::collections::HashSet<Entity>,
     frame: u64,
     next_set_id: u64,
     next_generation: u64,
@@ -149,12 +195,38 @@ impl Tiles3dSets {
         }
         Tiles3dDebug { tilesets: self.sets.len(), resident, in_flight }
     }
+
+    /// Whether `anchor` is taken: streaming, opening, or terminally failed.
+    /// The asset loader treats `true` as "nothing to do this frame".
+    pub fn has_anchor(&self, anchor: Entity) -> bool {
+        self.pending_anchors.contains(&anchor)
+            || self.failed_anchors.contains(&anchor)
+            || self.sets.iter().any(|s| s.anchor == Some(anchor))
+    }
+
+    /// Root-volume bounding sphere of the tileset anchored to `anchor`, in
+    /// the tileset's local (root-entity) frame — for camera framing. The
+    /// caller composes the root entity's `GlobalTransform`.
+    pub fn root_volume_for_anchor(&self, anchor: Entity) -> Option<(Entity, Vec3, f32)> {
+        let set = self.sets.iter().find(|s| s.anchor == Some(anchor))?;
+        let (center, radius) = set.tree.nodes.first()?.volume.bounding_sphere();
+        Some((set.root_entity, center.as_vec3(), radius as f32))
+    }
+}
+
+/// Anchor info carried through the async tileset open.
+#[derive(Debug, Clone)]
+struct AttachTarget {
+    anchor: Entity,
+    local: Transform,
+    twin_id: Option<String>,
 }
 
 /// Async-task → ECS messages.
 enum Tiles3dMsg {
     TilesetOpened {
         label: String,
+        attach: Option<AttachTarget>,
         /// Boxed: a parsed tileset tree dwarfs the per-tile variant.
         result: Result<(TilesetSource, Box<schema::Tileset>), String>,
     },
@@ -162,7 +234,7 @@ enum Tiles3dMsg {
         set_id: u64,
         tile: usize,
         generation: u64,
-        result: Result<Vec<DecodedPrimitive>, String>,
+        result: Result<Vec<DecodedItem>, String>,
     },
 }
 
@@ -186,8 +258,13 @@ impl Plugin for Tiles3dPlugin {
         app.init_resource::<Tiles3dConfig>()
             .init_resource::<Tiles3dSets>()
             .init_resource::<Tiles3dChannel>()
+            .add_message::<Tiles3dAttach>()
+            .add_message::<Tiles3dDetach>()
             .add_systems(Startup, init_dev_tileset)
-            .add_systems(Update, (receive_tiles3d, drive_tiles3d).chain());
+            .add_systems(
+                Update,
+                (apply_attach_detach, receive_tiles3d, drive_tiles3d).chain(),
+            );
     }
 }
 
@@ -212,15 +289,75 @@ fn init_dev_tileset(channel: Res<Tiles3dChannel>) {
     let Some(spec) = dev_source_spec() else { return };
     let spec = if spec == "fixture" { FIXTURE_SPEC.to_string() } else { spec };
     info!("tiles3d: dev trigger — opening {spec}");
-    spawn_tileset_open(spec, channel.tx.clone());
+    spawn_tileset_open(spec, None, channel.tx.clone());
+}
+
+/// Drain attach/detach messages from the asset loader (D6 routing).
+fn apply_attach_detach(
+    mut attaches: MessageReader<Tiles3dAttach>,
+    mut detaches: MessageReader<Tiles3dDetach>,
+    channel: Res<Tiles3dChannel>,
+    mut sets: ResMut<Tiles3dSets>,
+    mut commands: Commands,
+) {
+    for msg in detaches.read() {
+        // Cancel a still-opening attach: when its TilesetOpened lands, the
+        // missing pending entry drops it. A rebind also forgives an earlier
+        // terminal failure — the new asset deserves its own attempt.
+        sets.pending_anchors.remove(&msg.anchor);
+        sets.failed_anchors.remove(&msg.anchor);
+        let Tiles3dSets { sets, .. } = &mut *sets;
+        sets.retain(|set| {
+            if set.anchor != Some(msg.anchor) {
+                return true;
+            }
+            info!("tiles3d: detaching {} from {:?}", set.label, msg.anchor);
+            abort_in_flight(set);
+            if let Ok(mut e) = commands.get_entity(set.root_entity) {
+                e.despawn();
+            }
+            false
+        });
+    }
+    for msg in attaches.read() {
+        // One set per anchor: duplicate sends (resolver retries while the
+        // open is in flight) are absorbed here.
+        if sets.has_anchor(msg.anchor) {
+            continue;
+        }
+        info!("tiles3d: attaching {} ({}) to {:?}", msg.label, msg.url, msg.anchor);
+        sets.pending_anchors.insert(msg.anchor);
+        spawn_tileset_open(
+            msg.url.clone(),
+            Some(AttachTarget {
+                anchor: msg.anchor,
+                local: msg.local,
+                twin_id: msg.twin_id.clone(),
+            }),
+            channel.tx.clone(),
+        );
+    }
+}
+
+/// Abort every in-flight request of a set (detach/GC path).
+fn abort_in_flight(set: &ActiveTileset) {
+    for slot in &set.slots {
+        if let TileSlot::InFlight { generation } = slot {
+            fetch::trigger_abort(*generation);
+        }
+    }
 }
 
 /// Open a tileset (async): resolve the source kind, fetch + parse the root
 /// `tileset.json`, report back on the channel.
-fn spawn_tileset_open(spec: String, tx: crossbeam_channel::Sender<Tiles3dMsg>) {
+fn spawn_tileset_open(
+    spec: String,
+    attach: Option<AttachTarget>,
+    tx: crossbeam_channel::Sender<Tiles3dMsg>,
+) {
     fetch::spawn_io(async move {
         let result = open_tileset(&spec).await;
-        let _ = tx.send(Tiles3dMsg::TilesetOpened { label: spec, result });
+        let _ = tx.send(Tiles3dMsg::TilesetOpened { label: spec, attach, result });
     });
 }
 
@@ -271,7 +408,7 @@ async fn open_tileset(spec: &str) -> Result<(TilesetSource, Box<schema::Tileset>
         TilesetSource::Exploded(exploded)
     };
     let bytes = source
-        .read_entry("tileset.json")
+        .read_entry_cached("tileset.json", None)
         .await
         .map_err(|e| format!("fetch tileset.json: {e}"))?;
     let tileset = schema::parse_tileset(&bytes).map_err(|e| format!("parse tileset.json: {e}"))?;
@@ -283,6 +420,7 @@ async fn open_tileset(spec: &str) -> Result<(TilesetSource, Box<schema::Tileset>
 /// Drain async results into the ECS, time-boxed: at most
 /// `max_spawns_per_frame` content spawns per frame (§7's main-thread budget);
 /// the rest stay queued in the channel for the next frame.
+#[allow(clippy::too_many_arguments)]
 fn receive_tiles3d(
     channel: Res<Tiles3dChannel>,
     config: Res<Tiles3dConfig>,
@@ -290,29 +428,46 @@ fn receive_tiles3d(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut clouds: ResMut<Assets<bevy_pointcloud::point_cloud::PointCloud>>,
+    mut splats: ResMut<Assets<bevy_gaussian_splatting::PlanarGaussian3d>>,
+    shared_point_material: Res<crate::plugins::point_cloud::SharedPointMaterial>,
     mut commands: Commands,
 ) {
     let mut spawned = 0usize;
     while spawned < config.max_spawns_per_frame {
         let Ok(msg) = channel.rx.try_recv() else { break };
         match msg {
-            Tiles3dMsg::TilesetOpened { label, result } => match result {
+            Tiles3dMsg::TilesetOpened { label, attach, result } => match result {
                 Ok((source, tileset)) => {
-                    // T0: tilesets are local-metres at the world origin
-                    // (fixture / dev URLs). Twin-anchored ENU placement
-                    // composes in with D6 resolver integration (T1).
+                    // An anchored open must still be wanted (not detached
+                    // while in flight) and its anchor must still exist (the
+                    // twin/preview may have despawned during the fetch).
+                    if let Some(a) = &attach {
+                        let still_pending = sets.pending_anchors.remove(&a.anchor);
+                        if !still_pending || commands.get_entity(a.anchor).is_err() {
+                            info!("tiles3d: {label}: anchor gone before open finished — dropping");
+                            continue;
+                        }
+                    }
+                    // Tilesets are local-metres Z-up at their own origin; the
+                    // anchor entity (twin/preview, when present) carries the
+                    // ENU/world placement, so the tree itself only converts
+                    // Z-up → Bevy. Dev sets sit at the world origin.
+                    let anchor = attach.as_ref().map(|a| a.anchor);
                     match TileTree::build(&tileset, ZUP_TO_BEVY) {
                         Ok(tree) => {
                             let n = tree.len();
                             let id = sets.next_set_id;
                             sets.next_set_id += 1;
-                            let root_entity = commands
-                                .spawn((
-                                    Name::new(format!("Tiles3d({label})")),
-                                    Transform::IDENTITY,
-                                    Visibility::default(),
-                                ))
-                                .id();
+                            let mut root = commands.spawn((
+                                Name::new(format!("Tiles3d({label})")),
+                                attach.as_ref().map(|a| a.local).unwrap_or_default(),
+                                Visibility::default(),
+                            ));
+                            if let Some(a) = &attach {
+                                root.insert(ChildOf(a.anchor));
+                            }
+                            let root_entity = root.id();
                             let mut history = History::default();
                             history.resize(n);
                             info!("tiles3d: {label}: {n} tiles");
@@ -325,13 +480,27 @@ fn receive_tiles3d(
                                 history,
                                 last_touched: vec![0; n],
                                 root_entity,
+                                anchor: attach.as_ref().map(|a| a.anchor),
+                                twin_id: attach.and_then(|a| a.twin_id),
+                                placeholder_cleared: false,
                                 last_cut: None,
                             });
                         }
-                        Err(e) => error!("tiles3d: {label}: unusable tileset: {e}"),
+                        Err(e) => {
+                            if let Some(anchor) = anchor {
+                                sets.failed_anchors.insert(anchor);
+                            }
+                            error!("tiles3d: {label}: unusable tileset: {e}");
+                        }
                     }
                 }
-                Err(e) => error!("tiles3d: {label}: {e}"),
+                Err(e) => {
+                    if let Some(a) = &attach {
+                        sets.pending_anchors.remove(&a.anchor);
+                        sets.failed_anchors.insert(a.anchor);
+                    }
+                    error!("tiles3d: {label}: {e}");
+                }
             },
             Tiles3dMsg::TileContent { set_id, tile, generation, result } => {
                 let Some(set) = sets.sets.iter_mut().find(|s| s.id == set_id) else {
@@ -346,16 +515,19 @@ fn receive_tiles3d(
                     continue;
                 }
                 match result {
-                    Ok(prims) => {
+                    Ok(items) => {
                         spawned += 1;
                         let entity = spawn_tile_content(
                             &mut commands,
                             &mut meshes,
                             &mut materials,
                             &mut images,
+                            &mut clouds,
+                            &mut splats,
+                            &shared_point_material,
                             set,
                             tile,
-                            prims,
+                            items,
                         );
                         set.slots[tile] = TileSlot::Ready { entity };
                     }
@@ -372,16 +544,22 @@ fn receive_tiles3d(
     }
 }
 
-/// Spawn one tile's decoded primitives under a hidden tile-root entity. The
-/// render cut flips the root's visibility; children inherit.
+/// Spawn one tile's decoded items under a hidden tile-root entity. The
+/// render cut flips the root's visibility; children inherit. Twin-anchored
+/// sets tag content with `TwinMeshGroup` so selection/highlight/focus treat
+/// tiles like any other twin geometry.
+#[allow(clippy::too_many_arguments)]
 fn spawn_tile_content(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
+    clouds: &mut Assets<bevy_pointcloud::point_cloud::PointCloud>,
+    splats: &mut Assets<bevy_gaussian_splatting::PlanarGaussian3d>,
+    shared_point_material: &crate::plugins::point_cloud::SharedPointMaterial,
     set: &ActiveTileset,
     tile: usize,
-    prims: Vec<DecodedPrimitive>,
+    items: Vec<DecodedItem>,
 ) -> Entity {
     let node = &set.tree.nodes[tile];
     let tile_root = commands
@@ -395,30 +573,59 @@ fn spawn_tile_content(
             Name::new(format!("Tiles3dTile({} #{tile})", set.label)),
         ))
         .id();
-    for prim in prims {
-        let material = StandardMaterial {
-            base_color: Color::LinearRgba(LinearRgba::new(
-                prim.material.base_color[0],
-                prim.material.base_color[1],
-                prim.material.base_color[2],
-                prim.material.base_color[3],
-            )),
-            base_color_texture: prim.material.base_color_image.map(|img| images.add(img)),
-            metallic: prim.material.metallic,
-            perceptual_roughness: prim.material.roughness,
-            cull_mode: if prim.material.double_sided {
-                None
-            } else {
-                Some(bevy::render::render_resource::Face::Back)
-            },
-            ..default()
+    let group = set.twin_id.as_ref().map(|tid| TwinMeshGroup { twin_id: tid.clone() });
+    for item in items {
+        let child = match item {
+            DecodedItem::Mesh(prim) => {
+                let material = StandardMaterial {
+                    base_color: Color::LinearRgba(LinearRgba::new(
+                        prim.material.base_color[0],
+                        prim.material.base_color[1],
+                        prim.material.base_color[2],
+                        prim.material.base_color[3],
+                    )),
+                    base_color_texture: prim.material.base_color_image.map(|img| images.add(img)),
+                    metallic: prim.material.metallic,
+                    perceptual_roughness: prim.material.roughness,
+                    cull_mode: if prim.material.double_sided {
+                        None
+                    } else {
+                        Some(bevy::render::render_resource::Face::Back)
+                    },
+                    ..default()
+                };
+                commands
+                    .spawn((
+                        Mesh3d(meshes.add(prim.mesh)),
+                        MeshMaterial3d(materials.add(material)),
+                        Transform::from_matrix(prim.transform),
+                        ChildOf(tile_root),
+                    ))
+                    .id()
+            }
+            DecodedItem::Points { transform, points } => commands
+                .spawn((
+                    crate::plugins::point_cloud::cloud_components(
+                        clouds.add(bevy_pointcloud::point_cloud::PointCloud { points }),
+                        shared_point_material,
+                    ),
+                    Transform::from_matrix(transform),
+                    ChildOf(tile_root),
+                ))
+                .id(),
+            DecodedItem::Splat { transform, gaussians } => commands
+                .spawn((
+                    crate::plugins::splat::splat_components(splats.add(
+                        bevy_gaussian_splatting::PlanarGaussian3d::from(gaussians),
+                    )),
+                    Transform::from_matrix(transform),
+                    ChildOf(tile_root),
+                ))
+                .id(),
         };
-        commands.spawn((
-            Mesh3d(meshes.add(prim.mesh)),
-            MeshMaterial3d(materials.add(material)),
-            Transform::from_matrix(prim.transform),
-            ChildOf(tile_root),
-        ));
+        if let Some(group) = &group {
+            commands.entity(child).insert(group.clone());
+        }
     }
     tile_root
 }
@@ -427,18 +634,34 @@ fn spawn_tile_content(
 
 /// Run the selection pass per tileset, apply the render cut as visibility,
 /// schedule loads by priority (recomputed every frame, out-of-cut requests
-/// cancelled), and evict stale residents.
+/// aborted), and evict stale residents.
+#[allow(clippy::too_many_arguments)]
 fn drive_tiles3d(
     config: Res<Tiles3dConfig>,
     channel: Res<Tiles3dChannel>,
     mut sets: ResMut<Tiles3dSets>,
     camera: Query<(&Camera, &GlobalTransform, &Projection, &Frustum), With<PanOrbitCamera>>,
+    transforms: Query<&GlobalTransform>,
     mut vis_q: Query<&mut Visibility, With<Tiles3dTile>>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut commands: Commands,
 ) {
     let Tiles3dSets { sets, frame, next_generation, .. } = &mut *sets;
     *frame += 1;
+
+    // GC: an anchored set whose root entity died (anchor despawned — the
+    // hierarchy took the root and every tile entity with it) is torn down
+    // here; its in-flight requests abort and late results drop harmlessly.
+    // (`pending_anchors` / `failed_anchors` keep dead Entity ids — harmless:
+    // entity generations never repeat, and the per-id cost is 8 bytes.)
+    sets.retain(|set| {
+        if set.anchor.is_none() || transforms.contains(set.root_entity) {
+            return true;
+        }
+        info!("tiles3d: {}: anchor gone — dropping tileset", set.label);
+        abort_in_flight(set);
+        false
+    });
     if sets.is_empty() {
         return;
     }
@@ -450,15 +673,34 @@ fn drive_tiles3d(
     };
     let viewport_h = cam.logical_viewport_size().map(|v| v.y as f64).unwrap_or(1080.0);
     let k_px = viewport_h / (2.0 * (fov_y * 0.5).tan()).max(1e-6);
-    let params = SelectParams {
-        cam_pos: cam_gt.translation().as_dvec3(),
-        cam_forward: Vec3::from(cam_gt.forward()).as_dvec3(),
-        k_px,
-        sse_threshold_px: config.sse_threshold_px,
-    };
+    let cam_pos_world = cam_gt.translation().as_dvec3();
+    let cam_forward_world = Vec3::from(cam_gt.forward()).as_dvec3();
 
     let mut any_in_flight = false;
     for set in sets.iter_mut() {
+        // The set's frame: world_from_set = anchor chain × correction (the
+        // root entity's GlobalTransform — last frame's propagation, fine for
+        // streaming decisions). Selection runs in set-local coordinates:
+        // distances and geometric errors share the tileset's metres, so SSE
+        // is exact under rigid/uniform anchor transforms — no per-frame
+        // volume rebuilds for moving twins.
+        let world_from_set = transforms
+            .get(set.root_entity)
+            .map(|gt| gt.to_matrix().as_dmat4())
+            .unwrap_or(DMat4::IDENTITY);
+        let set_from_world = world_from_set.inverse();
+        let set_scale = traversal::max_scale(&world_from_set).max(1e-12);
+        let cam_pos = set_from_world.transform_point3(cam_pos_world);
+        let cam_forward = set_from_world
+            .transform_vector3(cam_forward_world)
+            .normalize_or(DVec3::NEG_Z);
+        let params = SelectParams {
+            cam_pos,
+            cam_forward,
+            k_px,
+            sse_threshold_px: config.sse_threshold_px,
+        };
+
         // Content readiness as the traversal sees it.
         let tiles_content: Vec<TileContent> = set
             .slots
@@ -479,9 +721,13 @@ fn drive_tiles3d(
 
         let tree = &set.tree;
         let culled = |i: usize| {
+            // Frustum test happens in world space: local volume → world.
             let (center, radius) = tree.nodes[i].volume.bounding_sphere();
-            let sphere =
-                Sphere { center: Vec3A::from(center.as_vec3()), radius: radius as f32 };
+            let world_center = world_from_set.transform_point3(center);
+            let sphere = Sphere {
+                center: Vec3A::from(world_center.as_vec3()),
+                radius: (radius * set_scale) as f32,
+            };
             // `intersect_far = false`, like the basemap: distant tiles coarsen
             // via SSE; clipping handles the rest.
             !frustum.intersects_sphere(&sphere, false)
@@ -512,15 +758,31 @@ fn drive_tiles3d(
             }
         }
 
-        // Scheduler. Cancel-by-state first: an in-flight tile that fell out
-        // of this frame's wanted loads frees its slot now; its landed payload
-        // is dropped by the InFlight/generation guard in `receive_tiles3d`.
+        // First painted cut: strip the anchor's placeholder cube geometry
+        // (same contract as `bind_spawned_scenes` for whole-file scenes —
+        // remove `Mesh3d`, keep the entity as the transform anchor).
+        if !set.placeholder_cleared && !sel.render.is_empty() && set.twin_id.is_some() {
+            if let Some(anchor) = set.anchor
+                && let Ok(mut e) = commands.get_entity(anchor)
+            {
+                e.remove::<Mesh3d>();
+            }
+            set.placeholder_cleared = true;
+        }
+
+        // Scheduler. Cancel first: an in-flight tile that fell out of this
+        // frame's wanted loads aborts its network transfer (T1) and frees its
+        // slot now; a landed stale payload is dropped by the
+        // InFlight/generation guard in `receive_tiles3d`.
         let mut wanted = vec![false; tree.len()];
         for req in &sel.loads {
             wanted[req.tile] = true;
         }
         for (i, slot) in set.slots.iter_mut().enumerate() {
-            if matches!(slot, TileSlot::InFlight { .. }) && !wanted[i] {
+            if let TileSlot::InFlight { generation } = slot
+                && !wanted[i]
+            {
+                fetch::trigger_abort(*generation);
                 *slot = TileSlot::NotLoaded;
             }
         }
@@ -539,16 +801,18 @@ fn drive_tiles3d(
             *next_generation += 1;
             set.slots[req.tile] = TileSlot::InFlight { generation };
             in_flight += 1;
+            let abort = fetch::register_abort(generation);
             let source = set.source.clone();
             let tx = channel.tx.clone();
             let (set_id, tile) = (set.id, req.tile);
             fetch::spawn_io(async move {
                 // Fetch + decode entirely inside the task (wasm: every IO step
                 // awaits a JS future and yields; decode is small-tile CPU).
-                let result = match source.read_entry(&uri).await {
+                let result = match source.read_entry_cached(&uri, Some(&abort)).await {
                     Ok(bytes) => content::decode_glb(&bytes),
                     Err(e) => Err(e.to_string()),
                 };
+                fetch::unregister_abort(generation);
                 // Receiver gone (plugin torn down) is fine — drop silently.
                 let _ = tx.send(Tiles3dMsg::TileContent { set_id, tile, generation, result });
             });
@@ -654,8 +918,8 @@ mod tests {
         for node in &tree.nodes {
             let uri = node.content_uri.as_ref().expect("all fixture tiles carry content");
             let glb = block_on(source.read_entry(uri)).expect("fixture glb");
-            let prims = content::decode_glb(&glb).expect("decode");
-            assert!(!prims.is_empty(), "{uri} has geometry");
+            let items = content::decode_glb(&glb).expect("decode");
+            assert!(!items.is_empty(), "{uri} has geometry");
         }
     }
 
@@ -672,5 +936,21 @@ mod tests {
         let uri = tree.nodes[5].content_uri.clone().unwrap();
         let glb = block_on(ar.read_entry(&uri)).expect("tile glb via ranged read");
         assert!(content::decode_glb(&glb).is_ok());
+    }
+
+    /// Aborting a registered generation flips its handle; a triggered source
+    /// read returns `Aborted` instead of bytes.
+    #[test]
+    fn abort_registry_cancels_reads() {
+        let abort = fetch::register_abort(987_654);
+        assert!(!abort.is_triggered());
+        fetch::trigger_abort(987_654);
+        assert!(abort.is_triggered());
+        let src = ByteSource::Mem(Arc::new(vec![0u8; 64]));
+        let res = block_on(src.read_abortable(0, 8, Some(&abort)));
+        assert!(matches!(res, Err(fetch::FetchError::Aborted)));
+        fetch::unregister_abort(987_654);
+        // Unregistered generations are no-ops.
+        fetch::trigger_abort(987_654);
     }
 }

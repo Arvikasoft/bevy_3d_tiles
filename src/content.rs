@@ -1,12 +1,21 @@
-//! Tile content decode: GLB bytes → Bevy mesh/material data (T0: mesh tiles
-//! only; point + splat tile content land with T2/T3 and feed the existing
-//! `PointCloud` / `PlanarGaussian3d` renderers per D5).
+//! Tile content decode: GLB bytes → renderable data for the three content
+//! types (plan D5) — triangle meshes (T0/T1), point clouds (T2), Gaussian
+//! splats (T3). One decoder, three outputs, feeding the existing renderers
+//! (`Mesh3d`, vendored `PointCloud`, `PlanarGaussian3d`).
 //!
-//! Decodes via the `gltf` crate (no `import` feature — that would pull the
-//! `image` crate; embedded textures decode through Bevy's `Image::from_buffer`
-//! with the png/jpeg features the GLB twin pipeline already enables). Runs
-//! entirely inside the loader task, off the frame loop: the output is plain
-//! `Send` data (`Mesh`, `Image`) that the ECS drain turns into entities.
+//! Mesh + point tiles decode via the `gltf` crate (no `import` feature — that
+//! would pull the `image` crate; embedded textures decode through Bevy's
+//! `Image::from_buffer` with the png/jpeg features the GLB twin pipeline
+//! already enables). Splat tiles can NOT go through the `gltf` crate: the
+//! `KHR_gaussian_splatting` extension (RC) names its vertex attributes
+//! `KHR_gaussian_splatting:ROTATION` etc. — not `_`-prefixed — which
+//! `gltf-json` rejects as invalid semantics at validation. Splat tiles get a
+//! minimal raw JSON+BIN decoder instead ([`decode_splat_gltf`]); our tiler
+//! (D3/D4) emits float accessors and single-node scenes, and the decoder
+//! checks enough structure to fail cleanly on anything else.
+//!
+//! Everything runs inside the loader task, off the frame loop: outputs are
+//! plain `Send` data the ECS drain turns into entities.
 //!
 //! Tile GLBs are self-contained by construction (D1/D3: our tilers emit
 //! GLB-with-BIN-chunk). External buffer/image URIs are rejected with a clear
@@ -15,8 +24,10 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{CompressedImageFormats, Image, ImageSampler, ImageType};
-use bevy::math::Mat4;
+use bevy::math::{Mat4, Vec3};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
+use bevy_gaussian_splatting::gaussian::formats::planar_3d::Gaussian3d;
+use bevy_pointcloud::point_cloud::PointCloudData;
 
 /// One decoded glTF primitive, positioned by its node's global transform
 /// (glTF Y-up frame — the spawned tile entity applies
@@ -25,6 +36,18 @@ pub struct DecodedPrimitive {
     pub transform: Mat4,
     pub mesh: Mesh,
     pub material: DecodedMaterial,
+}
+
+/// One decoded piece of tile content. A tile may carry several (multiple
+/// primitives / nodes); the spawn step turns each into a child entity.
+pub enum DecodedItem {
+    Mesh(Box<DecodedPrimitive>),
+    /// `POINTS`-mode primitive (positions + COLOR_0) → vendored point renderer.
+    Points { transform: Mat4, points: Vec<PointCloudData> },
+    /// `KHR_gaussian_splatting` primitive → `PlanarGaussian3d` renderer.
+    /// Gaussians are in the primitive's local (glTF Y-up) frame; padded to a
+    /// multiple of 32 like the crate's own ply path.
+    Splat { transform: Mat4, gaussians: Vec<Gaussian3d> },
 }
 
 /// Material inputs resolved at decode time; turned into a `StandardMaterial`
@@ -50,8 +73,17 @@ impl Default for DecodedMaterial {
     }
 }
 
-/// Decode a GLB (or self-contained glTF JSON) tile into renderable primitives.
-pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedPrimitive>, String> {
+/// Decode a GLB (or self-contained glTF JSON) tile into renderable items.
+pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
+    // Splat tiles bypass the gltf crate entirely (see module docs). The
+    // marker check is a cheap substring scan of the JSON chunk.
+    let (json, bin) = split_glb(bytes)?;
+    if memmem(json, b"KHR_gaussian_splatting") {
+        let value: serde_json::Value =
+            serde_json::from_slice(json).map_err(|e| format!("splat tile json: {e}"))?;
+        return decode_splat_gltf(&value, bin);
+    }
+
     let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| format!("gltf parse: {e}"))?;
     let doc = gltf.document;
     let blob = gltf.blob;
@@ -66,6 +98,39 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedPrimitive>, String> {
     Ok(out)
 }
 
+/// Split a GLB container into its JSON chunk and optional BIN chunk. Bytes
+/// without the `glTF` magic are treated as a bare JSON glTF (no buffer).
+fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
+    if bytes.len() < 4 || &bytes[0..4] != b"glTF" {
+        return Ok((bytes, None));
+    }
+    if bytes.len() < 12 {
+        return Err("glb truncated before header end".into());
+    }
+    let mut at = 12; // skip magic + version + length
+    let mut json: Option<&[u8]> = None;
+    let mut bin: Option<&[u8]> = None;
+    while at + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[at + 4..at + 8];
+        let body = bytes
+            .get(at + 8..at + 8 + len)
+            .ok_or_else(|| format!("glb chunk at {at} overruns the buffer"))?;
+        match kind {
+            b"JSON" => json = Some(body),
+            b"BIN\0" => bin = Some(body),
+            _ => {}
+        }
+        at += 8 + len;
+    }
+    Ok((json.ok_or("glb has no JSON chunk")?, bin))
+}
+
+/// Naive substring scan (the JSON chunk is small; no memmem dependency).
+fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Resolve a glTF buffer: GLB BIN chunk only (tiles are self-contained).
 fn resolve_buffer<'b>(buffer: &gltf::Buffer<'_>, blob: Option<&'b [u8]>) -> Option<&'b [u8]> {
     match buffer.source() {
@@ -78,17 +143,24 @@ fn decode_node(
     node: &gltf::Node<'_>,
     parent: Mat4,
     blob: Option<&[u8]>,
-    out: &mut Vec<DecodedPrimitive>,
+    out: &mut Vec<DecodedItem>,
 ) -> Result<(), String> {
     let global = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
-            if primitive.mode() != gltf::mesh::Mode::Triangles {
-                // Points/lines tiles are T2/T3 content types; skip quietly so
-                // a mixed-content tile still shows its triangles.
-                continue;
+            match primitive.mode() {
+                gltf::mesh::Mode::Triangles => {
+                    out.push(DecodedItem::Mesh(Box::new(decode_primitive(
+                        &primitive, global, blob,
+                    )?)));
+                }
+                gltf::mesh::Mode::Points => {
+                    out.push(decode_points(&primitive, global, blob)?);
+                }
+                // Lines/strips/fans: nothing renders them — skip quietly so a
+                // mixed-content tile still shows what it can.
+                _ => continue,
             }
-            out.push(decode_primitive(&primitive, global, blob)?);
         }
     }
     for child in node.children() {
@@ -142,6 +214,33 @@ fn decode_primitive(
     Ok(DecodedPrimitive { transform, mesh, material })
 }
 
+/// `POINTS`-mode primitive → point-renderer data. Positions stay in the glTF
+/// Y-up content frame (the tile entity transform places them); COLOR_0 when
+/// present, white otherwise. `point_size: -1.0` = the shared material's
+/// screen-space size, matching the whole-file LAZ loader.
+fn decode_points(
+    primitive: &gltf::Primitive<'_>,
+    transform: Mat4,
+    blob: Option<&[u8]>,
+) -> Result<DecodedItem, String> {
+    let reader = primitive.reader(|buffer| resolve_buffer(&buffer, blob));
+    let positions = reader
+        .read_positions()
+        .ok_or("points primitive has no POSITION (or buffer is an external URI)")?;
+    let mut colors = reader.read_colors(0).map(|c| c.into_rgba_f32());
+    let points: Vec<PointCloudData> = positions
+        .map(|p| PointCloudData {
+            position: Vec3::from(p),
+            point_size: -1.0,
+            color: colors
+                .as_mut()
+                .and_then(|c| c.next())
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]),
+        })
+        .collect();
+    Ok(DecodedItem::Points { transform, points })
+}
+
 fn decode_material(
     material: &gltf::Material<'_>,
     blob: Option<&[u8]>,
@@ -179,6 +278,263 @@ fn decode_material(
                 return Err("external texture URIs unsupported in tile content".into());
             }
         }
+    }
+    Ok(out)
+}
+
+// ── Raw KHR_gaussian_splatting decode ────────────────────────────────────────
+
+/// Spec attribute names (KHR_gaussian_splatting RC).
+const ATTR_ROTATION: &str = "KHR_gaussian_splatting:ROTATION";
+const ATTR_SCALE: &str = "KHR_gaussian_splatting:SCALE";
+const ATTR_OPACITY: &str = "KHR_gaussian_splatting:OPACITY";
+const ATTR_SH0: &str = "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0";
+
+/// `SH_0` basis constant: `color = 0.5 + C0 × f_dc` (and its inverse for the
+/// COLOR_0 fallback).
+const SH_C0: f32 = 0.282_095;
+
+/// Decode every splat primitive in a raw glTF document. Node transforms are
+/// honored (matrix or TRS); non-splat primitives in the same file are skipped.
+fn decode_splat_gltf(
+    json: &serde_json::Value,
+    bin: Option<&[u8]>,
+) -> Result<Vec<DecodedItem>, String> {
+    let mut out = Vec::new();
+    let scene_ix = json["scene"].as_u64().unwrap_or(0) as usize;
+    let roots = json["scenes"][scene_ix]["nodes"]
+        .as_array()
+        .ok_or("splat tile has no scene nodes")?;
+    for root in roots {
+        let ix = root.as_u64().ok_or("bad node index")? as usize;
+        decode_splat_node(json, bin, ix, Mat4::IDENTITY, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn decode_splat_node(
+    json: &serde_json::Value,
+    bin: Option<&[u8]>,
+    node_ix: usize,
+    parent: Mat4,
+    out: &mut Vec<DecodedItem>,
+) -> Result<(), String> {
+    let node = &json["nodes"][node_ix];
+    if node.is_null() {
+        return Err(format!("node {node_ix} out of bounds"));
+    }
+    let global = parent * node_transform(node);
+    if let Some(mesh_ix) = node["mesh"].as_u64() {
+        let prims = json["meshes"][mesh_ix as usize]["primitives"]
+            .as_array()
+            .ok_or("mesh without primitives")?;
+        for prim in prims {
+            let attrs = &prim["attributes"];
+            if attrs[ATTR_ROTATION].is_null() {
+                continue; // not a splat primitive
+            }
+            out.push(DecodedItem::Splat {
+                transform: global,
+                gaussians: decode_splat_primitive(json, bin, attrs)?,
+            });
+        }
+    }
+    if let Some(children) = node["children"].as_array() {
+        for child in children {
+            let ix = child.as_u64().ok_or("bad child index")? as usize;
+            decode_splat_node(json, bin, ix, global, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// A raw glTF node's local transform: `matrix` (column-major) or TRS.
+fn node_transform(node: &serde_json::Value) -> Mat4 {
+    if let Some(m) = node["matrix"].as_array() {
+        let vals: Vec<f32> = m.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
+        if vals.len() == 16 {
+            return Mat4::from_cols_array(&vals.try_into().unwrap());
+        }
+    }
+    let vec3 = |key: &str, default: [f32; 3]| -> bevy::math::Vec3 {
+        node[key]
+            .as_array()
+            .and_then(|a| {
+                let v: Vec<f32> =
+                    a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
+                <[f32; 3]>::try_from(v).ok()
+            })
+            .map(bevy::math::Vec3::from)
+            .unwrap_or(bevy::math::Vec3::from(default))
+    };
+    let rotation = node["rotation"]
+        .as_array()
+        .and_then(|a| {
+            let v: Vec<f32> = a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
+            <[f32; 4]>::try_from(v).ok()
+        })
+        .map(bevy::math::Quat::from_array)
+        .unwrap_or(bevy::math::Quat::IDENTITY);
+    Mat4::from_scale_rotation_translation(
+        vec3("scale", [1.0; 3]),
+        rotation,
+        vec3("translation", [0.0; 3]),
+    )
+}
+
+fn decode_splat_primitive(
+    json: &serde_json::Value,
+    bin: Option<&[u8]>,
+    attrs: &serde_json::Value,
+) -> Result<Vec<Gaussian3d>, String> {
+    let accessor_of = |name: &str| -> Result<usize, String> {
+        attrs[name]
+            .as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| format!("splat primitive missing {name}"))
+    };
+    let positions = read_accessor::<3>(json, bin, accessor_of("POSITION")?)?;
+    let rotations = read_accessor::<4>(json, bin, accessor_of(ATTR_ROTATION)?)?;
+    let scales = read_accessor::<3>(json, bin, accessor_of(ATTR_SCALE)?)?;
+    let opacities = read_accessor::<1>(json, bin, accessor_of(ATTR_OPACITY)?)?;
+    // Color source: SH degree 0 (required by the spec); COLOR_0 as a
+    // defensive fallback for foreign files.
+    let sh0 = match attrs[ATTR_SH0].as_u64() {
+        Some(ix) => Some(read_accessor::<3>(json, bin, ix as usize)?),
+        None => None,
+    };
+    let color0 = match (&sh0, attrs["COLOR_0"].as_u64()) {
+        (None, Some(ix)) => Some(read_accessor::<4>(json, bin, ix as usize)?),
+        _ => None,
+    };
+    if sh0.is_none() && color0.is_none() {
+        return Err("splat primitive has neither SH_DEGREE_0_COEF_0 nor COLOR_0".into());
+    }
+
+    let n = positions.len();
+    if [rotations.len(), scales.len(), opacities.len()].iter().any(|&l| l != n) {
+        return Err(format!(
+            "splat attribute counts disagree: pos={n} rot={} scale={} opacity={}",
+            rotations.len(),
+            scales.len(),
+            opacities.len()
+        ));
+    }
+
+    let mut gaussians = Vec::with_capacity(n.div_ceil(32) * 32);
+    for i in 0..n {
+        let mut g = Gaussian3d::default();
+        g.position_visibility.position = [positions[i][0], positions[i][1], positions[i][2]];
+        g.position_visibility.visibility = 1.0;
+        // glTF quaternion order is xyzw; the crate stores wxyz (the INRIA ply
+        // rot_0..3 layout). Spec guarantees unit quaternions; normalize anyway
+        // (quantized foreign data).
+        let [x, y, z, w] = rotations[i];
+        let norm = (x * x + y * y + z * z + w * w).sqrt().max(1e-12);
+        g.rotation.rotation = [w / norm, x / norm, y / norm, z / norm];
+        // Spec: linear, non-negative scale; linear opacity (sigmoid already
+        // applied at training) — both match the crate's post-ply-parse state.
+        g.scale_opacity.scale = [scales[i][0], scales[i][1], scales[i][2]];
+        g.scale_opacity.opacity = opacities[i][0].clamp(0.0, 1.0);
+        let f_dc = match (&sh0, &color0) {
+            (Some(sh), _) => [sh[i][0], sh[i][1], sh[i][2]],
+            (None, Some(c)) => [
+                (c[i][0] - 0.5) / SH_C0,
+                (c[i][1] - 0.5) / SH_C0,
+                (c[i][2] - 0.5) / SH_C0,
+            ],
+            (None, None) => unreachable!(),
+        };
+        g.spherical_harmonic.set(0, f_dc[0]);
+        g.spherical_harmonic.set(1, f_dc[1]);
+        g.spherical_harmonic.set(2, f_dc[2]);
+        gaussians.push(g);
+    }
+    // Pad to a multiple of 32 (the crate's own ply path does the same — the
+    // GPU sort works in 32-wide groups). Default gaussians are invisible.
+    let pad = (32 - gaussians.len() % 32) % 32;
+    gaussians.extend(std::iter::repeat_n(Gaussian3d::default(), pad));
+    Ok(gaussians)
+}
+
+/// Read accessor `index` as `Vec<[f32; N]>`. Supports float and the spec's
+/// normalized integer encodings; tightly-packed or strided buffer views; no
+/// sparse accessors (our tilers never emit them).
+fn read_accessor<const N: usize>(
+    json: &serde_json::Value,
+    bin: Option<&[u8]>,
+    index: usize,
+) -> Result<Vec<[f32; N]>, String> {
+    let acc = &json["accessors"][index];
+    if acc.is_null() {
+        return Err(format!("accessor {index} out of bounds"));
+    }
+    let count = acc["count"].as_u64().ok_or("accessor without count")? as usize;
+    let comp_type = acc["componentType"].as_u64().ok_or("accessor without componentType")?;
+    let normalized = acc["normalized"].as_bool().unwrap_or(false);
+    let type_str = acc["type"].as_str().ok_or("accessor without type")?;
+    let comps = match type_str {
+        "SCALAR" => 1,
+        "VEC2" => 2,
+        "VEC3" => 3,
+        "VEC4" => 4,
+        other => return Err(format!("unsupported accessor type {other}")),
+    };
+    if comps != N {
+        return Err(format!("accessor {index} is {type_str}, expected {N} components"));
+    }
+    let comp_size = match comp_type {
+        5120 | 5121 => 1, // i8 / u8
+        5122 | 5123 => 2, // i16 / u16
+        5125 | 5126 => 4, // u32 / f32
+        other => return Err(format!("unsupported componentType {other}")),
+    };
+    let bv_ix = acc["bufferView"].as_u64().ok_or("accessor without bufferView")? as usize;
+    let bv = &json["bufferViews"][bv_ix];
+    if bv["buffer"].as_u64() != Some(0) {
+        return Err("accessor bufferView must reference buffer 0 (BIN chunk)".into());
+    }
+    let bin = bin.ok_or("accessor references the BIN chunk but the GLB has none")?;
+    let bv_offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
+    let bv_len = bv["byteLength"].as_u64().ok_or("bufferView without byteLength")? as usize;
+    let stride = bv["byteStride"].as_u64().map(|s| s as usize).unwrap_or(comp_size * N);
+    let acc_offset = acc["byteOffset"].as_u64().unwrap_or(0) as usize;
+    let view = bin
+        .get(bv_offset..bv_offset + bv_len)
+        .ok_or("bufferView out of BIN bounds")?;
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = acc_offset + i * stride;
+        let mut vals = [0f32; N];
+        for (c, val) in vals.iter_mut().enumerate() {
+            let at = base + c * comp_size;
+            let bytes = view
+                .get(at..at + comp_size)
+                .ok_or_else(|| format!("accessor {index} element {i} out of bounds"))?;
+            *val = match comp_type {
+                5126 => f32::from_le_bytes(bytes.try_into().unwrap()),
+                5121 => {
+                    let v = bytes[0] as f32;
+                    if normalized { v / 255.0 } else { v }
+                }
+                5120 => {
+                    let v = bytes[0] as i8 as f32;
+                    if normalized { (v / 127.0).max(-1.0) } else { v }
+                }
+                5123 => {
+                    let v = u16::from_le_bytes(bytes.try_into().unwrap()) as f32;
+                    if normalized { v / 65535.0 } else { v }
+                }
+                5122 => {
+                    let v = i16::from_le_bytes(bytes.try_into().unwrap()) as f32;
+                    if normalized { (v / 32767.0).max(-1.0) } else { v }
+                }
+                5125 => u32::from_le_bytes(bytes.try_into().unwrap()) as f32,
+                _ => unreachable!(),
+            };
+        }
+        out.push(vals);
     }
     Ok(out)
 }
@@ -229,14 +585,18 @@ mod tests {
             ],
             "buffers": [{ "byteLength": bin.len() }]
         });
-        let mut json_bytes = serde_json::to_vec(&json).unwrap();
+        glb_from_parts(&serde_json::to_vec(&json).unwrap(), &bin)
+    }
+
+    fn glb_from_parts(json_bytes: &[u8], bin: &[u8]) -> Vec<u8> {
+        let mut json_bytes = json_bytes.to_vec();
+        let mut bin = bin.to_vec();
         while !json_bytes.len().is_multiple_of(4) {
             json_bytes.push(b' ');
         }
         while !bin.len().is_multiple_of(4) {
             bin.push(0);
         }
-
         let mut glb = Vec::new();
         glb.extend_from_slice(b"glTF");
         glb.extend_from_slice(&2u32.to_le_bytes());
@@ -253,9 +613,9 @@ mod tests {
 
     #[test]
     fn decodes_positions_colors_and_node_transform() {
-        let prims = decode_glb(&tiny_glb()).expect("decode");
-        assert_eq!(prims.len(), 1);
-        let p = &prims[0];
+        let items = decode_glb(&tiny_glb()).expect("decode");
+        assert_eq!(items.len(), 1);
+        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
         // Node translation carried into the primitive transform.
         assert_eq!(p.transform.w_axis.y, 2.0);
         assert_eq!(
@@ -272,5 +632,129 @@ mod tests {
     #[test]
     fn garbage_bytes_error_cleanly() {
         assert!(decode_glb(b"not a glb").is_err());
+    }
+
+    /// POINTS-mode GLB: positions + u8-normalized COLOR_0 → point items in
+    /// the glTF frame with material-driven sizes.
+    #[test]
+    fn decodes_points_primitive() {
+        let positions: [[f32; 3]; 2] = [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]];
+        let colors: [[u8; 4]; 2] = [[255, 0, 0, 255], [0, 255, 0, 255]];
+        let mut bin: Vec<u8> = Vec::new();
+        for p in positions.iter().flatten() {
+            bin.extend_from_slice(&p.to_le_bytes());
+        }
+        let color_offset = bin.len();
+        for c in colors.iter().flatten() {
+            bin.push(*c);
+        }
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{
+                "attributes": { "POSITION": 0, "COLOR_0": 1 },
+                "mode": 0
+            }]}],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 2, "type": "VEC3",
+                  "min": [0.0, 1.0, 2.0], "max": [3.0, 4.0, 5.0] },
+                { "bufferView": 1, "componentType": 5121, "normalized": true,
+                  "count": 2, "type": "VEC4" }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 24 },
+                { "buffer": 0, "byteOffset": color_offset, "byteLength": 8 }
+            ],
+            "buffers": [{ "byteLength": bin.len() }]
+        });
+        let glb = glb_from_parts(&serde_json::to_vec(&json).unwrap(), &bin);
+        let items = decode_glb(&glb).expect("decode");
+        assert_eq!(items.len(), 1);
+        let DecodedItem::Points { points, .. } = &items[0] else { panic!("expected points") };
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].position, Vec3::new(0.0, 1.0, 2.0));
+        assert_eq!(points[0].point_size, -1.0);
+        assert!((points[0].color[0] - 1.0).abs() < 1e-6);
+        assert!((points[1].color[1] - 1.0).abs() < 1e-6);
+    }
+
+    /// KHR_gaussian_splatting GLB (float accessors, like our tiler emits):
+    /// bypasses the gltf crate, maps quaternions xyzw→wxyz, keeps linear
+    /// scale/opacity, reads SH degree 0, pads to 32.
+    #[test]
+    fn decodes_splat_primitive_via_raw_path() {
+        let positions: [[f32; 3]; 2] = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let rotations: [[f32; 4]; 2] = [[0.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 0.0]]; // xyzw
+        let scales: [[f32; 3]; 2] = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
+        let opacities: [f32; 2] = [0.25, 1.0];
+        let sh0: [[f32; 3]; 2] = [[1.0, -0.5, 0.0], [0.0, 0.0, 2.0]];
+
+        let mut bin: Vec<u8> = Vec::new();
+        let mut offsets = Vec::new();
+        let mut push = |vals: &[f32]| {
+            offsets.push(bin.len());
+            for v in vals {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+        };
+        push(&positions.iter().flatten().copied().collect::<Vec<_>>());
+        push(&rotations.iter().flatten().copied().collect::<Vec<_>>());
+        push(&scales.iter().flatten().copied().collect::<Vec<_>>());
+        push(&opacities);
+        push(&sh0.iter().flatten().copied().collect::<Vec<_>>());
+
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "extensionsUsed": ["KHR_gaussian_splatting"],
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0, "translation": [10.0, 0.0, 0.0] }],
+            "meshes": [{ "primitives": [{
+                "attributes": {
+                    "POSITION": 0,
+                    "KHR_gaussian_splatting:ROTATION": 1,
+                    "KHR_gaussian_splatting:SCALE": 2,
+                    "KHR_gaussian_splatting:OPACITY": 3,
+                    "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0": 4
+                },
+                "mode": 0,
+                "extensions": { "KHR_gaussian_splatting": {} }
+            }]}],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 2, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC4" },
+                { "bufferView": 2, "componentType": 5126, "count": 2, "type": "VEC3" },
+                { "bufferView": 3, "componentType": 5126, "count": 2, "type": "SCALAR" },
+                { "bufferView": 4, "componentType": 5126, "count": 2, "type": "VEC3" }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": offsets[0], "byteLength": 24 },
+                { "buffer": 0, "byteOffset": offsets[1], "byteLength": 32 },
+                { "buffer": 0, "byteOffset": offsets[2], "byteLength": 24 },
+                { "buffer": 0, "byteOffset": offsets[3], "byteLength": 8 },
+                { "buffer": 0, "byteOffset": offsets[4], "byteLength": 24 }
+            ],
+            "buffers": [{ "byteLength": bin.len() }]
+        });
+        let glb = glb_from_parts(&serde_json::to_vec(&json).unwrap(), &bin);
+        let items = decode_glb(&glb).expect("decode");
+        assert_eq!(items.len(), 1);
+        let DecodedItem::Splat { transform, gaussians } = &items[0] else {
+            panic!("expected splat")
+        };
+        assert_eq!(transform.w_axis.x, 10.0);
+        assert_eq!(gaussians.len(), 32, "2 real + 30 pad");
+        let g = &gaussians[0];
+        assert_eq!(g.position_visibility.position, [1.0, 2.0, 3.0]);
+        assert_eq!(g.position_visibility.visibility, 1.0);
+        // xyzw [0,0,0,1] → wxyz [1,0,0,0].
+        assert_eq!(g.rotation.rotation, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(g.scale_opacity.scale, [0.1, 0.2, 0.3]);
+        assert_eq!(g.scale_opacity.opacity, 0.25);
+        let g1 = &gaussians[1];
+        // xyzw [1,0,0,0] → wxyz [0,1,0,0].
+        assert_eq!(g1.rotation.rotation, [0.0, 1.0, 0.0, 0.0]);
     }
 }

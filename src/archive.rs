@@ -25,7 +25,7 @@
 
 use md5::{Digest, Md5};
 
-use super::fetch::{ByteSource, FetchError};
+use super::fetch::{AbortHandle, ByteSource, FetchError};
 
 /// The mandated index filename (and its fixed 15-byte length).
 const INDEX_NAME: &[u8] = b"@3dtilesIndex1@";
@@ -399,7 +399,7 @@ impl Archive3tz {
             ));
         }
 
-        let raw = read_entry_at(&source, size, entry.local_offset, INDEX_NAME).await?;
+        let raw = read_entry_at(&source, size, entry.local_offset, INDEX_NAME, None).await?;
         let raw = raw.ok_or(ArchiveError::NoIndex)?;
         if raw.data.len() as u64 != entry.comp_size {
             return Err(ArchiveError::Corrupt(format!(
@@ -416,14 +416,30 @@ impl Archive3tz {
         &self.index
     }
 
+    /// The archive's underlying byte source (URL identity for cache keying).
+    pub fn source(&self) -> &ByteSource {
+        &self.source
+    }
+
     /// Read + decompress one entry by archive path. Two range-GETs (one when
     /// the over-fetched header window already contains the whole payload).
     pub async fn read_entry(&self, path: &str) -> Result<Vec<u8>, ArchiveError> {
+        self.read_entry_abortable(path, None).await
+    }
+
+    /// [`Self::read_entry`] with an optional cancellation token threaded
+    /// through every range request.
+    pub async fn read_entry_abortable(
+        &self,
+        path: &str,
+        abort: Option<&AbortHandle>,
+    ) -> Result<Vec<u8>, ArchiveError> {
         let normalized = normalize_path(path);
         let candidates = self.index.lookup(&normalized);
         for offset in &candidates {
             if let Some(raw) =
-                read_entry_at(&self.source, self.size, *offset, normalized.as_bytes()).await?
+                read_entry_at(&self.source, self.size, *offset, normalized.as_bytes(), abort)
+                    .await?
             {
                 return decode_entry(raw.method, raw.data);
             }
@@ -444,8 +460,19 @@ async fn self_read(
     len: u64,
     size: u64,
 ) -> Result<Vec<u8>, ArchiveError> {
+    self_read_abortable(source, start, len, size, None).await
+}
+
+/// Clamped range read with an optional cancellation token.
+async fn self_read_abortable(
+    source: &ByteSource,
+    start: u64,
+    len: u64,
+    size: u64,
+    abort: Option<&AbortHandle>,
+) -> Result<Vec<u8>, ArchiveError> {
     let len = len.min(size.saturating_sub(start));
-    Ok(source.read(start, len).await?)
+    Ok(source.read_abortable(start, len, abort).await?)
 }
 
 /// Fetch + parse the entry at a Local-File-Header offset; `None` when the
@@ -455,8 +482,9 @@ async fn read_entry_at(
     size: u64,
     offset: u64,
     expected_name: &[u8],
+    abort: Option<&AbortHandle>,
 ) -> Result<Option<RawEntry>, ArchiveError> {
-    let window = self_read(source, offset, LFH_OVERFETCH, size).await?;
+    let window = self_read_abortable(source, offset, LFH_OVERFETCH, size, abort).await?;
     let header = parse_local_header(&window)?;
     if header.name != expected_name {
         return Ok(None);
@@ -471,7 +499,7 @@ async fn read_entry_at(
     let data = if in_window_end <= window.len() {
         window[in_window_start..in_window_end].to_vec()
     } else {
-        self_read(source, offset + header.data_rel, comp_size, size).await?
+        self_read_abortable(source, offset + header.data_rel, comp_size, size, abort).await?
     };
     if data.len() as u64 != comp_size {
         return Err(ArchiveError::Corrupt(format!(

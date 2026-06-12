@@ -14,10 +14,17 @@
 //!   worker thread) instead of basemap's fail-fast stub, because the T0 gate
 //!   requires the fixture to render natively too.
 //!
-//! Cache-Storage CAS is deliberately NOT here yet: range reads need a
-//! range-aware key scheme, which lands with T1's real blob tilesets (whole-tile
-//! entries keyed by archive hash + entry path). The basemap CAS pattern carries
-//! over then.
+//! T1 additions:
+//! * **Cache-Storage CAS** for whole-entry reads ([`TilesetSource::read_entry_cached`]):
+//!   keyed by the SAS-stripped archive/base URL + entry path (asset blobs are
+//!   hash-named and immutable, mirroring `asset_loader::remote_source`). The
+//!   ranged *open* path (index/suffix reads) is never cached — only complete
+//!   entries are.
+//! * **Abort plumbing** ([`AbortHandle`] + the generation-keyed registry): the
+//!   scheduler cancels the actual network transfer of a request that fell out
+//!   of the cut, not just its slot state. wasm wires a real `AbortController`
+//!   into every fetch; native checks a flag between range requests (blocking
+//!   reqwest can't be interrupted mid-transfer — tiles are MBs, good enough).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +38,130 @@ pub enum FetchError {
     Io(String),
     #[error("range out of bounds: {start}+{len} > {size}")]
     OutOfRange { start: u64, len: u64, size: u64 },
+    #[error("request aborted (fell out of the cut)")]
+    Aborted,
+}
+
+// ── Cancellation ─────────────────────────────────────────────────────────────
+
+/// Cross-platform cancellation token for one tile request. Cheap to clone —
+/// clones share the same underlying controller/flag.
+#[derive(Debug, Clone)]
+pub struct AbortHandle {
+    #[cfg(target_arch = "wasm32")]
+    controller: web_sys::AbortController,
+    #[cfg(not(target_arch = "wasm32"))]
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AbortHandle {
+    pub fn new() -> Self {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // AbortController::new only fails in pathological environments;
+            // degrade to a dummy that can never be constructed — unwrap is the
+            // pragmatic choice (the basemap fetch layer makes the same call).
+            Self { controller: web_sys::AbortController::new().expect("AbortController") }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self { flag: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+        }
+    }
+
+    pub fn trigger(&self) {
+        #[cfg(target_arch = "wasm32")]
+        self.controller.abort();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.controller.signal().aborted()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.flag.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn signal(&self) -> web_sys::AbortSignal {
+        self.controller.signal()
+    }
+}
+
+impl Default for AbortHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Bail out early when the request was cancelled.
+fn check_abort(abort: Option<&AbortHandle>) -> Result<(), FetchError> {
+    match abort {
+        Some(a) if a.is_triggered() => Err(FetchError::Aborted),
+        _ => Ok(()),
+    }
+}
+
+// Generation-keyed abort registry. Lives OUTSIDE the ECS: on wasm an
+// `AbortController` is a JS object (not `Send`), so it can't sit in a
+// `Resource` slot — the scheduler talks to in-flight tasks through this map
+// instead. wasm is single-threaded (`thread_local` suffices); native tasks run
+// on worker threads (mutexed map).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static ABORTS: std::cell::RefCell<std::collections::HashMap<u64, AbortHandle>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+#[cfg(not(target_arch = "wasm32"))]
+static ABORTS: std::sync::Mutex<
+    Option<std::collections::HashMap<u64, AbortHandle>>,
+> = std::sync::Mutex::new(None);
+
+/// Create + register the abort handle for a request generation.
+pub fn register_abort(generation: u64) -> AbortHandle {
+    let handle = AbortHandle::new();
+    #[cfg(target_arch = "wasm32")]
+    ABORTS.with(|m| m.borrow_mut().insert(generation, handle.clone()));
+    #[cfg(not(target_arch = "wasm32"))]
+    ABORTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(generation, handle.clone());
+    handle
+}
+
+/// Abort the in-flight request of `generation` (no-op when already finished).
+pub fn trigger_abort(generation: u64) {
+    #[cfg(target_arch = "wasm32")]
+    ABORTS.with(|m| {
+        if let Some(h) = m.borrow().get(&generation) {
+            h.trigger();
+        }
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(map) = ABORTS.lock().unwrap().as_ref()
+        && let Some(h) = map.get(&generation)
+    {
+        h.trigger();
+    }
+}
+
+/// Drop a finished request's registry entry (called by the task on completion).
+pub fn unregister_abort(generation: u64) {
+    #[cfg(target_arch = "wasm32")]
+    ABORTS.with(|m| {
+        m.borrow_mut().remove(&generation);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(map) = ABORTS.lock().unwrap().as_mut() {
+        map.remove(&generation);
+    }
 }
 
 /// A random-access byte source: an in-memory buffer (tests), a local file
@@ -59,6 +190,17 @@ impl ByteSource {
 
     /// Read exactly `len` bytes at absolute offset `start`.
     pub async fn read(&self, start: u64, len: u64) -> Result<Vec<u8>, FetchError> {
+        self.read_abortable(start, len, None).await
+    }
+
+    /// [`Self::read`] with an optional cancellation token.
+    pub async fn read_abortable(
+        &self,
+        start: u64,
+        len: u64,
+        abort: Option<&AbortHandle>,
+    ) -> Result<Vec<u8>, FetchError> {
+        check_abort(abort)?;
         match self {
             ByteSource::Mem(buf) => {
                 let size = buf.len() as u64;
@@ -79,7 +221,7 @@ impl ByteSource {
                 })?;
                 Ok(out)
             }
-            ByteSource::Http(url) => http_range(url, start, len).await,
+            ByteSource::Http(url) => http_range(url, start, len, abort).await,
         }
     }
 
@@ -100,11 +242,20 @@ impl ByteSource {
 
     /// Read the whole source (exploded-tileset entries; plain GET on HTTP).
     pub async fn read_all(&self) -> Result<Vec<u8>, FetchError> {
+        self.read_all_abortable(None).await
+    }
+
+    /// [`Self::read_all`] with an optional cancellation token.
+    pub async fn read_all_abortable(
+        &self,
+        abort: Option<&AbortHandle>,
+    ) -> Result<Vec<u8>, FetchError> {
+        check_abort(abort)?;
         match self {
             ByteSource::Mem(buf) => Ok(buf.as_ref().clone()),
             ByteSource::File(path) => std::fs::read(path)
                 .map_err(|e| FetchError::Io(format!("{}: {e}", path.display()))),
-            ByteSource::Http(url) => http_get_all(url).await,
+            ByteSource::Http(url) => http_get_all(url, abort).await,
         }
     }
 }
@@ -143,14 +294,127 @@ impl TilesetSource {
     /// Fetch one entry (e.g. `"tileset.json"`, `"content/3/2/1.glb"`) by its
     /// tileset-relative URI.
     pub async fn read_entry(&self, uri: &str) -> Result<Vec<u8>, FetchError> {
+        self.read_entry_raw(uri, None).await
+    }
+
+    async fn read_entry_raw(
+        &self,
+        uri: &str,
+        abort: Option<&AbortHandle>,
+    ) -> Result<Vec<u8>, FetchError> {
         match self {
-            TilesetSource::Exploded(base) => base.join(uri).read_all().await,
-            TilesetSource::Archive(ar) => ar
-                .read_entry(uri)
-                .await
-                .map_err(|e| FetchError::Io(format!("3tz entry {uri}: {e}"))),
+            TilesetSource::Exploded(base) => base.join(uri).read_all_abortable(abort).await,
+            TilesetSource::Archive(ar) => {
+                ar.read_entry_abortable(uri, abort).await.map_err(|e| match e {
+                    super::archive::ArchiveError::Fetch(FetchError::Aborted) => {
+                        FetchError::Aborted
+                    }
+                    e => FetchError::Io(format!("3tz entry {uri}: {e}")),
+                })
+            }
         }
     }
+
+    /// [`Self::read_entry`] through the content-addressed Cache Storage layer
+    /// (wasm; a pass-through elsewhere), with optional cancellation.
+    ///
+    /// Cache key = SAS-stripped source URL + `/` + entry path. Asset blobs are
+    /// hash-named (`…/whole/<hash>.3tz`) and mirror prefixes are
+    /// version-scoped, so the key is content-addressed and survives SAS
+    /// rotation — same scheme as `asset_loader::remote_source`.
+    pub async fn read_entry_cached(
+        &self,
+        uri: &str,
+        abort: Option<&AbortHandle>,
+    ) -> Result<Vec<u8>, FetchError> {
+        let key = self.entry_cache_key(uri);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(key) = &key
+            && let Some(bytes) = cache_get(key).await
+        {
+            return Ok(bytes);
+        }
+        let bytes = self.read_entry_raw(uri, abort).await?;
+        #[cfg(target_arch = "wasm32")]
+        if let Some(key) = key {
+            cache_store_bytes(key, &bytes);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = key;
+        Ok(bytes)
+    }
+
+    /// Stable cache key for one entry, or `None` when the source isn't an
+    /// absolute HTTP URL (the Cache Storage API requires URL keys; local
+    /// fixtures and `Mem` sources don't need caching).
+    fn entry_cache_key(&self, uri: &str) -> Option<String> {
+        let base = match self {
+            TilesetSource::Archive(ar) => match ar.source() {
+                ByteSource::Http(url) => url.as_str(),
+                _ => return None,
+            },
+            TilesetSource::Exploded(ExplodedBase::Url(base)) => base.as_str(),
+            TilesetSource::Exploded(ExplodedBase::Dir(_)) => return None,
+        };
+        if !(base.starts_with("https://") || base.starts_with("http://")) {
+            return None;
+        }
+        let stripped = base.split('?').next().unwrap_or(base).trim_end_matches('/');
+        Some(format!("{stripped}/{}", uri.trim_start_matches('/')))
+    }
+}
+
+/// Cache Storage bucket shared with the whole-file asset path
+/// (`asset_loader::remote_source`) — one CAS, one invalidation knob.
+#[cfg(target_arch = "wasm32")]
+const CONTENT_CACHE: &str = "tt-asset-cas-v1";
+
+/// Look up `key` in the CAS bucket; `None` on miss or unavailable storage.
+#[cfg(target_arch = "wasm32")]
+async fn cache_get(key: &str) -> Option<Vec<u8>> {
+    use js_sys::Uint8Array;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let caches = web_sys::window()?.caches().ok()?;
+    let cache: web_sys::Cache =
+        JsFuture::from(caches.open(CONTENT_CACHE)).await.ok()?.dyn_into().ok()?;
+    let matched = JsFuture::from(cache.match_with_str(key)).await.ok()?;
+    if matched.is_undefined() {
+        return None;
+    }
+    let resp: web_sys::Response = matched.dyn_into().ok()?;
+    let buf = JsFuture::from(resp.array_buffer().ok()?).await.ok()?;
+    Some(Uint8Array::new(&buf).to_vec())
+}
+
+/// Persist decoded entry bytes under `key`, fire-and-forget (best-effort —
+/// quota/denied storage only costs future-session speed).
+#[cfg(target_arch = "wasm32")]
+fn cache_store_bytes(key: String, bytes: &[u8]) {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::{spawn_local, JsFuture};
+
+    let mut owned = bytes.to_vec();
+    spawn_local(async move {
+        let Some(caches) = web_sys::window().and_then(|w| w.caches().ok()) else {
+            return;
+        };
+        let Ok(opened) = JsFuture::from(caches.open(CONTENT_CACHE)).await else {
+            return;
+        };
+        let Ok(cache) = opened.dyn_into::<web_sys::Cache>() else {
+            return;
+        };
+        // The constructor copies into the JS heap; `owned` frees at task end.
+        let Ok(response) = web_sys::Response::new_with_opt_u8_array(Some(owned.as_mut_slice()))
+        else {
+            return;
+        };
+        if JsFuture::from(cache.put_with_str(&key, &response)).await.is_err() {
+            bevy::log::debug!("tiles3d: cache store failed for {key} (non-fatal)");
+        }
+    });
 }
 
 /// Spawn a fire-and-forget IO task. wasm: `spawn_local` on the single-threaded
@@ -182,14 +446,30 @@ async fn http_size(url: &str) -> Result<u64, FetchError> {
     Ok(total)
 }
 
+/// Map a gloo fetch error, recognizing user-triggered aborts.
 #[cfg(target_arch = "wasm32")]
-async fn http_range(url: &str, start: u64, len: u64) -> Result<Vec<u8>, FetchError> {
+fn map_gloo_error(e: gloo_net::Error, abort: Option<&AbortHandle>) -> FetchError {
+    if abort.is_some_and(|a| a.is_triggered()) {
+        FetchError::Aborted
+    } else {
+        FetchError::Http(e.to_string())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn http_range(
+    url: &str,
+    start: u64,
+    len: u64,
+    abort: Option<&AbortHandle>,
+) -> Result<Vec<u8>, FetchError> {
     let end = start + len - 1;
     let resp = gloo_net::http::Request::get(url)
         .header("Range", &format!("bytes={start}-{end}"))
+        .abort_signal(abort.map(|a| a.signal()).as_ref())
         .send()
         .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
+        .map_err(|e| map_gloo_error(e, abort))?;
     match resp.status() {
         206 => resp.binary().await.map_err(|e| FetchError::Http(e.to_string())),
         // Server ignored the Range header (no range support): take the whole
@@ -240,15 +520,16 @@ async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn http_get_all(url: &str) -> Result<Vec<u8>, FetchError> {
+async fn http_get_all(url: &str, abort: Option<&AbortHandle>) -> Result<Vec<u8>, FetchError> {
     let resp = gloo_net::http::Request::get(url)
+        .abort_signal(abort.map(|a| a.signal()).as_ref())
         .send()
         .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
+        .map_err(|e| map_gloo_error(e, abort))?;
     if !resp.ok() {
         return Err(FetchError::Http(format!("status {} for GET {url}", resp.status())));
     }
-    resp.binary().await.map_err(|e| FetchError::Http(e.to_string()))
+    resp.binary().await.map_err(|e| map_gloo_error(e, abort))
 }
 
 // Native HTTP: blocking reqwest on the worker thread `spawn_io` already runs
@@ -260,7 +541,13 @@ async fn http_size(url: &str) -> Result<u64, FetchError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn http_range(url: &str, start: u64, len: u64) -> Result<Vec<u8>, FetchError> {
+async fn http_range(
+    url: &str,
+    start: u64,
+    len: u64,
+    abort: Option<&AbortHandle>,
+) -> Result<Vec<u8>, FetchError> {
+    check_abort(abort)?;
     let end = start + len - 1;
     let resp = reqwest::blocking::Client::new()
         .get(url)
@@ -314,7 +601,8 @@ async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn http_get_all(url: &str) -> Result<Vec<u8>, FetchError> {
+async fn http_get_all(url: &str, abort: Option<&AbortHandle>) -> Result<Vec<u8>, FetchError> {
+    check_abort(abort)?;
     let resp = reqwest::blocking::get(url).map_err(|e| FetchError::Http(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(FetchError::Http(format!("status {} for GET {url}", resp.status())));

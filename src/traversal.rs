@@ -97,7 +97,7 @@ impl WorldVolume {
 
 /// Largest column scale of the 3×3 part — the factor a sphere radius grows by
 /// under `m` (exact for uniform/rigid transforms, conservative otherwise).
-fn max_scale(m: &DMat4) -> f64 {
+pub fn max_scale(m: &DMat4) -> f64 {
     m.x_axis
         .truncate()
         .length()
