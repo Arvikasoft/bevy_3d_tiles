@@ -24,6 +24,20 @@
 //! child subtree carries a `transform` (+3 m up) with its content + volumes
 //! authored in the shifted local frame — exercising the runtime's transform
 //! composition: if the math is right the quadrant lands 3 m above the rest.
+//!
+//! **Georeferenced mode (T4 verification, not committed):**
+//!
+//! ```bash
+//! cargo run --example gen_tiles3d_fixture -- --geo <lon> <lat> <h> [out_dir]
+//! ```
+//!
+//! Emits the same patch as an externally-shaped georeferenced tileset to
+//! `out_dir` (default `/tmp/tiles3d-demo-geo`): a host `tileset.json` whose
+//! root carries a **region** bounding volume and whose content is an
+//! **external tileset** `sub/tileset.json`, which in turn places the patch
+//! via an ENU→ECEF root **transform** (the PDOK / Cesium-mirror shape).
+//! Exercises region volumes, external-tileset grafting, georeference
+//! detection, and the ECEF→ENU placement path in one artifact.
 
 use std::fs;
 use std::path::Path;
@@ -46,6 +60,16 @@ const LEVEL_COLORS: [[f32; 4]; 3] = [
 ];
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--geo") {
+        let at = args.iter().position(|a| a == "--geo").unwrap();
+        let lon: f64 = args[at + 1].parse().expect("--geo <lon> <lat> <h>");
+        let lat: f64 = args[at + 2].parse().expect("--geo <lon> <lat> <h>");
+        let h: f64 = args[at + 3].parse().expect("--geo <lon> <lat> <h>");
+        let out = args.get(at + 4).cloned().unwrap_or_else(|| "/tmp/tiles3d-demo-geo".into());
+        return gen_geo_fixture(lon, lat, h, &out);
+    }
+
     let content_dir = Path::new(OUT_DIR).join("content");
     fs::create_dir_all(&content_dir).expect("create fixture dirs");
 
@@ -145,6 +169,116 @@ fn main() {
         total / 1024,
         tileset_bytes.len(),
         archive.len() / 1024
+    );
+}
+
+/// Georeferenced fixture (see module docs): host tileset with a region root
+/// + external-tileset content; sub tileset with an ENU→ECEF root transform.
+fn gen_geo_fixture(lon: f64, lat: f64, h: f64, out: &str) {
+    use turbotwin_sdk_rs::enu::geodetic_to_ecef;
+
+    let out_dir = Path::new(out);
+    fs::create_dir_all(out_dir.join("sub/content")).expect("create geo fixture dirs");
+
+    // The same 3-level patch, but authored for the SUB tileset (content URIs
+    // are sub-tileset-relative).
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let root_glb = tile_glb(-20.0, 20.0, -20.0, 20.0, 4, 0.0, LEVEL_COLORS[0]);
+    entries.push(("content/root.glb".into(), root_glb));
+    let quads: [(&str, f64, f64); 4] =
+        [("sw", -10.0, -10.0), ("se", 10.0, -10.0), ("nw", -10.0, 10.0), ("ne", 10.0, 10.0)];
+    let mut children_json = Vec::new();
+    for (qname, ce, cn) in quads.iter() {
+        let child_glb =
+            tile_glb(ce - 10.0, ce + 10.0, cn - 10.0, cn + 10.0, 8, 0.0, LEVEL_COLORS[1]);
+        entries.push((format!("content/c_{qname}.glb"), child_glb));
+        let mut leaves_json = Vec::new();
+        for (li, (le, ln)) in
+            [(-5.0, -5.0), (5.0, -5.0), (-5.0, 5.0), (5.0, 5.0)].iter().enumerate()
+        {
+            let (lce, lcn) = (ce + le, cn + ln);
+            let leaf_glb =
+                tile_glb(lce - 5.0, lce + 5.0, lcn - 5.0, lcn + 5.0, 16, 0.0, LEVEL_COLORS[2]);
+            let uri = format!("content/l_{qname}{li}.glb");
+            entries.push((uri.clone(), leaf_glb));
+            leaves_json.push(serde_json::json!({
+                "boundingVolume": { "box": [lce, lcn, 0.0, 5.0,0.0,0.0, 0.0,5.0,0.0, 0.0,0.0,4.0] },
+                "geometricError": 0.0,
+                "content": { "uri": uri }
+            }));
+        }
+        children_json.push(serde_json::json!({
+            "boundingVolume": { "box": [*ce, *cn, 0.0, 10.0,0.0,0.0, 0.0,10.0,0.0, 0.0,0.0,4.0] },
+            "geometricError": 4.0,
+            "content": { "uri": format!("content/c_{qname}.glb") },
+            "children": leaves_json
+        }));
+    }
+
+    // ENU→ECEF: columns = east, north, up unit vectors + the site's ECEF
+    // position (column-major 4×4, the standard Cesium-mirror root transform).
+    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+    let (sin_lon, cos_lon) = lon.to_radians().sin_cos();
+    let east = [-sin_lon, cos_lon, 0.0];
+    let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
+    let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
+    let (x0, y0, z0) = geodetic_to_ecef(lat, lon, h);
+    let enu_to_ecef = [
+        east[0], east[1], east[2], 0.0,
+        north[0], north[1], north[2], 0.0,
+        up[0], up[1], up[2], 0.0,
+        x0, y0, z0, 1.0,
+    ];
+
+    let sub_tileset = serde_json::json!({
+        "asset": { "version": "1.1" },
+        "geometricError": 64.0,
+        "root": {
+            "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 30.0] },
+            "geometricError": 16.0,
+            "refine": "REPLACE",
+            "transform": enu_to_ecef,
+            "content": { "uri": "content/root.glb" },
+            "children": children_json
+        }
+    });
+
+    // Host root: region volume (geodetic radians) around the patch; its
+    // content is the external sub tileset.
+    let dlat = 30.0 / 6_378_137.0;
+    let dlon = 30.0 / (6_378_137.0 * cos_lat);
+    let (lat_r, lon_r) = (lat.to_radians(), lon.to_radians());
+    let host_tileset = serde_json::json!({
+        "asset": { "version": "1.1" },
+        "geometricError": 256.0,
+        "root": {
+            "boundingVolume": {
+                "region": [lon_r - dlon, lat_r - dlat, lon_r + dlon, lat_r + dlat,
+                           h - 10.0, h + 10.0]
+            },
+            "geometricError": 64.0,
+            "refine": "REPLACE",
+            "content": { "uri": "sub/tileset.json" }
+        }
+    });
+
+    fs::write(
+        out_dir.join("sub/tileset.json"),
+        serde_json::to_vec_pretty(&sub_tileset).expect("sub tileset json"),
+    )
+    .expect("write sub tileset");
+    for (path, bytes) in &entries {
+        fs::write(out_dir.join("sub").join(path), bytes).expect("write geo tile");
+    }
+    fs::write(
+        out_dir.join("tileset.json"),
+        serde_json::to_vec_pretty(&host_tileset).expect("host tileset json"),
+    )
+    .expect("write host tileset");
+    println!(
+        "geo fixture: {} GLBs at ({lon}, {lat}, {h}) → {out}/tileset.json \
+         (region root → external sub/tileset.json → ENU→ECEF transform)",
+        entries.len()
     );
 }
 

@@ -40,6 +40,8 @@ pub enum FetchError {
     OutOfRange { start: u64, len: u64, size: u64 },
     #[error("request aborted (fell out of the cut)")]
     Aborted,
+    #[error("daily request cap reached ({0}) — live tile streaming halted")]
+    BudgetExhausted(u32),
 }
 
 // ── Cancellation ─────────────────────────────────────────────────────────────
@@ -260,14 +262,198 @@ impl ByteSource {
     }
 }
 
+// ── Live sessioned sources (Google P3DT, T4) ─────────────────────────────────
+
+/// Per-day request budget for a live source. The denormalized
+/// `daily_request_cap` from the layer row is a HARD client-side stop
+/// (BEVY-3D-TILES D7 — the 2026-05-30 cost-incident lesson); `cap == 0`
+/// means no client-side limit. On wasm the count persists across reloads in
+/// `localStorage` under a UTC-date key, so "daily" survives a refresh.
+#[derive(Debug)]
+pub struct BudgetCounter {
+    used: std::sync::atomic::AtomicU32,
+    cap: u32,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    persist_key: Option<String>,
+}
+
+impl BudgetCounter {
+    pub fn new(cap: u32, persist_label: Option<&str>) -> Self {
+        let persist_key = persist_label.map(|l| format!("tt-p3dt-budget:{l}:{}", utc_date()));
+        let used = persist_key.as_deref().and_then(local_storage_get_u32).unwrap_or(0);
+        Self { used: std::sync::atomic::AtomicU32::new(used), cap, persist_key }
+    }
+
+    /// Count one request. `Err(cap)` when the budget is exhausted — the
+    /// request must not be issued.
+    pub fn try_acquire(&self) -> Result<u32, u32> {
+        use std::sync::atomic::Ordering;
+        if self.cap > 0 && self.used.load(Ordering::Relaxed) >= self.cap {
+            return Err(self.cap);
+        }
+        let now = self.used.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(target_arch = "wasm32")]
+        if let Some(key) = &self.persist_key {
+            local_storage_set_u32(key, now);
+        }
+        Ok(now)
+    }
+
+    pub fn used(&self) -> u32 {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.cap > 0 && self.used() >= self.cap
+    }
+
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+}
+
+/// Today's UTC date as `YYYY-MM-DD` (browser clock on wasm, system on native).
+fn utc_date() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let iso: String = js_sys::Date::new_0().to_iso_string().into();
+        iso.chars().take(10).collect()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Days-since-epoch → civil date (Howard Hinnant's algorithm) — no
+        // chrono dependency for a log label.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let z = secs as i64 / 86_400 + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_storage_get_u32(key: &str) -> Option<u32> {
+    web_sys::window()?
+        .local_storage()
+        .ok()??
+        .get_item(key)
+        .ok()?
+        .and_then(|v| v.parse().ok())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn local_storage_get_u32(_key: &str) -> Option<u32> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_storage_set_u32(key: &str, value: u32) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(key, &value.to_string());
+    }
+}
+
+/// A live, sessioned, budget-capped tileset endpoint — Google Photorealistic
+/// 3D Tiles (plan D7). Every entry request carries the org's API key and the
+/// session token (extracted from the first content URI the root tileset
+/// returns; all subsequent requests must echo it). Content is **never**
+/// CAS-cached and never stored — the ToS forbids persistence; the renderer
+/// honours per-fetch in-memory use only.
+#[derive(Debug)]
+pub struct LiveSession {
+    /// Scheme + host of the root URL (e.g. `https://tile.googleapis.com`).
+    base: String,
+    key: String,
+    session: std::sync::Mutex<Option<String>>,
+    budget: BudgetCounter,
+}
+
+impl LiveSession {
+    /// `root_url` = the full root-tileset URL; the key is appended per
+    /// request (never stored inside entry URIs).
+    pub fn new(root_url: &str, key: String, budget: BudgetCounter) -> Self {
+        let base = root_url
+            .find("://")
+            .and_then(|at| root_url[at + 3..].find('/').map(|slash| &root_url[..at + 3 + slash]))
+            .unwrap_or(root_url)
+            .to_string();
+        Self { base, key, session: std::sync::Mutex::new(None), budget }
+    }
+
+    pub fn budget(&self) -> &BudgetCounter {
+        &self.budget
+    }
+
+    /// Adopt the session token discovered in a tileset's content URIs.
+    pub fn set_session(&self, token: String) {
+        *self.session.lock().unwrap() = Some(token);
+    }
+
+    pub fn has_session(&self) -> bool {
+        self.session.lock().unwrap().is_some()
+    }
+
+    /// Resolve an entry URI to the full request URL: absolute URLs pass
+    /// through, absolute paths join the base host; `key` (and `session`,
+    /// once known) are appended unless the URI already carries them.
+    fn entry_url(&self, uri: &str) -> String {
+        let mut url = if uri.starts_with("http://") || uri.starts_with("https://") {
+            uri.to_string()
+        } else {
+            format!("{}/{}", self.base, uri.trim_start_matches('/'))
+        };
+        let mut append = |k: &str, v: &str| {
+            let marker = format!("{k}=");
+            let has = url
+                .split_once('?')
+                .map(|(_, q)| q.split('&').any(|p| p.starts_with(&marker)))
+                .unwrap_or(false);
+            if !has {
+                url.push(if url.contains('?') { '&' } else { '?' });
+                url.push_str(&marker);
+                url.push_str(v);
+            }
+        };
+        append("key", &self.key);
+        let session = self.session.lock().unwrap().clone();
+        if let Some(session) = session {
+            append("session", &session);
+        }
+        url
+    }
+}
+
+/// Extract the `session` query parameter from a (relative or absolute) URI.
+pub fn extract_session_param(uri: &str) -> Option<String> {
+    let (_, query) = uri.split_once('?')?;
+    let query = query.split('#').next().unwrap_or(query);
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix("session="))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Where a tileset's entries come from: a directory/base-URL of loose files
-/// (`tileset.json` + relative content URIs) or a packed `.3tz` archive
-/// (range-streamed; see [`super::archive::Archive3tz`]).
+/// (`tileset.json` + relative content URIs), a packed `.3tz` archive
+/// (range-streamed; see [`super::archive::Archive3tz`]), or a live sessioned
+/// endpoint (Google P3DT — keyed, budget-capped, never cached).
 #[derive(Debug, Clone)]
 pub enum TilesetSource {
     /// Base location; entry `uri`s resolve relative to it.
     Exploded(ExplodedBase),
     Archive(Arc<super::archive::Archive3tz>),
+    Live(Arc<LiveSession>),
 }
 
 /// Base for an exploded tileset: a native directory or an HTTP base URL.
@@ -312,6 +498,10 @@ impl TilesetSource {
                     e => FetchError::Io(format!("3tz entry {uri}: {e}")),
                 })
             }
+            TilesetSource::Live(live) => {
+                live.budget.try_acquire().map_err(FetchError::BudgetExhausted)?;
+                ByteSource::Http(live.entry_url(uri)).read_all_abortable(abort).await
+            }
         }
     }
 
@@ -327,6 +517,11 @@ impl TilesetSource {
         uri: &str,
         abort: Option<&AbortHandle>,
     ) -> Result<Vec<u8>, FetchError> {
+        // Live sources (Google P3DT) BYPASS the CAS entirely: the ToS forbids
+        // persisting tile content (plan D7) — gate-tested, don't "optimize".
+        if matches!(self, TilesetSource::Live(_)) {
+            return self.read_entry_raw(uri, abort).await;
+        }
         let key = self.entry_cache_key(uri);
         #[cfg(target_arch = "wasm32")]
         if let Some(key) = &key
@@ -355,6 +550,8 @@ impl TilesetSource {
             },
             TilesetSource::Exploded(ExplodedBase::Url(base)) => base.as_str(),
             TilesetSource::Exploded(ExplodedBase::Dir(_)) => return None,
+            // Live content must never get a cache key (ToS — see above).
+            TilesetSource::Live(_) => return None,
         };
         if !(base.starts_with("https://") || base.starts_with("http://")) {
             return None;
@@ -659,6 +856,91 @@ mod tests {
         assert_eq!(parse_content_range_total(" bytes 0-0/12"), Some(12));
         assert_eq!(parse_content_range_total("bytes */512"), Some(512));
         assert_eq!(parse_content_range_total("garbage"), None);
+    }
+
+    #[test]
+    fn session_param_extraction() {
+        assert_eq!(
+            extract_session_param("/v1/3dtiles/datasets/abc/files/x.json?session=TOK-123"),
+            Some("TOK-123".to_string())
+        );
+        assert_eq!(
+            extract_session_param("https://tile.googleapis.com/x.glb?a=1&session=Z&b=2"),
+            Some("Z".to_string())
+        );
+        assert_eq!(extract_session_param("content/0.glb"), None);
+        assert_eq!(extract_session_param("x.json?session="), None);
+    }
+
+    #[test]
+    fn live_session_url_building() {
+        let live = LiveSession::new(
+            "https://tile.googleapis.com/v1/3dtiles/root.json",
+            "KEY1".into(),
+            BudgetCounter::new(0, None),
+        );
+        // Before a session exists: key only; absolute paths join the host.
+        assert_eq!(
+            live.entry_url("/v1/3dtiles/datasets/a/files/b.json"),
+            "https://tile.googleapis.com/v1/3dtiles/datasets/a/files/b.json?key=KEY1"
+        );
+        // The full root URL passes through.
+        assert_eq!(
+            live.entry_url("https://tile.googleapis.com/v1/3dtiles/root.json"),
+            "https://tile.googleapis.com/v1/3dtiles/root.json?key=KEY1"
+        );
+        live.set_session("SESH".into());
+        // Session appended once known; an existing session param is kept.
+        assert_eq!(
+            live.entry_url("/x.glb"),
+            "https://tile.googleapis.com/x.glb?key=KEY1&session=SESH"
+        );
+        assert_eq!(
+            live.entry_url("/x.glb?session=OTHER"),
+            "https://tile.googleapis.com/x.glb?session=OTHER&key=KEY1"
+        );
+    }
+
+    #[test]
+    fn budget_counter_hard_stops_at_cap() {
+        let b = BudgetCounter::new(3, None);
+        assert_eq!(b.try_acquire(), Ok(1));
+        assert_eq!(b.try_acquire(), Ok(2));
+        assert_eq!(b.try_acquire(), Ok(3));
+        assert!(b.exhausted());
+        assert_eq!(b.try_acquire(), Err(3));
+        assert_eq!(b.used(), 3);
+        // cap 0 = unlimited (provider default), never exhausts.
+        let unlimited = BudgetCounter::new(0, None);
+        for _ in 0..100 {
+            assert!(unlimited.try_acquire().is_ok());
+        }
+        assert!(!unlimited.exhausted());
+    }
+
+    /// The CAS-bypass gate (D7): a Live source never produces a cache key,
+    /// and a budget-exhausted source refuses the request outright.
+    #[test]
+    fn live_source_bypasses_cas_and_enforces_budget() {
+        let live = Arc::new(LiveSession::new(
+            "https://tile.googleapis.com/v1/3dtiles/root.json",
+            "K".into(),
+            BudgetCounter::new(1, None),
+        ));
+        let source = TilesetSource::Live(live.clone());
+        assert!(source.entry_cache_key("anything.glb").is_none());
+        live.budget().try_acquire().unwrap(); // burn the budget
+        let res = bevy::tasks::block_on(source.read_entry("x.glb"));
+        assert!(matches!(res, Err(FetchError::BudgetExhausted(1))), "{res:?}");
+    }
+
+    #[test]
+    fn utc_date_is_iso_shaped() {
+        let d = utc_date();
+        assert_eq!(d.len(), 10, "{d}");
+        assert_eq!(d.as_bytes()[4], b'-');
+        assert_eq!(d.as_bytes()[7], b'-');
+        assert!(d.starts_with("20"), "{d}");
     }
 
     #[test]

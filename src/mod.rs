@@ -30,6 +30,7 @@
 //! under rigid/uniform anchor transforms without rebuilding tree volumes.
 //! Dev-trigger tilesets (`TT_TILES3D=…` / `?tiles3d=…`) stay world-anchored.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bevy::camera::primitives::{Frustum, Sphere};
@@ -41,16 +42,23 @@ use bevy_panorbit_camera::PanOrbitCamera;
 
 pub mod archive;
 pub mod content;
+pub mod draco;
 pub mod fetch;
+pub mod geo;
 pub mod schema;
 pub mod traversal;
 
 use archive::Archive3tz;
-use content::DecodedItem;
-use fetch::{ByteSource, ExplodedBase, TilesetSource};
-use traversal::{History, SelectParams, TileContent, TileTree, ZUP_TO_BEVY};
+use content::{DecodedItem, DecodedTile};
+use fetch::{BudgetCounter, ByteSource, ExplodedBase, LiveSession, TilesetSource};
+use traversal::{History, SelectParams, TileContent, TileTree, TreeFrame, ZUP_TO_BEVY};
 
 use crate::plugins::scene_layout::TwinMeshGroup;
+use crate::plugins::spatial_source::{ProjectOrigin, ProjectOriginInner};
+
+/// The Google Photorealistic 3D Tiles root tileset (D7). The org's API key
+/// is appended per request, never stored in the row.
+pub const GOOGLE_P3DT_ROOT_URL: &str = "https://tile.googleapis.com/v1/3dtiles/root.json";
 
 /// Committed demo tileset (see `examples/gen_tiles3d_fixture.rs`). The path
 /// doubles as a relative URL under Trunk (assets are `copy-dir`'d) and a
@@ -86,12 +94,25 @@ impl Default for Tiles3dConfig {
     }
 }
 
+/// Google P3DT per-layer config, denormalized from the project row (L3).
+#[derive(Debug, Clone)]
+pub struct P3dtParams {
+    /// Org's Map Tiles API key (client-visible by design, L-D4).
+    pub api_key: String,
+    /// Hard per-day request stop; 0 = no client-side cap (D7 guardrail).
+    pub daily_request_cap: u32,
+}
+
 /// Attach a streaming tileset under an anchor entity (D6 resolver routing —
-/// sent by the asset loader for `"3dtiles"` renditions).
+/// sent by the asset loader for `"3dtiles"` renditions, and by the layers
+/// resolver for world layers).
 #[derive(Message, Debug, Clone)]
 pub struct Tiles3dAttach {
     /// Entity the tileset root parents under (twin entity / preview root).
     /// Tile placement = anchor's world transform × `local` × tile transforms.
+    /// Georeferenced (ECEF) tilesets ignore the anchor's transform — they
+    /// place themselves via the project origin's ENU frame; the anchor only
+    /// scopes their lifecycle (detach-by-anchor, GC).
     pub anchor: Entity,
     /// `.3tz` blob URL (SAS-signed) or an exploded `tileset.json` URL.
     pub url: String,
@@ -103,6 +124,9 @@ pub struct Tiles3dAttach {
     pub twin_id: Option<String>,
     /// Display label for logs/debug (asset id, twin id…).
     pub label: String,
+    /// Google P3DT session config: routes the open through a live, keyed,
+    /// budget-capped, never-cached source (D7). `None` = a normal tileset.
+    pub p3dt: Option<P3dtParams>,
 }
 
 /// Tear down any tileset anchored to this entity (rebind / mode switch).
@@ -134,6 +158,21 @@ enum TileSlot {
     Failed,
 }
 
+/// How a set's tree coordinates reach Bevy world space.
+enum SetFrame {
+    /// Set-local frame: the root entity's `GlobalTransform` (anchor chain ×
+    /// rendition correction) places the set; selection pulls the camera into
+    /// set-local coordinates (T1).
+    Anchored,
+    /// Tree coordinates are ECEF (T4): placement = the ENU frame at the
+    /// project origin, recomputed from absolutes in f64 on origin change
+    /// (basemap's rebase model — no accumulated drift; one view, true world
+    /// positions — a spaceborne anchor puts ground tiles at their real
+    /// height far below, exactly like basemap terrain). `built` = the
+    /// origin resident tile transforms were composed at.
+    Ecef { built: Option<ProjectOriginInner> },
+}
+
 /// One streaming tileset.
 pub struct ActiveTileset {
     id: u64,
@@ -154,6 +193,37 @@ pub struct ActiveTileset {
     /// Last logged render-cut shape `(tiles, min_depth, max_depth)` —
     /// transitions are the observable trace of LOD swaps.
     last_cut: Option<(usize, u32, u32)>,
+    /// Placement frame (T4): anchored set-local vs georeferenced ECEF.
+    frame: SetFrame,
+    /// Per-tile `CESIUM_RTC` centers (ECEF) — composed into the spawn
+    /// transform in f64, kept for origin rebases.
+    rtc_centers: Vec<Option<DVec3>>,
+    /// Aggregated tile `asset.copyright` fragments (P3DT attribution, D7).
+    copyrights: BTreeSet<String>,
+    /// Budget-exhausted warning emitted (log once, not per frame).
+    budget_warned: bool,
+}
+
+impl ActiveTileset {
+    fn tree_frame(&self) -> TreeFrame {
+        match self.frame {
+            SetFrame::Anchored => TreeFrame::Local,
+            SetFrame::Ecef { .. } => TreeFrame::Ecef,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(self.source, TilesetSource::Live(_))
+    }
+}
+
+/// Attribution side-band of the streaming tilesets, read by the basemap's
+/// overlay system: aggregated tile copyrights (P3DT ToS requires showing
+/// them) and whether Google content is on screen (logo requirement).
+#[derive(Resource, Default, PartialEq, Eq)]
+pub struct TilesetCredits {
+    pub lines: Vec<String>,
+    pub google_visible: bool,
 }
 
 /// Live tilesets + scheduler counters.
@@ -206,9 +276,14 @@ impl Tiles3dSets {
 
     /// Root-volume bounding sphere of the tileset anchored to `anchor`, in
     /// the tileset's local (root-entity) frame — for camera framing. The
-    /// caller composes the root entity's `GlobalTransform`.
+    /// caller composes the root entity's `GlobalTransform`, so ECEF sets
+    /// (whose volumes are planetary ECEF, not root-entity-local) return
+    /// `None` — world layers aren't camera-framing targets.
     pub fn root_volume_for_anchor(&self, anchor: Entity) -> Option<(Entity, Vec3, f32)> {
         let set = self.sets.iter().find(|s| s.anchor == Some(anchor))?;
+        if !matches!(set.frame, SetFrame::Anchored) {
+            return None;
+        }
         let (center, radius) = set.tree.nodes.first()?.volume.bounding_sphere();
         Some((set.root_entity, center.as_vec3(), radius as f32))
     }
@@ -220,6 +295,14 @@ struct AttachTarget {
     anchor: Entity,
     local: Transform,
     twin_id: Option<String>,
+}
+
+/// What one tile's content fetch produced.
+enum TileOutput {
+    Content(Box<DecodedTile>),
+    /// `content.uri` named another tileset.json (external tileset — the
+    /// P3DT tree is built of these): graft it under the tile.
+    Subtree(Box<schema::Tileset>),
 }
 
 /// Async-task → ECS messages.
@@ -234,7 +317,7 @@ enum Tiles3dMsg {
         set_id: u64,
         tile: usize,
         generation: u64,
-        result: Result<Vec<DecodedItem>, String>,
+        result: Result<TileOutput, String>,
     },
 }
 
@@ -258,12 +341,19 @@ impl Plugin for Tiles3dPlugin {
         app.init_resource::<Tiles3dConfig>()
             .init_resource::<Tiles3dSets>()
             .init_resource::<Tiles3dChannel>()
+            .init_resource::<TilesetCredits>()
             .add_message::<Tiles3dAttach>()
             .add_message::<Tiles3dDetach>()
             .add_systems(Startup, init_dev_tileset)
             .add_systems(
                 Update,
-                (apply_attach_detach, receive_tiles3d, drive_tiles3d).chain(),
+                (
+                    apply_attach_detach,
+                    receive_tiles3d,
+                    drive_tiles3d,
+                    update_google_logo,
+                )
+                    .chain(),
             );
     }
 }
@@ -289,7 +379,7 @@ fn init_dev_tileset(channel: Res<Tiles3dChannel>) {
     let Some(spec) = dev_source_spec() else { return };
     let spec = if spec == "fixture" { FIXTURE_SPEC.to_string() } else { spec };
     info!("tiles3d: dev trigger — opening {spec}");
-    spawn_tileset_open(spec, None, channel.tx.clone());
+    spawn_tileset_open(spec, None, None, channel.tx.clone());
 }
 
 /// Drain attach/detach messages from the asset loader (D6 routing).
@@ -329,6 +419,7 @@ fn apply_attach_detach(
         sets.pending_anchors.insert(msg.anchor);
         spawn_tileset_open(
             msg.url.clone(),
+            msg.p3dt.clone(),
             Some(AttachTarget {
                 anchor: msg.anchor,
                 local: msg.local,
@@ -352,11 +443,12 @@ fn abort_in_flight(set: &ActiveTileset) {
 /// `tileset.json`, report back on the channel.
 fn spawn_tileset_open(
     spec: String,
+    p3dt: Option<P3dtParams>,
     attach: Option<AttachTarget>,
     tx: crossbeam_channel::Sender<Tiles3dMsg>,
 ) {
     fetch::spawn_io(async move {
-        let result = open_tileset(&spec).await;
+        let result = open_tileset(&spec, p3dt).await;
         let _ = tx.send(Tiles3dMsg::TilesetOpened { label: spec, attach, result });
     });
 }
@@ -383,7 +475,47 @@ fn is_archive_spec(spec: &str) -> bool {
     spec.split(['?', '#']).next().unwrap_or(spec).ends_with(".3tz")
 }
 
-async fn open_tileset(spec: &str) -> Result<(TilesetSource, Box<schema::Tileset>), String> {
+/// Walk a parsed tileset for the first content URI carrying a `session`
+/// query param and adopt it into the live session (the P3DT protocol: the
+/// root response embeds the token in its child URIs; every subsequent
+/// request must echo it).
+fn adopt_session(live: &LiveSession, tileset: &schema::Tileset) {
+    fn find(tile: &schema::Tile) -> Option<String> {
+        if let Some(content) = &tile.content
+            && let Some(session) = fetch::extract_session_param(&content.uri)
+        {
+            return Some(session);
+        }
+        tile.children.iter().find_map(find)
+    }
+    if let Some(session) = find(&tileset.root) {
+        let fresh = !live.has_session();
+        live.set_session(session);
+        if fresh {
+            info!("tiles3d: P3DT session established");
+        }
+    }
+}
+
+async fn open_tileset(
+    spec: &str,
+    p3dt: Option<P3dtParams>,
+) -> Result<(TilesetSource, Box<schema::Tileset>), String> {
+    if let Some(p3dt) = p3dt {
+        // Live sessioned endpoint (Google P3DT, D7): keyed, budget-capped,
+        // never CAS-cached. The root fetch is the billed "root request".
+        let budget = BudgetCounter::new(p3dt.daily_request_cap, Some("p3dt"));
+        let live = Arc::new(LiveSession::new(spec, p3dt.api_key, budget));
+        let source = TilesetSource::Live(live.clone());
+        let bytes = source
+            .read_entry_cached(spec, None)
+            .await
+            .map_err(|e| format!("fetch P3DT root: {e}"))?;
+        let tileset =
+            schema::parse_tileset(&bytes).map_err(|e| format!("parse P3DT root: {e}"))?;
+        adopt_session(&live, &tileset);
+        return Ok((source, Box::new(tileset)));
+    }
     let source = if is_archive_spec(spec) {
         let archive = Archive3tz::open(byte_source_for(spec))
             .await
@@ -424,6 +556,7 @@ async fn open_tileset(spec: &str) -> Result<(TilesetSource, Box<schema::Tileset>
 fn receive_tiles3d(
     channel: Res<Tiles3dChannel>,
     config: Res<Tiles3dConfig>,
+    origin: Res<ProjectOrigin>,
     mut sets: ResMut<Tiles3dSets>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -449,28 +582,48 @@ fn receive_tiles3d(
                             continue;
                         }
                     }
-                    // Tilesets are local-metres Z-up at their own origin; the
-                    // anchor entity (twin/preview, when present) carries the
-                    // ENU/world placement, so the tree itself only converts
-                    // Z-up → Bevy. Dev sets sit at the world origin.
                     let anchor = attach.as_ref().map(|a| a.anchor);
-                    match TileTree::build(&tileset, ZUP_TO_BEVY) {
+                    // Frame decision (T4): live P3DT and detected
+                    // georeferenced tilesets are ECEF trees placed via the
+                    // project origin's ENU frame; everything else is a
+                    // local-metres Z-up set placed by its anchor entity.
+                    let georef = matches!(source, TilesetSource::Live(_))
+                        || geo::tileset_is_georeferenced(&tileset);
+                    let (frame, world_from_tileset, tree_frame) = if georef {
+                        (SetFrame::Ecef { built: None }, DMat4::IDENTITY, TreeFrame::Ecef)
+                    } else {
+                        (SetFrame::Anchored, ZUP_TO_BEVY, TreeFrame::Local)
+                    };
+                    match TileTree::build(&tileset, world_from_tileset, tree_frame) {
                         Ok(tree) => {
                             let n = tree.len();
                             let id = sets.next_set_id;
                             sets.next_set_id += 1;
+                            // ECEF sets are NOT parented under the anchor:
+                            // their placement comes from the ENU frame, and
+                            // an anchor transform (twin placement) must not
+                            // shift them. The anchor still scopes lifecycle.
                             let mut root = commands.spawn((
                                 Name::new(format!("Tiles3d({label})")),
-                                attach.as_ref().map(|a| a.local).unwrap_or_default(),
                                 Visibility::default(),
                             ));
-                            if let Some(a) = &attach {
-                                root.insert(ChildOf(a.anchor));
+                            if georef {
+                                root.insert(Transform::IDENTITY);
+                            } else {
+                                root.insert(
+                                    attach.as_ref().map(|a| a.local).unwrap_or_default(),
+                                );
+                                if let Some(a) = &attach {
+                                    root.insert(ChildOf(a.anchor));
+                                }
                             }
                             let root_entity = root.id();
                             let mut history = History::default();
                             history.resize(n);
-                            info!("tiles3d: {label}: {n} tiles");
+                            info!(
+                                "tiles3d: {label}: {n} tiles{}",
+                                if georef { " (georeferenced — ECEF frame)" } else { "" }
+                            );
                             sets.sets.push(ActiveTileset {
                                 id,
                                 label,
@@ -484,6 +637,10 @@ fn receive_tiles3d(
                                 twin_id: attach.and_then(|a| a.twin_id),
                                 placeholder_cleared: false,
                                 last_cut: None,
+                                frame,
+                                rtc_centers: vec![None; n],
+                                copyrights: BTreeSet::new(),
+                                budget_warned: false,
                             });
                         }
                         Err(e) => {
@@ -515,8 +672,58 @@ fn receive_tiles3d(
                     continue;
                 }
                 match result {
-                    Ok(items) => {
+                    Ok(TileOutput::Subtree(external)) => {
                         spawned += 1;
+                        if let TilesetSource::Live(live) = &set.source {
+                            adopt_session(live, &external);
+                        }
+                        match set.tree.graft(tile, &external, set.tree_frame()) {
+                            Ok(_) => {
+                                // The graft consumed the content: the tile is
+                                // a plain interior node now; its subtree's
+                                // slots ride the same per-tile arrays.
+                                set.tree.nodes[tile].content_uri = None;
+                                let n = set.tree.len();
+                                set.slots.resize(n, TileSlot::NotLoaded);
+                                set.last_touched.resize(n, 0);
+                                set.rtc_centers.resize(n, None);
+                                set.history.resize(n);
+                                set.slots[tile] = TileSlot::NotLoaded;
+                                info!(
+                                    "tiles3d: {}: external tileset grafted at tile {tile} \
+                                     (tree now {n} tiles)",
+                                    set.label
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "tiles3d: {}: unusable external tileset at tile {tile}: {e}",
+                                    set.label
+                                );
+                                set.slots[tile] = TileSlot::Failed;
+                            }
+                        }
+                    }
+                    Ok(TileOutput::Content(decoded)) => {
+                        spawned += 1;
+                        let DecodedTile { items, rtc_center, copyright } = *decoded;
+                        set.rtc_centers[tile] = rtc_center;
+                        if let Some(c) = copyright {
+                            for frag in c.split(';') {
+                                let frag = frag.trim();
+                                if !frag.is_empty() {
+                                    set.copyrights.insert(frag.to_string());
+                                }
+                            }
+                        }
+                        // ECEF sets compose placement against the CURRENT
+                        // origin in f64; tiles landing before the origin
+                        // resolves wait (re-requested once it exists).
+                        let Some(transform) = tile_spawn_transform(set, tile, origin.get())
+                        else {
+                            set.slots[tile] = TileSlot::NotLoaded;
+                            continue;
+                        };
                         let entity = spawn_tile_content(
                             &mut commands,
                             &mut meshes,
@@ -527,6 +734,7 @@ fn receive_tiles3d(
                             &shared_point_material,
                             set,
                             tile,
+                            transform,
                             items,
                         );
                         set.slots[tile] = TileSlot::Ready { entity };
@@ -544,6 +752,43 @@ fn receive_tiles3d(
     }
 }
 
+/// A tile's spawn transform in its set's frame. Anchored sets: the
+/// precomposed `world_from_content` (the root entity's transform chain
+/// finishes placement). ECEF sets: `world_from_ecef × ecef_from_content ×
+/// rtc` composed **in f64** against the current origin — the planetary
+/// magnitudes cancel before the f32 cast (the altitude-anchor jitter
+/// lesson). `None` = the origin isn't resolved yet — the caller re-queues
+/// the tile.
+fn tile_spawn_transform(
+    set: &ActiveTileset,
+    tile: usize,
+    origin: Option<ProjectOriginInner>,
+) -> Option<Transform> {
+    let node = &set.tree.nodes[tile];
+    match set.frame {
+        SetFrame::Anchored => Some(Transform::from_matrix(node.world_from_content.as_mat4())),
+        SetFrame::Ecef { .. } => {
+            let o = origin?;
+            let m = compose_ecef_tile_matrix(o, node.world_from_content, set.rtc_centers[tile]);
+            Some(Transform::from_matrix(m.as_mat4()))
+        }
+    }
+}
+
+/// `world_from_ecef(origin) × ecef_from_content × T(rtc_center)`, in f64.
+fn compose_ecef_tile_matrix(
+    origin: ProjectOriginInner,
+    ecef_from_content: DMat4,
+    rtc_center: Option<DVec3>,
+) -> DMat4 {
+    let world_from_ecef = crate::plugins::spatial_source::enu::world_from_ecef(origin);
+    let mut m = world_from_ecef * ecef_from_content;
+    if let Some(rtc) = rtc_center {
+        m *= DMat4::from_translation(rtc);
+    }
+    m
+}
+
 /// Spawn one tile's decoded items under a hidden tile-root entity. The
 /// render cut flips the root's visibility; children inherit. Twin-anchored
 /// sets tag content with `TwinMeshGroup` so selection/highlight/focus treat
@@ -559,13 +804,13 @@ fn spawn_tile_content(
     shared_point_material: &crate::plugins::point_cloud::SharedPointMaterial,
     set: &ActiveTileset,
     tile: usize,
+    transform: Transform,
     items: Vec<DecodedItem>,
 ) -> Entity {
-    let node = &set.tree.nodes[tile];
     let tile_root = commands
         .spawn((
             Tiles3dTile { set_id: set.id, tile },
-            Transform::from_matrix(node.world_from_content.as_mat4()),
+            transform,
             // Spawned hidden; `drive_tiles3d`'s cut reveals it — a freshly
             // loaded tile must never flash over the coarser one it replaces.
             Visibility::Hidden,
@@ -639,30 +884,42 @@ fn spawn_tile_content(
 fn drive_tiles3d(
     config: Res<Tiles3dConfig>,
     channel: Res<Tiles3dChannel>,
+    origin: Res<ProjectOrigin>,
     mut sets: ResMut<Tiles3dSets>,
+    mut credits: ResMut<TilesetCredits>,
     camera: Query<(&Camera, &GlobalTransform, &Projection, &Frustum), With<PanOrbitCamera>>,
     transforms: Query<&GlobalTransform>,
     mut vis_q: Query<&mut Visibility, With<Tiles3dTile>>,
+    mut tile_transforms: Query<&mut Transform, With<Tiles3dTile>>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut commands: Commands,
 ) {
     let Tiles3dSets { sets, frame, next_generation, .. } = &mut *sets;
     *frame += 1;
 
-    // GC: an anchored set whose root entity died (anchor despawned — the
-    // hierarchy took the root and every tile entity with it) is torn down
-    // here; its in-flight requests abort and late results drop harmlessly.
-    // (`pending_anchors` / `failed_anchors` keep dead Entity ids — harmless:
-    // entity generations never repeat, and the per-id cost is 8 bytes.)
+    // GC: a set whose root entity died — or whose anchor died (ECEF roots
+    // are NOT parented under their anchor, so the hierarchy can't cascade
+    // for them) — is torn down here; its in-flight requests abort and late
+    // results drop harmlessly. (`pending_anchors` / `failed_anchors` keep
+    // dead Entity ids — harmless: entity generations never repeat, and the
+    // per-id cost is 8 bytes.)
     sets.retain(|set| {
-        if set.anchor.is_none() || transforms.contains(set.root_entity) {
+        let root_alive = transforms.contains(set.root_entity);
+        let anchor_alive = set.anchor.is_none_or(|a| transforms.contains(a));
+        if root_alive && anchor_alive {
             return true;
         }
         info!("tiles3d: {}: anchor gone — dropping tileset", set.label);
         abort_in_flight(set);
+        if root_alive && let Ok(mut e) = commands.get_entity(set.root_entity) {
+            e.despawn();
+        }
         false
     });
     if sets.is_empty() {
+        if *credits != TilesetCredits::default() {
+            *credits = TilesetCredits::default();
+        }
         return;
     }
     let Ok((cam, cam_gt, proj, frustum)) = camera.single() else { return };
@@ -677,19 +934,49 @@ fn drive_tiles3d(
     let cam_forward_world = Vec3::from(cam_gt.forward()).as_dvec3();
 
     let mut any_in_flight = false;
+    let mut google_visible = false;
     for set in sets.iter_mut() {
-        // The set's frame: world_from_set = anchor chain × correction (the
-        // root entity's GlobalTransform — last frame's propagation, fine for
-        // streaming decisions). Selection runs in set-local coordinates:
-        // distances and geometric errors share the tileset's metres, so SSE
-        // is exact under rigid/uniform anchor transforms — no per-frame
-        // volume rebuilds for moving twins.
-        let world_from_set = transforms
-            .get(set.root_entity)
-            .map(|gt| gt.to_matrix().as_dmat4())
-            .unwrap_or(DMat4::IDENTITY);
+        // The set's frame. Anchored: world_from_set = anchor chain ×
+        // correction (the root entity's GlobalTransform — last frame's
+        // propagation, fine for streaming decisions); selection runs in
+        // set-local coordinates so SSE is exact under rigid/uniform anchor
+        // transforms. ECEF (T4): world_from_set = the ENU frame at the
+        // project origin, recomputed from absolutes in f64 — one view, true
+        // world positions (the one-view atmosphere model).
+        let (world_from_set, set_scale) = match &mut set.frame {
+            SetFrame::Anchored => {
+                let m = transforms
+                    .get(set.root_entity)
+                    .map(|gt| gt.to_matrix().as_dmat4())
+                    .unwrap_or(DMat4::IDENTITY);
+                let scale = traversal::max_scale(&m).max(1e-12);
+                (m, scale)
+            }
+            SetFrame::Ecef { built } => {
+                let Some(o) = origin.get() else {
+                    // No ENU datum yet — hold the set entirely.
+                    continue;
+                };
+                if *built != Some(o) {
+                    // ORIGIN REBASE (basemap's model, exact-recompute form):
+                    // re-place every resident tile from absolutes in f64.
+                    *built = Some(o);
+                    for (i, slot) in set.slots.iter_mut().enumerate() {
+                        let TileSlot::Ready { entity } = *slot else { continue };
+                        if let Ok(mut t) = tile_transforms.get_mut(entity) {
+                            let m = compose_ecef_tile_matrix(
+                                o,
+                                set.tree.nodes[i].world_from_content,
+                                set.rtc_centers[i],
+                            );
+                            *t = Transform::from_matrix(m.as_mat4());
+                        }
+                    }
+                }
+                (crate::plugins::spatial_source::enu::world_from_ecef(o), 1.0)
+            }
+        };
         let set_from_world = world_from_set.inverse();
-        let set_scale = traversal::max_scale(&world_from_set).max(1e-12);
         let cam_pos = set_from_world.transform_point3(cam_pos_world);
         let cam_forward = set_from_world
             .transform_vector3(cam_forward_world)
@@ -786,11 +1073,31 @@ fn drive_tiles3d(
                 *slot = TileSlot::NotLoaded;
             }
         }
+        // Budget guardrail (D7): a live set whose daily request cap is
+        // exhausted issues nothing more — hard stop, warn once.
+        let budget_exhausted = match &set.source {
+            TilesetSource::Live(live) => {
+                let exhausted = live.budget().exhausted();
+                if exhausted && !set.budget_warned {
+                    warn!(
+                        "tiles3d: {}: daily request cap reached ({} requests) — \
+                         P3DT streaming halted until tomorrow (org admins set the \
+                         cap on the layer entry)",
+                        set.label,
+                        live.budget().cap(),
+                    );
+                    set.budget_warned = true;
+                }
+                exhausted
+            }
+            _ => false,
+        };
+
         // Issue new requests in priority order under the concurrency cap.
         let mut in_flight =
             set.slots.iter().filter(|s| matches!(s, TileSlot::InFlight { .. })).count();
         for req in &sel.loads {
-            if in_flight >= config.max_concurrent_loads {
+            if budget_exhausted || in_flight >= config.max_concurrent_loads {
                 break;
             }
             if !matches!(set.slots[req.tile], TileSlot::NotLoaded) {
@@ -808,8 +1115,20 @@ fn drive_tiles3d(
             fetch::spawn_io(async move {
                 // Fetch + decode entirely inside the task (wasm: every IO step
                 // awaits a JS future and yields; decode is small-tile CPU).
+                // Content naming another tileset.json is an external tileset
+                // (the P3DT tree shape) — parsed here, grafted on receive.
+                let is_subtree = uri
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(&uri)
+                    .ends_with(".json");
                 let result = match source.read_entry_cached(&uri, Some(&abort)).await {
-                    Ok(bytes) => content::decode_glb(&bytes),
+                    Ok(bytes) if is_subtree => schema::parse_tileset(&bytes)
+                        .map(|ts| TileOutput::Subtree(Box::new(ts)))
+                        .map_err(|e| format!("parse external tileset: {e}")),
+                    Ok(bytes) => content::decode_tile(&bytes)
+                        .await
+                        .map(|tile| TileOutput::Content(Box::new(tile))),
                     Err(e) => Err(e.to_string()),
                 };
                 fetch::unregister_abort(generation);
@@ -869,8 +1188,24 @@ fn drive_tiles3d(
             }
         }
         set.history.absorb(&sel, tree.len());
+        google_visible |= set.is_live() && !sel.render.is_empty();
         any_in_flight |=
             set.slots.iter().any(|s| matches!(s, TileSlot::InFlight { .. }));
+    }
+
+    // Attribution side-band (D7/L-D5): aggregated tile copyrights + the
+    // Google-logo flag, consumed by the basemap overlay system. Change-gated
+    // to avoid resource churn.
+    let mut lines: BTreeSet<&String> = BTreeSet::new();
+    for set in sets.iter() {
+        lines.extend(&set.copyrights);
+    }
+    let want = TilesetCredits {
+        lines: lines.into_iter().cloned().collect(),
+        google_visible,
+    };
+    if *credits != want {
+        *credits = want;
     }
 
     // Keep the reactive loop awake while content streams — without this the
@@ -880,6 +1215,56 @@ fn drive_tiles3d(
         redraw.write(RequestRedraw);
     }
 }
+
+/// Show/remove the Google logo overlay while Photorealistic 3D Tiles render
+/// (Map Tiles API attribution policy: the logo must be visible whenever
+/// Google content is; bottom-left, clear of the data attributions at
+/// bottom-right). Only touches the DOM on a state change.
+fn update_google_logo(credits: Res<TilesetCredits>, mut last: Local<Option<bool>>) {
+    let want = credits.google_visible;
+    if *last == Some(want) {
+        return;
+    }
+    *last = Some(want);
+    set_google_logo_dom(want);
+}
+
+/// Create/remove the `#tt-google-logo` overlay div (the official Google
+/// wordmark served from gstatic, on a subtle backing chip for contrast per
+/// the brand guidance).
+#[cfg(target_arch = "wasm32")]
+fn set_google_logo_dom(show: bool) {
+    const ID: &str = "tt-google-logo";
+    const LOGO_URL: &str =
+        "https://www.gstatic.com/images/branding/googlelogo/svg/googlelogo_clr_74x24px.svg";
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    if show {
+        if doc.get_element_by_id(ID).is_some() {
+            return;
+        }
+        let Some(body) = doc.body() else { return };
+        if let Ok(el) = doc.create_element("div") {
+            el.set_id(ID);
+            let _ = el.set_attribute(
+                "style",
+                "position:fixed;left:6px;bottom:4px;z-index:30;\
+                 background:rgba(255,255,255,0.85);padding:2px 7px;border-radius:4px;\
+                 pointer-events:none;user-select:none;line-height:0;",
+            );
+            el.set_inner_html(&format!(
+                "<img src=\"{LOGO_URL}\" alt=\"Google\" style=\"height:19px\">"
+            ));
+            let _ = body.append_child(&el);
+        }
+    } else if let Some(el) = doc.get_element_by_id(ID) {
+        el.remove();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_google_logo_dom(_show: bool) {}
 
 #[cfg(test)]
 mod tests {
@@ -905,7 +1290,8 @@ mod tests {
         let source = TilesetSource::Exploded(ExplodedBase::Dir("assets/fixtures/tiles3d-demo".into()));
         let bytes = block_on(source.read_entry("tileset.json")).expect("fixture tileset.json");
         let tileset = schema::parse_tileset(&bytes).expect("parse");
-        let tree = TileTree::build(&tileset, ZUP_TO_BEVY).expect("build");
+        assert!(!geo::tileset_is_georeferenced(&tileset), "fixture is local-metres");
+        let tree = TileTree::build(&tileset, ZUP_TO_BEVY, TreeFrame::Local).expect("build");
         assert_eq!(tree.len(), 21, "1 root + 4 children + 16 leaves");
         // Mixed volume kinds present.
         let spheres = tree
@@ -932,7 +1318,7 @@ mod tests {
         assert_eq!(ar.index().len(), 22, "tileset.json + 21 GLBs");
         let bytes = block_on(ar.read_entry("tileset.json")).expect("tileset.json");
         let tileset = schema::parse_tileset(&bytes).expect("parse");
-        let tree = TileTree::build(&tileset, ZUP_TO_BEVY).expect("build");
+        let tree = TileTree::build(&tileset, ZUP_TO_BEVY, TreeFrame::Local).expect("build");
         let uri = tree.nodes[5].content_uri.clone().unwrap();
         let glb = block_on(ar.read_entry(&uri)).expect("tile glb via ranged read");
         assert!(content::decode_glb(&glb).is_ok());

@@ -29,6 +29,7 @@
 
 use bevy::math::{DMat4, DVec3, DVec4};
 
+use super::geo;
 use super::schema::{self, Refine, VolumeKind};
 
 /// Refine when a tile's screen-space error exceeds this many pixels.
@@ -126,6 +127,20 @@ pub const YUP_TO_ZUP: DMat4 = DMat4::from_cols(
     DVec4::new(0.0, 0.0, 0.0, 1.0),
 );
 
+/// Which frame a tile tree's coordinates live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeFrame {
+    /// Local-metres Z-up tileset (our tilers / the dev fixture): the build's
+    /// `world_from_tileset` (usually [`ZUP_TO_BEVY`]) is final, placement
+    /// rides the anchor entity. `region` volumes degrade to the parent's.
+    Local,
+    /// Georeferenced tileset (T4 — Google P3DT, national open data): tree
+    /// coordinates are **ECEF** (EPSG:4978) f64; `region` volumes convert via
+    /// [`geo::region_to_ecef_volume`]. Build with `world_from_tileset =
+    /// identity`; the per-frame ENU placement happens in `drive_tiles3d`.
+    Ecef,
+}
+
 /// One flattened tile. Index 0 is the root.
 #[derive(Debug, Clone)]
 pub struct TileNode {
@@ -136,11 +151,16 @@ pub struct TileNode {
     pub geometric_error: f64,
     pub refine: Refine,
     pub content_uri: Option<String>,
-    /// Bounding volume in Bevy world space (tile transforms pre-composed).
+    /// Bounding volume in the tree frame (tile transforms pre-composed;
+    /// Bevy world space for [`TreeFrame::Local`], ECEF for [`TreeFrame::Ecef`]).
     pub volume: WorldVolume,
     /// Full content placement: `world_from_tileset × cumulative tile
-    /// transforms × glTF-Y-up rotation`. The spawned tile entity's transform.
+    /// transforms × glTF-Y-up rotation`. The spawned tile entity's transform
+    /// (for ECEF trees: composed against the ENU placement first, in f64).
     pub world_from_content: DMat4,
+    /// Cumulative tile-frame transform WITHOUT the glTF rotation — the parent
+    /// matrix external tileset roots compose under when grafted here.
+    pub world_from_tile: DMat4,
 }
 
 impl TileNode {
@@ -166,10 +186,12 @@ impl TileTree {
 
     /// Flatten a parsed tileset. `world_from_tileset` places the tileset's
     /// frame in Bevy world space (for local-metres tilesets at the project
-    /// origin: [`ZUP_TO_BEVY`], optionally × the twin's ENU placement).
+    /// origin: [`ZUP_TO_BEVY`]; for [`TreeFrame::Ecef`] pass the identity —
+    /// the tree stays in ECEF and placement happens per frame).
     pub fn build(
         tileset: &schema::Tileset,
         world_from_tileset: DMat4,
+        frame: TreeFrame,
     ) -> Result<TileTree, String> {
         let mut tree = TileTree::default();
         build_node(
@@ -180,8 +202,40 @@ impl TileTree {
             Refine::Replace,
             world_from_tileset,
             None,
+            frame,
         )?;
         Ok(tree)
+    }
+
+    /// Graft an external tileset (a tile whose `content.uri` named another
+    /// `tileset.json`) under node `at`: the external root becomes a child of
+    /// `at`, composing under `at`'s cumulative transform and inheriting its
+    /// refine, per the 3D Tiles external-tileset semantics. The caller clears
+    /// `at`'s `content_uri` (the content was *consumed* by the graft).
+    /// Returns the new child's index; every appended node sits at indices
+    /// `>=` that value, so per-tile side arrays just resize.
+    pub fn graft(
+        &mut self,
+        at: usize,
+        external: &schema::Tileset,
+        frame: TreeFrame,
+    ) -> Result<usize, String> {
+        let parent_world = self.nodes[at].world_from_tile;
+        let inherited_refine = self.nodes[at].refine;
+        let parent_volume = Some(self.nodes[at].volume);
+        let depth = self.nodes[at].depth + 1;
+        let idx = build_node(
+            self,
+            &external.root,
+            Some(at),
+            depth,
+            inherited_refine,
+            parent_world,
+            parent_volume,
+            frame,
+        )?;
+        self.nodes[at].children.push(idx);
+        Ok(idx)
     }
 }
 
@@ -194,6 +248,7 @@ fn build_node(
     inherited_refine: Refine,
     parent_world: DMat4,
     parent_volume: Option<WorldVolume>,
+    frame: TreeFrame,
 ) -> Result<usize, String> {
     // The tile's own transform applies to its bounding volume AND content,
     // and composes down the tree (3D Tiles §"tile transforms").
@@ -216,13 +271,19 @@ fn build_node(
             ],
         }
         .transformed(&world),
+        // Regions are EPSG:4979 absolutes — per spec they are NOT affected
+        // by tile transforms, so the conversion ignores `world`.
+        Some(VolumeKind::Region(r)) if frame == TreeFrame::Ecef => {
+            geo::region_to_ecef_volume(&r)
+        }
         Some(VolumeKind::Region(_)) | None => {
-            // Region volumes are EPSG:4979 — placing them needs the
-            // georeferenced ECEF→ENU path (T4, Google P3DT). Until then a
-            // region (or missing) volume degrades to the parent's, keeping
-            // the tree traversable; the root has no parent to inherit.
+            // A region volume in a LOCAL tree has no defined placement (our
+            // tilers never emit them); it (or a missing volume) degrades to
+            // the parent's, keeping the tree traversable. The root has no
+            // parent to inherit.
             parent_volume.ok_or_else(|| {
-                "root bounding volume must be box or sphere (region placement lands with T4)"
+                "root bounding volume must be box or sphere in a local-frame tileset \
+                 (regions need the georeferenced ECEF path)"
                     .to_string()
             })?
         }
@@ -239,11 +300,21 @@ fn build_node(
         content_uri: tile.content.as_ref().map(|c| c.uri.clone()),
         volume,
         world_from_content: world * YUP_TO_ZUP,
+        world_from_tile: world,
     });
 
     let mut children = Vec::with_capacity(tile.children.len());
     for child in &tile.children {
-        children.push(build_node(tree, child, Some(idx), depth + 1, refine, world, Some(volume))?);
+        children.push(build_node(
+            tree,
+            child,
+            Some(idx),
+            depth + 1,
+            refine,
+            world,
+            Some(volume),
+            frame,
+        )?);
     }
     tree.nodes[idx].children = children;
     Ok(idx)
@@ -575,6 +646,7 @@ mod tests {
             content_uri: Some("root.glb".into()),
             volume: sphere(DVec3::ZERO, 30.0),
             world_from_content: DMat4::IDENTITY,
+                world_from_tile: DMat4::IDENTITY,
         });
         let quad = [(-10.0, -10.0), (10.0, -10.0), (-10.0, 10.0), (10.0, 10.0)];
         for (cx, cz) in quad {
@@ -588,6 +660,7 @@ mod tests {
                 content_uri: Some(format!("c{c}.glb")),
                 volume: sphere(DVec3::new(cx, 0.0, cz), 9.0),
                 world_from_content: DMat4::IDENTITY,
+                world_from_tile: DMat4::IDENTITY,
             });
             tree.nodes[0].children.push(c);
         }
@@ -604,6 +677,7 @@ mod tests {
                     content_uri: Some(format!("l{l}.glb")),
                     volume: sphere(DVec3::new(cx + lx * 0.25, 0.0, cz + lz * 0.25), 4.0),
                     world_from_content: DMat4::IDENTITY,
+                world_from_tile: DMat4::IDENTITY,
                 });
                 let cc = tree.nodes[c].children.clone();
                 tree.nodes[c].children = [cc, vec![l]].concat();
@@ -816,6 +890,7 @@ mod tests {
             content_uri: None,
             volume: sphere(DVec3::ZERO, 10.0),
             world_from_content: DMat4::IDENTITY,
+                world_from_tile: DMat4::IDENTITY,
         });
         for i in 0..2 {
             tree.nodes.push(TileNode {
@@ -827,6 +902,7 @@ mod tests {
                 content_uri: Some(format!("l{i}.glb")),
                 volume: sphere(DVec3::new(i as f64 * 4.0 - 2.0, 0.0, 0.0), 5.0),
                 world_from_content: DMat4::IDENTITY,
+                world_from_tile: DMat4::IDENTITY,
             });
         }
         let content =
@@ -870,7 +946,7 @@ mod tests {
             }
         }"#;
         let ts = schema::parse_tileset(json.as_bytes()).unwrap();
-        let tree = TileTree::build(&ts, ZUP_TO_BEVY).unwrap();
+        let tree = TileTree::build(&ts, ZUP_TO_BEVY, TreeFrame::Local).unwrap();
         assert_eq!(tree.len(), 3);
         // Child volume center: zup (10,0,3) → bevy (10, 3, 0).
         let WorldVolume::Obb { center, .. } = tree.nodes[1].volume else {
@@ -891,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn region_root_is_rejected_until_t4() {
+    fn region_root_rejected_in_local_frame_accepted_in_ecef() {
         let json = r#"{
             "asset": { "version": "1.1" },
             "geometricError": 1,
@@ -901,6 +977,72 @@ mod tests {
             }
         }"#;
         let ts = schema::parse_tileset(json.as_bytes()).unwrap();
-        assert!(TileTree::build(&ts, ZUP_TO_BEVY).is_err());
+        assert!(TileTree::build(&ts, ZUP_TO_BEVY, TreeFrame::Local).is_err());
+        let tree = TileTree::build(&ts, DMat4::IDENTITY, TreeFrame::Ecef).unwrap();
+        // The region landed as a real ECEF volume — its centre sits at
+        // planetary magnitude, not at the local origin.
+        let (center, radius) = tree.nodes[0].volume.bounding_sphere();
+        assert!(center.length() > 6_000_000.0, "center = {center:?}");
+        assert!(radius > 100.0 && radius < 100_000.0, "radius = {radius}");
+    }
+
+    #[test]
+    fn graft_external_tileset_under_content_tile() {
+        // Host: root → child with a translated transform whose content is an
+        // external tileset.json.
+        let host = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 64,
+            "root": {
+                "boundingVolume": { "sphere": [0, 0, 0, 100] },
+                "geometricError": 32,
+                "refine": "REPLACE",
+                "children": [{
+                    "boundingVolume": { "sphere": [0, 0, 0, 40] },
+                    "geometricError": 16,
+                    "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 100,0,0,1],
+                    "content": { "uri": "sub/tileset.json" }
+                }]
+            }
+        }"#;
+        // External: a root with its own child, positioned in the HOST tile's
+        // frame (the +100 X translation must compose through).
+        let external = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 16,
+            "root": {
+                "boundingVolume": { "sphere": [0, 0, 0, 40] },
+                "geometricError": 8,
+                "content": { "uri": "sub/root.glb" },
+                "children": [{
+                    "boundingVolume": { "sphere": [5, 0, 0, 10] },
+                    "geometricError": 0,
+                    "content": { "uri": "sub/leaf.glb" }
+                }]
+            }
+        }"#;
+        let host_ts = schema::parse_tileset(host.as_bytes()).unwrap();
+        let ext_ts = schema::parse_tileset(external.as_bytes()).unwrap();
+        let mut tree = TileTree::build(&host_ts, ZUP_TO_BEVY, TreeFrame::Local).unwrap();
+        assert_eq!(tree.len(), 2);
+
+        let new_root = tree.graft(1, &ext_ts, TreeFrame::Local).unwrap();
+        tree.nodes[1].content_uri = None; // consumed by the graft
+        assert_eq!(new_root, 2);
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree.nodes[1].children, vec![2]);
+        assert_eq!(tree.nodes[2].parent, Some(1));
+        assert_eq!(tree.nodes[2].depth, 2);
+        // Inherited REPLACE refine (external carries none).
+        assert_eq!(tree.nodes[2].refine, Refine::Replace);
+        // The host tile's +100 X (zup) transform composes into the grafted
+        // volumes: zup (100,0,0) → bevy (100,0,0).
+        let (c2, _) = tree.nodes[2].volume.bounding_sphere();
+        assert!((c2 - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9, "c2 = {c2:?}");
+        let (c3, _) = tree.nodes[3].volume.bounding_sphere();
+        assert!((c3 - DVec3::new(105.0, 0.0, 0.0)).length() < 1e-9, "c3 = {c3:?}");
+        // Content placement composes the same chain.
+        let p = tree.nodes[3].world_from_content.transform_point3(DVec3::ZERO);
+        assert!((p - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9, "p = {p:?}");
     }
 }

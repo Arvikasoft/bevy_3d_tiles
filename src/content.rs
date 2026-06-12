@@ -24,10 +24,12 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{CompressedImageFormats, Image, ImageSampler, ImageType};
-use bevy::math::{Mat4, Vec3};
+use bevy::math::{DVec3, Mat4, Vec3};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy_gaussian_splatting::gaussian::formats::planar_3d::Gaussian3d;
 use bevy_pointcloud::point_cloud::PointCloudData;
+
+use super::draco;
 
 /// One decoded glTF primitive, positioned by its node's global transform
 /// (glTF Y-up frame — the spawned tile entity applies
@@ -71,6 +73,52 @@ impl Default for DecodedMaterial {
             double_sided: false,
         }
     }
+}
+
+/// A fully decoded tile: renderable items plus the side-band data T4 needs.
+pub struct DecodedTile {
+    pub items: Vec<DecodedItem>,
+    /// `CESIUM_RTC` center (ECEF metres, Google P3DT). Composed into the
+    /// tile's placement **in f64 at spawn** — never baked into f32 vertex
+    /// data or a f32 transform (planetary magnitudes only cancel in f64).
+    pub rtc_center: Option<DVec3>,
+    /// glTF `asset.copyright` — aggregated into the attribution overlay
+    /// (required by the Google ToS, plan D7/L-D5).
+    pub copyright: Option<String>,
+}
+
+/// Decode a tile, routing by content markers: splats bypass the `gltf` crate
+/// (see module docs), Draco/`CESIUM_RTC` content is rewritten to vanilla glTF
+/// first ([`preprocess_glb`] — the `gltf` crate rejects unknown
+/// `extensionsRequired`), everything else takes the plain [`decode_glb`]
+/// path. Async only for the Draco decoder round-trip; plain tiles never
+/// yield.
+pub async fn decode_tile(bytes: &[u8]) -> Result<DecodedTile, String> {
+    let (json, bin) = split_glb(bytes)?;
+    let has_splat = memmem(json, b"KHR_gaussian_splatting");
+    let has_draco = memmem(json, b"KHR_draco_mesh_compression");
+    let has_rtc = memmem(json, b"CESIUM_RTC");
+    if !(has_splat || has_draco || has_rtc || memmem(json, b"copyright")) {
+        return Ok(DecodedTile { items: decode_glb(bytes)?, rtc_center: None, copyright: None });
+    }
+
+    let mut value: serde_json::Value =
+        serde_json::from_slice(json).map_err(|e| format!("tile json: {e}"))?;
+    let copyright = value["asset"]["copyright"].as_str().map(str::to_string);
+    let rtc_center = value["extensions"]["CESIUM_RTC"]["center"].as_array().and_then(|c| {
+        let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
+        <[f64; 3]>::try_from(v).ok().map(DVec3::from_array)
+    });
+
+    let items = if has_splat {
+        decode_splat_gltf(&value, bin)?
+    } else if has_draco || has_rtc {
+        let vanilla = preprocess_glb(&mut value, bin).await?;
+        decode_glb(&vanilla)?
+    } else {
+        decode_glb(bytes)?
+    };
+    Ok(DecodedTile { items, rtc_center, copyright })
 }
 
 /// Decode a GLB (or self-contained glTF JSON) tile into renderable items.
@@ -129,6 +177,253 @@ fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
 /// Naive substring scan (the JSON chunk is small; no memmem dependency).
 fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+// ── Draco / CESIUM_RTC preprocessing (T4 — Google P3DT content) ──────────────
+
+/// One `KHR_draco_mesh_compression` primitive found in the document.
+struct DracoPrim {
+    mesh: usize,
+    prim: usize,
+    buffer_view: usize,
+    /// glTF semantic → Draco attribute unique id, straight from the ext JSON.
+    attributes: Vec<(String, u32)>,
+}
+
+fn find_draco_prims(json: &serde_json::Value) -> Vec<DracoPrim> {
+    let mut out = Vec::new();
+    let Some(meshes) = json["meshes"].as_array() else { return out };
+    for (m, mesh) in meshes.iter().enumerate() {
+        let Some(prims) = mesh["primitives"].as_array() else { continue };
+        for (p, prim) in prims.iter().enumerate() {
+            let ext = &prim["extensions"]["KHR_draco_mesh_compression"];
+            let Some(view) = ext["bufferView"].as_u64() else { continue };
+            let Some(attrs) = ext["attributes"].as_object() else { continue };
+            out.push(DracoPrim {
+                mesh: m,
+                prim: p,
+                buffer_view: view as usize,
+                attributes: attrs
+                    .iter()
+                    .filter_map(|(k, v)| v.as_u64().map(|id| (k.clone(), id as u32)))
+                    .collect(),
+            });
+        }
+    }
+    out
+}
+
+fn buffer_view_slice<'b>(
+    json: &serde_json::Value,
+    bin: Option<&'b [u8]>,
+    view_ix: usize,
+) -> Result<&'b [u8], String> {
+    let bv = &json["bufferViews"][view_ix];
+    if bv["buffer"].as_u64() != Some(0) {
+        return Err("draco bufferView must reference buffer 0 (BIN chunk)".into());
+    }
+    let offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
+    let len = bv["byteLength"].as_u64().ok_or("bufferView without byteLength")? as usize;
+    bin.ok_or("draco bufferView references the BIN chunk but the GLB has none")?
+        .get(offset..offset + len)
+        .ok_or_else(|| "draco bufferView out of BIN bounds".into())
+}
+
+/// Decode every Draco primitive (through the platform decoder) and rewrite
+/// the document into a vanilla self-contained GLB: decoded data appended to
+/// the BIN chunk behind fresh accessors, the Draco extension and `CESIUM_RTC`
+/// stripped (the `gltf` crate hard-rejects unknown `extensionsRequired`; the
+/// RTC center was already extracted by the caller).
+async fn preprocess_glb(
+    json: &mut serde_json::Value,
+    bin: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let prims = find_draco_prims(json);
+    let mut decoded = Vec::with_capacity(prims.len());
+    for prim in &prims {
+        let compressed = buffer_view_slice(json, bin, prim.buffer_view)?;
+        let ids: Vec<u32> = prim.attributes.iter().map(|(_, id)| *id).collect();
+        decoded.push(draco::decode(compressed, &ids).await?);
+    }
+    splice_glb(json, bin, &prims, decoded)
+}
+
+/// The synchronous splice half of [`preprocess_glb`] (testable without a
+/// real Draco decoder).
+fn splice_glb(
+    json: &mut serde_json::Value,
+    bin: Option<&[u8]>,
+    prims: &[DracoPrim],
+    decoded: Vec<draco::DracoMesh>,
+) -> Result<Vec<u8>, String> {
+    let mut new_bin: Vec<u8> = bin.unwrap_or_default().to_vec();
+
+    for (prim, dm) in prims.iter().zip(decoded) {
+        // Indices.
+        while !new_bin.len().is_multiple_of(4) {
+            new_bin.push(0);
+        }
+        let idx_offset = new_bin.len();
+        for i in &dm.indices {
+            new_bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let idx_view = push_json(json, "bufferViews", serde_json::json!({
+            "buffer": 0, "byteOffset": idx_offset, "byteLength": dm.indices.len() * 4,
+        }));
+        let idx_accessor = serde_json::json!({
+            "bufferView": idx_view, "componentType": 5125,
+            "count": dm.indices.len(), "type": "SCALAR",
+        });
+        // Draco primitives reference accessors WITHOUT bufferViews (count/
+        // type only). Overwrite those in place — leaving them orphaned fails
+        // the gltf crate's "Missing data" validation.
+        set_or_push_accessor(json, prim, None, idx_accessor);
+
+        // Attributes (already dequantized to f32 by the decoder).
+        for (semantic, uid) in &prim.attributes {
+            let (_, components, data) = dm
+                .attributes
+                .iter()
+                .find(|(id, _, _)| id == uid)
+                .ok_or_else(|| format!("draco decoder returned no attribute {uid}"))?;
+            let type_str = match components {
+                1 => "SCALAR",
+                2 => "VEC2",
+                3 => "VEC3",
+                4 => "VEC4",
+                n => return Err(format!("draco attribute with {n} components")),
+            };
+            let count = data.len() / components;
+            let offset = new_bin.len();
+            for v in data {
+                new_bin.extend_from_slice(&v.to_le_bytes());
+            }
+            let view = push_json(json, "bufferViews", serde_json::json!({
+                "buffer": 0, "byteOffset": offset, "byteLength": data.len() * 4,
+            }));
+            let mut accessor = serde_json::json!({
+                "bufferView": view, "componentType": 5126,
+                "count": count, "type": type_str,
+            });
+            if semantic == "POSITION" {
+                // Spec mandates min/max on POSITION accessors.
+                let mut lo = [f32::INFINITY; 3];
+                let mut hi = [f32::NEG_INFINITY; 3];
+                for chunk in data.chunks_exact(3) {
+                    for c in 0..3 {
+                        lo[c] = lo[c].min(chunk[c]);
+                        hi[c] = hi[c].max(chunk[c]);
+                    }
+                }
+                accessor["min"] = serde_json::json!(lo);
+                accessor["max"] = serde_json::json!(hi);
+            }
+            set_or_push_accessor(json, prim, Some(semantic), accessor);
+        }
+
+        let p = &mut json["meshes"][prim.mesh]["primitives"][prim.prim];
+        if let Some(ext) = p.get_mut("extensions").and_then(|e| e.as_object_mut()) {
+            ext.remove("KHR_draco_mesh_compression");
+            if ext.is_empty() {
+                p.as_object_mut().unwrap().remove("extensions");
+            }
+        }
+    }
+
+    // Strip the handled extensions; the RTC center is side-band data now.
+    // NOTE: use get_mut, never `json[key]` — IndexMut on a missing key
+    // INSERTS a literal null, which the gltf crate then chokes on.
+    if let Some(ext) = json.get_mut("extensions").and_then(|e| e.as_object_mut()) {
+        ext.remove("CESIUM_RTC");
+        if ext.is_empty() {
+            json.as_object_mut().unwrap().remove("extensions");
+        }
+    }
+    for list in ["extensionsUsed", "extensionsRequired"] {
+        if let Some(arr) = json.get_mut(list).and_then(|v| v.as_array_mut()) {
+            arr.retain(|v| {
+                !matches!(v.as_str(), Some("KHR_draco_mesh_compression" | "CESIUM_RTC"))
+            });
+            if arr.is_empty() {
+                json.as_object_mut().unwrap().remove(list);
+            }
+        }
+    }
+    if json["buffers"][0].is_object() {
+        json["buffers"][0]["byteLength"] = serde_json::json!(new_bin.len());
+    } else if !new_bin.is_empty() {
+        json["buffers"] = serde_json::json!([{ "byteLength": new_bin.len() }]);
+    }
+
+    let json_bytes = serde_json::to_vec(&json).map_err(|e| format!("splice json: {e}"))?;
+    Ok(assemble_glb(&json_bytes, &new_bin))
+}
+
+/// Point a primitive slot (`indices` when `semantic` is `None`, else
+/// `attributes[semantic]`) at `accessor`: overwrite the accessor the slot
+/// already references — Draco primitives carry bufferView-less accessors
+/// that fail validation if left orphaned — or append it and link the slot.
+fn set_or_push_accessor(
+    json: &mut serde_json::Value,
+    prim: &DracoPrim,
+    semantic: Option<&str>,
+    accessor: serde_json::Value,
+) {
+    let slot = {
+        let p = &json["meshes"][prim.mesh]["primitives"][prim.prim];
+        match semantic {
+            Some(s) => p["attributes"][s].as_u64(),
+            None => p["indices"].as_u64(),
+        }
+    };
+    match slot {
+        Some(existing) => json["accessors"][existing as usize] = accessor,
+        None => {
+            let ix = push_json(json, "accessors", accessor);
+            let p = &mut json["meshes"][prim.mesh]["primitives"][prim.prim];
+            match semantic {
+                Some(s) => p["attributes"][s] = serde_json::json!(ix),
+                None => p["indices"] = serde_json::json!(ix),
+            }
+        }
+    }
+}
+
+/// Append `value` to the top-level array `key` (created when absent),
+/// returning its index.
+fn push_json(json: &mut serde_json::Value, key: &str, value: serde_json::Value) -> usize {
+    if !json[key].is_array() {
+        json[key] = serde_json::json!([]);
+    }
+    let arr = json[key].as_array_mut().unwrap();
+    arr.push(value);
+    arr.len() - 1
+}
+
+/// Assemble a GLB container from JSON + BIN chunks (4-byte padded).
+fn assemble_glb(json_bytes: &[u8], bin: &[u8]) -> Vec<u8> {
+    let mut json_bytes = json_bytes.to_vec();
+    let mut bin = bin.to_vec();
+    while !json_bytes.len().is_multiple_of(4) {
+        json_bytes.push(b' ');
+    }
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+    let mut glb = Vec::with_capacity(28 + json_bytes.len() + bin.len());
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    let total = 12 + 8 + json_bytes.len() + if bin.is_empty() { 0 } else { 8 + bin.len() };
+    glb.extend_from_slice(&(total as u32).to_le_bytes());
+    glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json_bytes);
+    if !bin.is_empty() {
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin);
+    }
+    glb
 }
 
 /// Resolve a glTF buffer: GLB BIN chunk only (tiles are self-contained).
@@ -589,26 +884,7 @@ mod tests {
     }
 
     fn glb_from_parts(json_bytes: &[u8], bin: &[u8]) -> Vec<u8> {
-        let mut json_bytes = json_bytes.to_vec();
-        let mut bin = bin.to_vec();
-        while !json_bytes.len().is_multiple_of(4) {
-            json_bytes.push(b' ');
-        }
-        while !bin.len().is_multiple_of(4) {
-            bin.push(0);
-        }
-        let mut glb = Vec::new();
-        glb.extend_from_slice(b"glTF");
-        glb.extend_from_slice(&2u32.to_le_bytes());
-        let total = 12 + 8 + json_bytes.len() + 8 + bin.len();
-        glb.extend_from_slice(&(total as u32).to_le_bytes());
-        glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
-        glb.extend_from_slice(b"JSON");
-        glb.extend_from_slice(&json_bytes);
-        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
-        glb.extend_from_slice(b"BIN\0");
-        glb.extend_from_slice(&bin);
-        glb
+        assemble_glb(json_bytes, bin)
     }
 
     #[test]
@@ -632,6 +908,95 @@ mod tests {
     #[test]
     fn garbage_bytes_error_cleanly() {
         assert!(decode_glb(b"not a glb").is_err());
+    }
+
+    /// `decode_tile` on a plain tile takes the fast path and carries no
+    /// side-band data; with `asset.copyright` + `CESIUM_RTC` it extracts
+    /// both, strips the extensions (the gltf crate rejects unknown
+    /// `extensionsRequired`), and still decodes the geometry.
+    #[test]
+    fn decode_tile_extracts_copyright_and_rtc() {
+        use bevy::tasks::block_on;
+
+        let plain = block_on(decode_tile(&tiny_glb())).expect("plain decode");
+        assert_eq!(plain.items.len(), 1);
+        assert!(plain.rtc_center.is_none() && plain.copyright.is_none());
+
+        // tiny_glb's JSON + copyright + a required CESIUM_RTC extension.
+        let glb_bytes = tiny_glb();
+        let (json, bin) = split_glb(&glb_bytes).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(json).unwrap();
+        value["asset"]["copyright"] = serde_json::json!("Data A;Data B");
+        value["extensions"] =
+            serde_json::json!({ "CESIUM_RTC": { "center": [6378137.0, 1000.5, -2000.25] } });
+        value["extensionsRequired"] = serde_json::json!(["CESIUM_RTC"]);
+        let glb = assemble_glb(&serde_json::to_vec(&value).unwrap(), bin.unwrap());
+
+        let tile = block_on(decode_tile(&glb)).expect("rtc decode");
+        assert_eq!(tile.items.len(), 1, "geometry survives the strip");
+        assert_eq!(tile.copyright.as_deref(), Some("Data A;Data B"));
+        let rtc = tile.rtc_center.expect("rtc center");
+        assert!((rtc - DVec3::new(6_378_137.0, 1000.5, -2000.25)).length() < 1e-9);
+    }
+
+    /// The Draco splice: a primitive whose data only exists Draco-compressed
+    /// rewrites into a vanilla GLB that the standard path decodes (mock
+    /// decoder output stands in for the real decoder, which is wasm-only).
+    #[test]
+    fn splice_glb_rewrites_draco_primitive() {
+        let fake_compressed = vec![0xAAu8; 16];
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "extensionsUsed": ["KHR_draco_mesh_compression", "CESIUM_RTC"],
+            "extensionsRequired": ["KHR_draco_mesh_compression", "CESIUM_RTC"],
+            "extensions": { "CESIUM_RTC": { "center": [1.0, 2.0, 3.0] } },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{
+                // Spec shape: attributes reference accessors WITHOUT
+                // bufferViews; the extension maps semantics → draco ids.
+                "attributes": { "POSITION": 0, "COLOR_0": 1 },
+                "mode": 4,
+                "extensions": { "KHR_draco_mesh_compression": {
+                    "bufferView": 0,
+                    "attributes": { "POSITION": 0, "COLOR_0": 1 }
+                }}
+            }]}],
+            "accessors": [
+                { "componentType": 5126, "count": 3, "type": "VEC3",
+                  "min": [0,0,0], "max": [1,1,0] },
+                { "componentType": 5126, "count": 3, "type": "VEC4" }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": fake_compressed.len() }
+            ],
+            "buffers": [{ "byteLength": fake_compressed.len() }]
+        });
+
+        let positions = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let colors = vec![1.0f32; 12];
+        let decoded = vec![draco::DracoMesh {
+            indices: vec![0, 1, 2],
+            attributes: vec![(0, 3, positions), (1, 4, colors)],
+        }];
+        let prims = find_draco_prims(&json);
+        assert_eq!(prims.len(), 1);
+        assert_eq!(prims[0].buffer_view, 0);
+
+        let mut value = json;
+        let vanilla =
+            splice_glb(&mut value, Some(&fake_compressed), &prims, decoded).expect("splice");
+        // The spliced GLB decodes through the strict gltf-crate path.
+        let items = decode_glb(&vanilla).expect("decode spliced");
+        assert_eq!(items.len(), 1);
+        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
+        assert_eq!(p.mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len(), 3);
+        assert!(p.mesh.indices().is_some());
+        // All handled extensions stripped.
+        let (j, _) = split_glb(&vanilla).unwrap();
+        assert!(!memmem(j, b"KHR_draco_mesh_compression"));
+        assert!(!memmem(j, b"CESIUM_RTC"));
     }
 
     /// POINTS-mode GLB: positions + u8-normalized COLOR_0 → point items in
