@@ -488,8 +488,14 @@ async fn http_range(
 
 #[cfg(target_arch = "wasm32")]
 async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
+    // The probe gets its own AbortController: a server that doesn't support
+    // suffix ranges answers 200 + FULL body (Azure Blob does exactly this —
+    // verified live; only explicit ranges get a 206), and the transfer must
+    // be cancelled after the headers, not drained.
+    let probe_abort = AbortHandle::new();
     let resp = gloo_net::http::Request::get(url)
         .header("Range", &format!("bytes=-{n}"))
+        .abort_signal(Some(&probe_abort.signal()))
         .send()
         .await
         .map_err(|e| FetchError::Http(e.to_string()))?;
@@ -510,10 +516,29 @@ async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
             Ok((bytes, total))
         }
         200 => {
-            let body = resp.binary().await.map_err(|e| FetchError::Http(e.to_string()))?;
-            let total = body.len() as u64;
-            let n = n.min(total) as usize;
-            Ok((body[body.len() - n..].to_vec(), total))
+            // Suffix range unsupported. With a Content-Length we cancel the
+            // full-body transfer and re-ask for the explicit tail range; only
+            // a length-less response (dev servers) gets drained whole.
+            let total = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            match total {
+                Some(total) if total > 0 => {
+                    probe_abort.trigger();
+                    drop(resp);
+                    let n = n.min(total);
+                    let bytes = http_range(url, total - n, n, None).await?;
+                    Ok((bytes, total))
+                }
+                _ => {
+                    let body =
+                        resp.binary().await.map_err(|e| FetchError::Http(e.to_string()))?;
+                    let total = body.len() as u64;
+                    let n = n.min(total) as usize;
+                    Ok((body[body.len() - n..].to_vec(), total))
+                }
+            }
         }
         s => Err(FetchError::Http(format!("status {s} for suffix GET {url}"))),
     }
@@ -582,6 +607,18 @@ async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
         .get("content-range")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // Suffix range unsupported (Azure Blob: 200 + full body) → drop the
+    // response after the headers (closes the connection mid-transfer) and
+    // re-ask for the explicit tail range. Only a length-less 200 is drained.
+    if status == 200 {
+        let total = resp.content_length().filter(|&t| t > 0);
+        if let Some(total) = total {
+            drop(resp);
+            let n = n.min(total);
+            let bytes = http_range(url, total - n, n, None).await?;
+            return Ok((bytes, total));
+        }
+    }
     let body = resp.bytes().map_err(|e| FetchError::Http(e.to_string()))?;
     match status {
         206 => {
