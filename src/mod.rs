@@ -391,7 +391,9 @@ enum Tiles3dMsg {
     },
     TileContent {
         set_id: u64,
-        tile: usize,
+        /// Resolves to the slot at receive time by matching this generation —
+        /// NOT by a captured tile index, which `compact_grafted_subtrees` may
+        /// renumber while the fetch is in flight.
         generation: u64,
         result: Result<TileOutput, String>,
     },
@@ -770,18 +772,22 @@ fn receive_tiles3d(
                     error!("tiles3d: {label}: {e}");
                 }
             },
-            Tiles3dMsg::TileContent { set_id, tile, generation, result } => {
+            Tiles3dMsg::TileContent { set_id, generation, result } => {
                 let Some(set) = sets.sets.iter_mut().find(|s| s.id == set_id) else {
                     continue;
                 };
-                // Cancelled (slot left InFlight) or reissued (generation
-                // bumped) → drop the stale payload.
-                let TileSlot::InFlight { generation: current } = set.slots[tile] else {
+                // Resolve the slot by GENERATION, never the message's captured
+                // tile index: `compact_grafted_subtrees` renumbers the tree, so
+                // a result landing after a compaction carries a stale (possibly
+                // out-of-range) index — indexing `slots[tile]` with it panicked.
+                // The generation is globally unique, so this finds the in-flight
+                // slot at its CURRENT index and naturally drops a cancelled,
+                // reissued, or compacted-away payload (no matching InFlight gen).
+                let Some(tile) = set.slots.iter().position(
+                    |s| matches!(s, TileSlot::InFlight { generation: g } if *g == generation),
+                ) else {
                     continue;
                 };
-                if current != generation {
-                    continue;
-                }
                 match result {
                     Ok(TileOutput::Subtree(external)) => {
                         spawned += 1;
@@ -1430,7 +1436,7 @@ fn drive_tiles3d(
             let abort = fetch::register_abort(generation);
             let source = set.source.clone();
             let tx = channel.tx.clone();
-            let (set_id, tile) = (set.id, req.tile);
+            let set_id = set.id;
             let georeferenced = matches!(set.frame, SetFrame::Ecef { .. });
             fetch::spawn_io(async move {
                 // Fetch + decode entirely inside the task (wasm: every IO step
@@ -1451,7 +1457,7 @@ fn drive_tiles3d(
                 };
                 fetch::unregister_abort(generation);
                 // Receiver gone (plugin torn down) is fine — drop silently.
-                let _ = tx.send(Tiles3dMsg::TileContent { set_id, tile, generation, result });
+                let _ = tx.send(Tiles3dMsg::TileContent { set_id, generation, result });
             });
         }
 
