@@ -974,6 +974,12 @@ fn spawn_tile_content(
                     } else {
                         Some(bevy::render::render_resource::Face::Back)
                     },
+                    // LOD-keyed draw order: `depth_bias` biases the opaque sort
+                    // distance, so a finer (deeper) tile draws AFTER the coarse
+                    // one it overlaps and wins the equal-depth test — the finer
+                    // detail dissolves cleanly on top instead of z-fighting the
+                    // coarse tile held opaque beneath it during the cross-fade.
+                    depth_bias: set.tree.nodes[tile].depth as f32,
                     ..default()
                 };
                 // Dithered LOD cross-fade: starts fully dissolved (fade 0); the
@@ -1203,11 +1209,9 @@ fn drive_tiles3d(
         for (i, slot) in set.slots.iter().enumerate() {
             if let TileSlot::Ready { entity } = slot
                 && let Ok(mut fade) = fade_q.get_mut(*entity)
+                && fade.wanted != want_visible[i]
             {
-                let target = if want_visible[i] { 1.0 } else { 0.0 };
-                if fade.target != target {
-                    fade.target = target;
-                }
+                fade.wanted = want_visible[i];
             }
         }
 
