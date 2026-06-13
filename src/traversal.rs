@@ -621,32 +621,35 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     if all_covered {
         return VisitOut { covered: true, any_rendered_last: any_last };
     }
-    // Some selected descendant isn't paintable yet. Three-way resolution
-    // (each clause earned by a live-P3DT regression — don't reorder):
+    // Some selected descendant isn't paintable yet. Resolution ORDER is
+    // load-bearing (each clause earned by a live-P3DT regression):
     //
-    // 1. This tile is renderable → ATOMIC SWAP: replace the entire partial
-    //    cut below with this tile's own content. Never parent+children
-    //    overlap (coarse photogrammetry sits ABOVE fine and occludes it),
-    //    never holes; the ancestor-touched rule keeps this the common case
-    //    and the coarsen stays one level deep.
+    // 1. Some of this subtree's FINER level was on screen last frame → KEEP
+    //    IT. Hold the ready children that are already showing and let the
+    //    pending siblings stream into a transient gap; this tile is queued as
+    //    a backstop but NOT rendered, so coarse photogrammetry never overlaps
+    //    the fine it would occlude. This is the "don't unload what the user is
+    //    already looking at" rule — and because it returns *covered*, one
+    //    freshly-grafted pending tile can no longer cascade up through the
+    //    contentless graft-interiors and collapse every on-screen sibling to
+    //    coarse (the live "spin → everything blinks coarse" finding). MUST run
+    //    before the atomic swap, or a Ready ancestor wins and wipes the cut.
+    if any_last {
+        push_load(ctx, sel, i, dist);
+        return VisitOut { covered: true, any_rendered_last: true };
+    }
+    // 2. Nothing finer has ever shown here (initial load, or zoom-in from this
+    //    coarse tile) and it's renderable → ATOMIC SWAP: paint this tile's own
+    //    content in place of the partial cut below. Coarse-first, never an
+    //    overlap (coarse sits ABOVE fine and occludes it), never a hole.
     if ctx.content[i] == TileContent::Ready {
         sel.render.truncate(checkpoint);
         sel.render.push(i);
         return VisitOut { covered: true, any_rendered_last: ctx.history.rendered[i] };
     }
-    // 2. Nothing to swap to (contentless/pending), but this subtree WAS on
-    //    screen last frame → BRAKE the cascade: keep the partial children
-    //    and accept the small hole. Reporting uncovered here would let an
-    //    ancestor swap a huge footprint to coarse — P3DT's tree is full of
-    //    contentless grafted interiors, so the cascade climbed straight
-    //    through them and wiped (or blanked) the whole visible region.
-    if any_last {
-        push_load(ctx, sel, i, dist);
-        return VisitOut { covered: true, any_rendered_last: true };
-    }
-    // 3. Nothing here has ever rendered (initial load of this region):
-    //    drop the partial selections and report uncovered so the nearest
-    //    READY ancestor paints the whole footprint coarse-first.
+    // 3. Nothing finer shown AND nothing to swap to (contentless/pending):
+    //    drop the partial selections and report uncovered so the nearest READY
+    //    ancestor paints the whole footprint coarse-first.
     sel.render.truncate(checkpoint);
     push_load(ctx, sel, i, dist);
     VisitOut { covered: false, any_rendered_last: false }
@@ -830,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_refinement_kicks_to_parent_no_overlap_no_holes() {
+    fn partial_refinement_keeps_onscreen_children_no_coarse_collapse() {
         let tree = fixture_tree();
         let mut content = all(TileContent::Ready, tree.len());
         // Child 1's leaves: two ready (and previously rendered), two pending.
@@ -842,12 +845,13 @@ mod tests {
         history.rendered[kids[0]] = true;
         history.rendered[kids[1]] = true;
         let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
-        // Atomic REPLACE: the parent renders INSTEAD of the partial children
-        // — coarse and fine content never overlap (coarse photogrammetry
-        // occludes fine), and the pending footprints are never holes.
-        assert!(sel.render.contains(&1));
-        assert!(!sel.render.contains(&kids[0]) && !sel.render.contains(&kids[1]));
-        // The pending two remain queued so the swap to full detail lands.
+        // The on-screen fine leaves KEEP rendering — a streaming sibling must
+        // never collapse them back to the coarse parent…
+        assert!(sel.render.contains(&kids[0]) && sel.render.contains(&kids[1]));
+        // …and the parent does NOT render (no coarse-over-fine overlap); the
+        // two pending footprints are a transient gap, not a coarse swap.
+        assert!(!sel.render.contains(&1), "no coarse collapse over visible fine");
+        // The pending two stay queued so the gap fills with full detail.
         let queued: Vec<usize> = sel.loads.iter().map(|r| r.tile).collect();
         assert!(queued.contains(&kids[2]) && queued.contains(&kids[3]));
     }
