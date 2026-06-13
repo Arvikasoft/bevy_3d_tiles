@@ -1071,6 +1071,38 @@ fn drive_tiles3d(
 
         let sel = traversal::select(tree, &tiles_content, &set.history, &culled, params);
 
+        // TEMP DIAG (tilt-vanish hunt) — remove once root-caused. Every 10
+        // frames: camera pitch (deg above horizon), how many tree nodes the
+        // frustum culled, how many tiles the pass chose to RENDER, and how many
+        // of those are actually Ready (spawned). If `render` stays high while
+        // the screen blanks → render/Bevy-culling side; if `render` collapses
+        // → selection/cull side.
+        {
+            let culled_n = (0..tree.len()).filter(|&i| culled(i)).count();
+            let ready_in_cut = sel
+                .render
+                .iter()
+                .filter(|&&t| matches!(set.slots[t], TileSlot::Ready { .. }))
+                .count();
+            let pitch_deg = cam_forward_world.y.clamp(-1.0, 1.0).asin().to_degrees();
+            if *frame % 10 == 0 {
+                info!(
+                    "tiles3d DIAG {}: pitch={:+.1}° render={} ready_in_cut={} \
+                     culled={}/{} cam_y={:.0} fwd=({:.2},{:.2},{:.2})",
+                    set.label,
+                    pitch_deg,
+                    sel.render.len(),
+                    ready_in_cut,
+                    culled_n,
+                    tree.len(),
+                    cam_pos_world.y,
+                    cam_forward_world.x,
+                    cam_forward_world.y,
+                    cam_forward_world.z,
+                );
+            }
+        }
+
         // Eviction clock: everything the pass wanted stays fresh.
         for (i, &touched) in sel.touched.iter().enumerate() {
             if touched {
