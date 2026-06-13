@@ -25,7 +25,10 @@ struct TileDither {
     fade: f32,
 }
 
-@group(2) @binding(100)
+// Bevy 0.18 moved the material bind group from 2 → 3; `#{MATERIAL_BIND_GROUP}`
+// resolves to whatever group the StandardMaterial bindings sit in (and tracks
+// the bindless/non-bindless layout), so the extension uniform lands beside them.
+@group(#{MATERIAL_BIND_GROUP}) @binding(100)
 var<uniform> tile_dither: TileDither;
 
 // Jorge Jimenez interleaved-gradient noise — a fine, animation-stable hash over
