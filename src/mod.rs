@@ -224,6 +224,10 @@ impl ActiveTileset {
 pub struct TilesetCredits {
     pub lines: Vec<String>,
     pub google_visible: bool,
+    /// A georeferenced (ECEF) tileset is rendering a cut — it IS the ground,
+    /// so the metric ground grid should hide exactly like it does for the
+    /// basemap (read by `basemap::toggle_ground_grid`).
+    pub ground_covering: bool,
 }
 
 /// Live tilesets + scheduler counters.
@@ -977,6 +981,7 @@ fn drive_tiles3d(
 
     let mut any_in_flight = false;
     let mut google_visible = false;
+    let mut ground_covering = false;
     for set in sets.iter_mut() {
         // The set's frame. Anchored: world_from_set = anchor chain ×
         // correction (the root entity's GlobalTransform — last frame's
@@ -1230,6 +1235,8 @@ fn drive_tiles3d(
         }
         set.history.absorb(&sel, tree.len());
         google_visible |= set.is_live() && !sel.render.is_empty();
+        ground_covering |=
+            matches!(set.frame, SetFrame::Ecef { .. }) && !sel.render.is_empty();
         any_in_flight |=
             set.slots.iter().any(|s| matches!(s, TileSlot::InFlight { .. }));
     }
@@ -1244,6 +1251,7 @@ fn drive_tiles3d(
     let want = TilesetCredits {
         lines: lines.into_iter().cloned().collect(),
         google_visible,
+        ground_covering,
     };
     if *credits != want {
         *credits = want;

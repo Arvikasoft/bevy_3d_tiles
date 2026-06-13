@@ -471,6 +471,9 @@ pub fn select<F: Fn(usize) -> bool>(
     // Preload tier: ancestors of the rendered cut that have unloaded content.
     // REPLACE refinement means a loaded ancestor gives instant zoom-out (and a
     // kick target) — basemap's "ancestors trickle in last" tier, generalized.
+    // EVERY ancestor is marked touched (not just loadable ones): a READY
+    // parent chain must stay resident, or kicks land on a much coarser
+    // ancestor and the view collapses several levels while children stream.
     let mut queued = vec![false; n];
     for req in &sel.loads {
         queued[req.tile] = true;
@@ -478,9 +481,9 @@ pub fn select<F: Fn(usize) -> bool>(
     for i in 0..sel.render.len() {
         let mut at = tree.nodes[sel.render[i]].parent;
         while let Some(p) = at {
+            sel.touched[p] = true;
             if ctx.content[p].loadable() && !queued[p] {
                 queued[p] = true;
-                sel.touched[p] = true;
                 let dist = tree.nodes[p].volume.distance_to(params.cam_pos);
                 sel.loads.push(LoadRequest {
                     tile: p,
@@ -591,26 +594,15 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     if all_covered {
         return VisitOut { covered: true, any_rendered_last: any_last };
     }
-    if any_last {
-        // Part of the refined cut was already on screen last frame — keep it
-        // (removing it to kick would regress detail). BACKFILL the pending
-        // siblings' footprints by rendering this tile's own content BEHIND
-        // the partial children — without this, a moving camera punches holes
-        // into the nearest geometry while children stream (live P3DT
-        // finding). The ready children draw over the coarse parent.
-        if ctx.content[i] == TileContent::Ready {
-            sel.render.push(i);
-        } else {
-            push_load(ctx, sel, i, dist);
-        }
-        return VisitOut {
-            covered: ctx.content[i] == TileContent::Ready,
-            any_rendered_last: any_last,
-        };
-    }
-    // Kick (§7.5): none of the selected descendants have ever shown — drop
-    // them from the render list (their loads stay queued) and paint this
-    // tile's own content instead until they arrive.
+    // Kick (§7.5): some selected descendant isn't paintable yet — drop the
+    // whole partial cut (loads stay queued) and render this tile's own
+    // content INSTEAD until every child arrives. Classic atomic REPLACE:
+    // never overlap parent and children (coarse photogrammetry surfaces sit
+    // ABOVE the fine ones and occlude them — live P3DT finding), never leave
+    // the pending siblings' footprints as holes. The cost is a brief local
+    // one-level coarsen while new siblings stream; the ancestor-touched rule
+    // in `select` keeps the parent resident so the kick almost never
+    // cascades deeper than that.
     sel.render.truncate(checkpoint);
     if ctx.content[i] == TileContent::Ready {
         sel.render.push(i);
@@ -777,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_refinement_kept_when_some_rendered_last_frame() {
+    fn partial_refinement_kicks_to_parent_no_overlap_no_holes() {
         let tree = fixture_tree();
         let mut content = all(TileContent::Ready, tree.len());
         // Child 1's leaves: two ready (and previously rendered), two pending.
@@ -789,14 +781,28 @@ mod tests {
         history.rendered[kids[0]] = true;
         history.rendered[kids[1]] = true;
         let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
-        // The two ready leaves stay on screen (no kick of child 1)…
-        assert!(sel.render.contains(&kids[0]) && sel.render.contains(&kids[1]));
-        // …their parent renders BEHIND them, backfilling the pending
-        // siblings' footprints (no holes while they stream)…
+        // Atomic REPLACE: the parent renders INSTEAD of the partial children
+        // — coarse and fine content never overlap (coarse photogrammetry
+        // occludes fine), and the pending footprints are never holes.
         assert!(sel.render.contains(&1));
-        // …while the pending two remain queued.
+        assert!(!sel.render.contains(&kids[0]) && !sel.render.contains(&kids[1]));
+        // The pending two remain queued so the swap to full detail lands.
         let queued: Vec<usize> = sel.loads.iter().map(|r| r.tile).collect();
         assert!(queued.contains(&kids[2]) && queued.contains(&kids[3]));
+    }
+
+    /// Ready ancestors of the rendered cut stay `touched` — evicting them
+    /// would make every kick collapse several levels instead of one.
+    #[test]
+    fn cut_ancestors_stay_touched_for_residency() {
+        let tree = fixture_tree();
+        let content = all(TileContent::Ready, tree.len());
+        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        assert_eq!(sel.render.len(), 16, "leaves render");
+        for anc in 0..=4 {
+            assert!(sel.touched[anc], "ancestor {anc} kept resident");
+        }
     }
 
     #[test]
