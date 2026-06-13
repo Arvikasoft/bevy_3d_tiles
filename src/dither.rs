@@ -39,11 +39,12 @@ impl MaterialExtension for TileDither {
         // file! → `src/...`, so the hyphenated package dir never enters).
         "embedded://bevy_client/plugins/tiles3d/dither.wgsl".into()
     }
-    fn prepass_fragment_shader() -> ShaderRef {
-        // Same shader handles the prepass branch via `#ifdef PREPASS_PIPELINE`,
-        // so the discard applies there too (no depth halo from dithered pixels).
-        "embedded://bevy_client/plugins/tiles3d/dither.wgsl".into()
-    }
+    // NOTE: we deliberately do NOT override `prepass_fragment_shader()`. The
+    // depth/shadow prepass keeps the default StandardMaterial shader, so the
+    // dither `discard` isn't applied there — a half-dissolved tile still casts
+    // a full shadow for the ~0.28 s transition (minor, cosmetic). Overriding it
+    // would route the shadow pipeline through the `#ifdef PREPASS_PIPELINE`
+    // branch (untested here); not worth a second grey-screen for the prototype.
 }
 
 /// Per-tile-root fade state. `drive_tiles3d` writes `target`; [`tick_tile_fade`]
