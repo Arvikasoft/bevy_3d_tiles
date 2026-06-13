@@ -42,6 +42,7 @@ use bevy_panorbit_camera::PanOrbitCamera;
 
 pub mod archive;
 pub mod content;
+pub mod dither;
 pub mod draco;
 pub mod fetch;
 pub mod geo;
@@ -54,6 +55,7 @@ pub mod traversal;
 
 use archive::Archive3tz;
 use content::{DecodedItem, DecodedTile};
+use dither::{TileDither, TileFade, TileMat};
 use fetch::{BudgetCounter, ByteSource, ExplodedBase, LiveSession, TilesetSource};
 use traversal::{History, SelectParams, TileContent, TileTree, TreeFrame, ZUP_TO_BEVY};
 
@@ -616,7 +618,7 @@ fn receive_tiles3d(
     origin: Res<ProjectOrigin>,
     mut sets: ResMut<Tiles3dSets>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TileMat>>,
     mut images: ResMut<Assets<Image>>,
     mut clouds: ResMut<Assets<bevy_pointcloud::point_cloud::PointCloud>>,
     mut splats: ResMut<Assets<bevy_gaussian_splatting::PlanarGaussian3d>>,
@@ -899,7 +901,7 @@ fn beyond_horizon(cam: DVec3, center: DVec3, radius: f64, planet_r: f64) -> bool
 fn spawn_tile_content(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<TileMat>,
     images: &mut Assets<Image>,
     clouds: &mut Assets<bevy_pointcloud::point_cloud::PointCloud>,
     splats: &mut Assets<bevy_gaussian_splatting::PlanarGaussian3d>,
@@ -913,9 +915,11 @@ fn spawn_tile_content(
         .spawn((
             Tiles3dTile { set_id: set.id, tile },
             transform,
-            // Spawned hidden; `drive_tiles3d`'s cut reveals it — a freshly
-            // loaded tile must never flash over the coarser one it replaces.
+            // Spawned hidden + faded out; `drive_tiles3d` sets the fade target
+            // and `tick_tile_fade` dissolves it in — a freshly loaded tile must
+            // never flash over the coarser one it replaces.
             Visibility::Hidden,
+            TileFade::default(),
             ChildOf(set.root_entity),
             Name::new(format!("Tiles3dTile({} #{tile})", set.label)),
         ))
@@ -924,7 +928,7 @@ fn spawn_tile_content(
     for item in items {
         let child = match item {
             DecodedItem::Mesh(prim) => {
-                let material = StandardMaterial {
+                let base = StandardMaterial {
                     base_color: Color::LinearRgba(LinearRgba::new(
                         prim.material.base_color[0],
                         prim.material.base_color[1],
@@ -943,6 +947,9 @@ fn spawn_tile_content(
                     },
                     ..default()
                 };
+                // Dithered LOD cross-fade: starts fully dissolved (fade 0); the
+                // cut + `tick_tile_fade` ramp it in.
+                let material = TileMat { base, extension: TileDither { fade: 0.0 } };
                 commands
                     .spawn((
                         Mesh3d(meshes.add(prim.mesh)),
@@ -993,7 +1000,7 @@ fn drive_tiles3d(
     mut credits: ResMut<TilesetCredits>,
     camera: Query<(&Camera, &GlobalTransform, &Projection, &Frustum), With<PanOrbitCamera>>,
     transforms: Query<&GlobalTransform>,
-    mut vis_q: Query<&mut Visibility, With<Tiles3dTile>>,
+    mut fade_q: Query<&mut TileFade, With<Tiles3dTile>>,
     mut tile_transforms: Query<&mut Transform, With<Tiles3dTile>>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut commands: Commands,
@@ -1155,18 +1162,20 @@ fn drive_tiles3d(
             }
         }
 
-        // Apply the render cut as per-tile-root visibility.
+        // Apply the render cut as a per-tile-root dither fade TARGET; the swap
+        // dissolves rather than pops. `tick_tile_fade` eases current→target,
+        // pushes it into the materials, and owns the actual `Visibility`.
         let mut want_visible = vec![false; tree.len()];
         for &t in &sel.render {
             want_visible[t] = true;
         }
         for (i, slot) in set.slots.iter().enumerate() {
             if let TileSlot::Ready { entity } = slot
-                && let Ok(mut vis) = vis_q.get_mut(*entity)
+                && let Ok(mut fade) = fade_q.get_mut(*entity)
             {
-                let want = if want_visible[i] { Visibility::Visible } else { Visibility::Hidden };
-                if *vis != want {
-                    *vis = want;
+                let target = if want_visible[i] { 1.0 } else { 0.0 };
+                if fade.target != target {
+                    fade.target = target;
                 }
             }
         }
