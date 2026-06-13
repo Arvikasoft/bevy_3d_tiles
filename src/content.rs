@@ -61,6 +61,9 @@ pub struct DecodedMaterial {
     pub metallic: f32,
     pub roughness: f32,
     pub double_sided: bool,
+    /// `KHR_materials_unlit` — photogrammetry/satellite content ships baked
+    /// lighting (Google P3DT requires this extension); re-lighting it dims.
+    pub unlit: bool,
 }
 
 impl Default for DecodedMaterial {
@@ -71,6 +74,7 @@ impl Default for DecodedMaterial {
             metallic: 0.0,
             roughness: 1.0,
             double_sided: false,
+            unlit: false,
         }
     }
 }
@@ -92,33 +96,111 @@ pub struct DecodedTile {
 /// first ([`preprocess_glb`] — the `gltf` crate rejects unknown
 /// `extensionsRequired`), everything else takes the plain [`decode_glb`]
 /// path. Async only for the Draco decoder round-trip; plain tiles never
-/// yield.
-pub async fn decode_tile(bytes: &[u8]) -> Result<DecodedTile, String> {
+/// yield. `georeferenced` forces the JSON scan — ECEF-tree content can carry
+/// planetary node transforms with no marker string to cheaply detect.
+pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTile, String> {
     let (json, bin) = split_glb(bytes)?;
     let has_splat = memmem(json, b"KHR_gaussian_splatting");
     let has_draco = memmem(json, b"KHR_draco_mesh_compression");
     let has_rtc = memmem(json, b"CESIUM_RTC");
-    if !(has_splat || has_draco || has_rtc || memmem(json, b"copyright")) {
+    if !(georeferenced || has_splat || has_draco || has_rtc || memmem(json, b"copyright")) {
         return Ok(DecodedTile { items: decode_glb(bytes)?, rtc_center: None, copyright: None });
     }
 
     let mut value: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| format!("tile json: {e}"))?;
     let copyright = value["asset"]["copyright"].as_str().map(str::to_string);
-    let rtc_center = value["extensions"]["CESIUM_RTC"]["center"].as_array().and_then(|c| {
+    let mut rtc_center = value["extensions"]["CESIUM_RTC"]["center"].as_array().and_then(|c| {
         let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
         <[f64; 3]>::try_from(v).ok().map(DVec3::from_array)
     });
 
-    let items = if has_splat {
-        decode_splat_gltf(&value, bin)?
-    } else if has_draco || has_rtc {
+    if has_splat {
+        let items = decode_splat_gltf(&value, bin)?;
+        return Ok(DecodedTile { items, rtc_center, copyright });
+    }
+
+    // Google P3DT bakes ECEF positions into node MATRICES instead of
+    // CESIUM_RTC — planetary magnitudes that the gltf crate would truncate
+    // to f32. Extract the offset in f64 from the raw JSON and route it
+    // through the same side-band channel.
+    let mut nodes_rebased = false;
+    if rtc_center.is_none()
+        && let Some(center) = extract_planetary_root_offset(&mut value)
+    {
+        rtc_center = Some(center);
+        nodes_rebased = true;
+    }
+
+    let items = if has_draco || has_rtc || nodes_rebased {
         let vanilla = preprocess_glb(&mut value, bin).await?;
         decode_glb(&vanilla)?
     } else {
         decode_glb(bytes)?
     };
     Ok(DecodedTile { items, rtc_center, copyright })
+}
+
+/// When any scene-root node sits at planetary magnitude (Google P3DT bakes
+/// ECEF into node matrices), pick the first such translation as the tile's
+/// offset and subtract it from EVERY root node **in f64**, so the f32 glTF
+/// decode only ever sees tile-local values. Returns the extracted offset.
+/// The spawn transform re-applies it: `world_from_content × T(offset) ×
+/// node'` ≡ `world_from_content × node` exactly.
+fn extract_planetary_root_offset(json: &mut serde_json::Value) -> Option<DVec3> {
+    const PLANETARY_M: f64 = 1.0e6;
+
+    let scene_ix = json["scene"].as_u64().unwrap_or(0) as usize;
+    let roots: Vec<usize> = json["scenes"][scene_ix]["nodes"]
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|n| n as usize))
+        .collect();
+
+    let translation_of = |node: &serde_json::Value| -> [f64; 3] {
+        if let Some(m) = node["matrix"].as_array()
+            && m.len() == 16
+        {
+            return [
+                m[12].as_f64().unwrap_or(0.0),
+                m[13].as_f64().unwrap_or(0.0),
+                m[14].as_f64().unwrap_or(0.0),
+            ];
+        }
+        node["translation"]
+            .as_array()
+            .map(|t| {
+                [
+                    t.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    t.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    t.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                ]
+            })
+            .unwrap_or([0.0; 3])
+    };
+
+    let center = roots.iter().find_map(|&ix| {
+        let t = translation_of(&json["nodes"][ix]);
+        (DVec3::from_array(t).length() > PLANETARY_M).then_some(DVec3::from_array(t))
+    })?;
+
+    // Subtract from EVERY root (small-translation roots become -center —
+    // mixing untouched and rebased roots under the re-applied offset would
+    // shift the untouched ones).
+    for &ix in &roots {
+        let t = translation_of(&json["nodes"][ix]);
+        let new = [t[0] - center.x, t[1] - center.y, t[2] - center.z];
+        let node = &mut json["nodes"][ix];
+        if node["matrix"].is_array() {
+            let m = node["matrix"].as_array_mut().unwrap();
+            for (k, v) in new.iter().enumerate() {
+                m[12 + k] = serde_json::json!(v);
+            }
+        } else {
+            node["translation"] = serde_json::json!(new);
+        }
+    }
+    Some(center)
 }
 
 /// Decode a GLB (or self-contained glTF JSON) tile into renderable items.
@@ -175,7 +257,7 @@ fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
 }
 
 /// Naive substring scan (the JSON chunk is small; no memmem dependency).
-fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
@@ -547,6 +629,7 @@ fn decode_material(
         roughness: pbr.roughness_factor(),
         double_sided: material.double_sided(),
         base_color_image: None,
+        unlit: material.unlit(),
     };
     if let Some(info) = pbr.base_color_texture() {
         let image = info.texture().source();
@@ -918,7 +1001,7 @@ mod tests {
     fn decode_tile_extracts_copyright_and_rtc() {
         use bevy::tasks::block_on;
 
-        let plain = block_on(decode_tile(&tiny_glb())).expect("plain decode");
+        let plain = block_on(decode_tile(&tiny_glb(), false)).expect("plain decode");
         assert_eq!(plain.items.len(), 1);
         assert!(plain.rtc_center.is_none() && plain.copyright.is_none());
 
@@ -932,11 +1015,51 @@ mod tests {
         value["extensionsRequired"] = serde_json::json!(["CESIUM_RTC"]);
         let glb = assemble_glb(&serde_json::to_vec(&value).unwrap(), bin.unwrap());
 
-        let tile = block_on(decode_tile(&glb)).expect("rtc decode");
+        let tile = block_on(decode_tile(&glb, false)).expect("rtc decode");
         assert_eq!(tile.items.len(), 1, "geometry survives the strip");
         assert_eq!(tile.copyright.as_deref(), Some("Data A;Data B"));
         let rtc = tile.rtc_center.expect("rtc center");
         assert!((rtc - DVec3::new(6_378_137.0, 1000.5, -2000.25)).length() < 1e-9);
+    }
+
+    /// Google P3DT shape: ECEF baked into the node MATRIX (no CESIUM_RTC),
+    /// `KHR_materials_unlit` required. The planetary translation must come
+    /// out in f64 as the rtc side-band; decoded node transforms stay
+    /// tile-local; the material decodes unlit.
+    #[test]
+    fn decode_tile_extracts_planetary_node_matrix() {
+        use bevy::tasks::block_on;
+
+        let (cx, cy, cz) = (-2_398_029.177_060_164, 3_361_082.915_181_850_5, 2_398_029.177_060_164_5);
+        let glb_bytes = tiny_glb();
+        let (json, bin) = split_glb(&glb_bytes).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(json).unwrap();
+        // The real Google node shape: rotation + planetary translation in
+        // one matrix (column-major).
+        value["nodes"] = serde_json::json!([{
+            "matrix": [1,0,0,0, 0,0,-1,0, 0,1,0,0, cx, cy, cz, 1],
+            "mesh": 0
+        }]);
+        value["asset"]["copyright"] = serde_json::json!("Google");
+        value["extensionsUsed"] = serde_json::json!(["KHR_materials_unlit"]);
+        value["extensionsRequired"] = serde_json::json!(["KHR_materials_unlit"]);
+        value["materials"] = serde_json::json!([{
+            "pbrMetallicRoughness": { "baseColorFactor": [1.0,1.0,1.0,1.0] },
+            "extensions": { "KHR_materials_unlit": {} }
+        }]);
+        value["meshes"][0]["primitives"][0]["material"] = serde_json::json!(0);
+        let glb = assemble_glb(&serde_json::to_vec(&value).unwrap(), bin.unwrap());
+
+        let tile = block_on(decode_tile(&glb, true)).expect("decode");
+        let rtc = tile.rtc_center.expect("planetary offset extracted");
+        assert!((rtc - DVec3::new(cx, cy, cz)).length() < 1e-6, "rtc = {rtc:?}");
+        let DecodedItem::Mesh(p) = &tile.items[0] else { panic!("expected mesh") };
+        // The decoded transform keeps the rotation but the translation is
+        // tile-local now (zero here — single node).
+        assert!(p.transform.w_axis.truncate().length() < 1e-3, "{:?}", p.transform.w_axis);
+        assert!((p.transform.y_axis.z - (-1.0)).abs() < 1e-6, "rotation preserved");
+        assert!(p.material.unlit, "KHR_materials_unlit decoded");
+        assert_eq!(tile.copyright.as_deref(), Some("Google"));
     }
 
     /// The Draco splice: a primitive whose data only exists Draco-compressed

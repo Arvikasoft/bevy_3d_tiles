@@ -483,6 +483,20 @@ fn uri_dir_prefix(uri: &str) -> Option<String> {
     path.rsplit_once('/').map(|(dir, _)| format!("{dir}/"))
 }
 
+/// Whether fetched content bytes are an external `tileset.json` rather than
+/// tile geometry. By CONTENT, never by URI: P3DT serves both from
+/// extensionless paths. A tileset is JSON with `root` + `geometricError`
+/// (no glTF document has the latter); GLBs carry the `glTF` magic.
+fn looks_like_external_tileset(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"glTF") {
+        return false;
+    }
+    let first = bytes.iter().find(|b| !b.is_ascii_whitespace());
+    first == Some(&b'{')
+        && content::memmem(bytes, b"\"geometricError\"")
+        && content::memmem(bytes, b"\"root\"")
+}
+
 /// Walk a parsed tileset for the first content URI carrying a `session`
 /// query param and adopt it into the live session (the P3DT protocol: the
 /// root response embeds the token in its child URIs; every subsequent
@@ -858,6 +872,8 @@ fn spawn_tile_content(
                     base_color_texture: prim.material.base_color_image.map(|img| images.add(img)),
                     metallic: prim.material.metallic,
                     perceptual_roughness: prim.material.roughness,
+                    // Photogrammetry (P3DT) ships baked lighting.
+                    unlit: prim.material.unlit,
                     cull_mode: if prim.material.double_sided {
                         None
                     } else {
@@ -1138,21 +1154,20 @@ fn drive_tiles3d(
             let source = set.source.clone();
             let tx = channel.tx.clone();
             let (set_id, tile) = (set.id, req.tile);
+            let georeferenced = matches!(set.frame, SetFrame::Ecef { .. });
             fetch::spawn_io(async move {
                 // Fetch + decode entirely inside the task (wasm: every IO step
                 // awaits a JS future and yields; decode is small-tile CPU).
-                // Content naming another tileset.json is an external tileset
-                // (the P3DT tree shape) — parsed here, grafted on receive.
-                let is_subtree = uri
-                    .split(['?', '#'])
-                    .next()
-                    .unwrap_or(&uri)
-                    .ends_with(".json");
+                // External tilesets are detected by CONTENT, not URI — P3DT
+                // serves subtree JSON and GLBs from the same extensionless
+                // /files/<id> namespace.
                 let result = match source.read_entry_cached(&uri, Some(&abort)).await {
-                    Ok(bytes) if is_subtree => schema::parse_tileset(&bytes)
-                        .map(|ts| TileOutput::Subtree(Box::new(ts)))
-                        .map_err(|e| format!("parse external tileset: {e}")),
-                    Ok(bytes) => content::decode_tile(&bytes)
+                    Ok(bytes) if looks_like_external_tileset(&bytes) => {
+                        schema::parse_tileset(&bytes)
+                            .map(|ts| TileOutput::Subtree(Box::new(ts)))
+                            .map_err(|e| format!("parse external tileset: {e}"))
+                    }
+                    Ok(bytes) => content::decode_tile(&bytes, georeferenced)
                         .await
                         .map(|tile| TileOutput::Content(Box::new(tile))),
                     Err(e) => Err(e.to_string()),
@@ -1304,6 +1319,20 @@ mod tests {
         assert!(is_archive_spec("https://x/a/demo.3tz#frag"));
         assert!(!is_archive_spec("assets/fixtures/tiles3d-demo/tileset.json"));
         assert!(!is_archive_spec("https://x/a/tileset.json?sas=1"));
+    }
+
+    #[test]
+    fn external_tileset_detection_is_content_based() {
+        let tileset = br#"{"asset":{"version":"1.1"},"geometricError":1e100,
+            "root":{"boundingVolume":{"box":[0,0,0,1,0,0,0,1,0,0,0,1]},"geometricError":0}}"#;
+        assert!(looks_like_external_tileset(tileset));
+        assert!(looks_like_external_tileset(b"  \n{\"geometricError\": 1, \"root\": {}}"));
+        // GLB magic → content, regardless of any JSON-chunk strings.
+        assert!(!looks_like_external_tileset(b"glTF\x02\x00\x00\x00..."));
+        // Bare glTF JSON (no geometricError) → content.
+        assert!(!looks_like_external_tileset(
+            br#"{"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],"meshes":[]}"#
+        ));
     }
 
     #[test]
