@@ -1291,12 +1291,17 @@ fn drive_tiles3d(
         let cam_forward = set_from_world
             .transform_vector3(cam_forward_world)
             .normalize_or(DVec3::NEG_Z);
+        // Camera height above the planet surface (globe sets only): the falloff
+        // measures from here, so flying high keeps the nadir tile sharp.
+        let cam_height_m =
+            planet_radius.map(|r| (cam_pos.length() - r).max(0.0)).unwrap_or(0.0);
         let params = SelectParams {
             cam_pos,
             cam_forward,
             k_px,
             sse_threshold_px: config.sse_threshold_px,
             detail_falloff_m: config.detail_falloff_m,
+            cam_height_m,
         };
 
         // Content readiness as the traversal sees it.
@@ -1336,7 +1341,11 @@ fn drive_tiles3d(
             let world_center = world_from_set.transform_point3(center);
             let sphere = Sphere {
                 center: Vec3A::from(world_center.as_vec3()),
-                radius: (radius * set_scale) as f32,
+                // Inflate the test sphere 25%: keep tiles whose extent sits just
+                // past the frustum edge so they don't pop out (and stop loading)
+                // as the view rotates/tilts — the "tiles vanish at this exact
+                // angle" finding. Cheap now that compaction bounds the tree.
+                radius: (radius * set_scale * 1.25) as f32,
             };
             // `intersect_far = false`, like the basemap: distant tiles coarsen
             // via SSE; clipping handles the rest.

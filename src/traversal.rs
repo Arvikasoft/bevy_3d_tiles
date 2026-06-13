@@ -377,14 +377,19 @@ pub struct SelectParams {
     pub k_px: f64,
     /// Refine while `sse > threshold` (px).
     pub sse_threshold_px: f64,
-    /// Distance-relaxed detail falloff (metres). The effective refine
-    /// threshold grows with the tile's distance from the camera —
-    /// `threshold × (1 + dist / detail_falloff_m)` — so terrain toward the
-    /// horizon stops subdividing instead of pulling the whole visible
-    /// hemisphere to full LOD (the live P3DT "tilt → 98 k-tile tree" finding).
-    /// `dist ≪ falloff` ⇒ normal threshold; `dist ≫ falloff` ⇒ coarse. `0`
-    /// disables (constant threshold = pre-falloff behaviour).
+    /// Distance-relaxed detail falloff (metres). The effective refine threshold
+    /// grows with how far the tile sits BEYOND the camera's own height —
+    /// `threshold × (1 + max(0, dist − cam_height_m) / detail_falloff_m)` — so
+    /// terrain toward the horizon stops subdividing instead of pulling the whole
+    /// visible hemisphere to full LOD (the live P3DT "tilt → 98 k-tile tree"
+    /// finding), while the tile directly under a high top-down view stays sharp
+    /// (its `dist ≈ cam_height_m`, so it keeps the base threshold). `0` disables.
     pub detail_falloff_m: f64,
+    /// Camera height above the planet surface (metres) for globe sets — the
+    /// reference distance the falloff measures FROM, so altitude alone never
+    /// coarsens the view (only reaching toward the horizon does). `0` for
+    /// non-globe sets, where the falloff measures raw distance as before.
+    pub cam_height_m: f64,
 }
 
 /// Screen-space error of a tile with geometric error `ge` at `dist` metres.
@@ -599,7 +604,12 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     // A camera *inside* the volume still has `dist == 0` ⇒ infinite SSE ⇒
     // refine, so detail directly under the camera is unaffected.
     let threshold = if ctx.params.detail_falloff_m > 0.0 {
-        ctx.params.sse_threshold_px * (1.0 + dist / ctx.params.detail_falloff_m)
+        // Measure the falloff from the camera's HEIGHT, not its position: the
+        // tile right under a high top-down view has `dist ≈ cam_height_m` ⇒
+        // `extra ≈ 0` ⇒ base threshold (stays sharp), while tiles reaching
+        // toward the horizon (`dist ≫ height`) relax and stop subdividing.
+        let extra = (dist - ctx.params.cam_height_m).max(0.0);
+        ctx.params.sse_threshold_px * (1.0 + extra / ctx.params.detail_falloff_m)
     } else {
         ctx.params.sse_threshold_px
     };
@@ -734,6 +744,7 @@ mod tests {
             // Disabled in most tests so the SSE assertions stay exact; the
             // falloff has its own dedicated test below.
             detail_falloff_m: 0.0,
+            cam_height_m: 0.0,
         }
     }
 
