@@ -594,24 +594,34 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     if all_covered {
         return VisitOut { covered: true, any_rendered_last: any_last };
     }
-    // Kick (§7.5): some selected descendant isn't paintable yet — drop the
-    // whole partial cut (loads stay queued) and render this tile's own
-    // content INSTEAD until every child arrives. Classic atomic REPLACE:
-    // never overlap parent and children (coarse photogrammetry surfaces sit
-    // ABOVE the fine ones and occlude them — live P3DT finding), never leave
-    // the pending siblings' footprints as holes. The cost is a brief local
-    // one-level coarsen while new siblings stream; the ancestor-touched rule
-    // in `select` keeps the parent resident so the kick almost never
-    // cascades deeper than that.
-    sel.render.truncate(checkpoint);
+    // Some selected descendant isn't paintable yet. Three-way resolution
+    // (each clause earned by a live-P3DT regression — don't reorder):
+    //
+    // 1. This tile is renderable → ATOMIC SWAP: replace the entire partial
+    //    cut below with this tile's own content. Never parent+children
+    //    overlap (coarse photogrammetry sits ABOVE fine and occludes it),
+    //    never holes; the ancestor-touched rule keeps this the common case
+    //    and the coarsen stays one level deep.
     if ctx.content[i] == TileContent::Ready {
+        sel.render.truncate(checkpoint);
         sel.render.push(i);
         return VisitOut { covered: true, any_rendered_last: ctx.history.rendered[i] };
     }
+    // 2. Nothing to swap to (contentless/pending), but this subtree WAS on
+    //    screen last frame → BRAKE the cascade: keep the partial children
+    //    and accept the small hole. Reporting uncovered here would let an
+    //    ancestor swap a huge footprint to coarse — P3DT's tree is full of
+    //    contentless grafted interiors, so the cascade climbed straight
+    //    through them and wiped (or blanked) the whole visible region.
+    if any_last {
+        push_load(ctx, sel, i, dist);
+        return VisitOut { covered: true, any_rendered_last: true };
+    }
+    // 3. Nothing here has ever rendered (initial load of this region):
+    //    drop the partial selections and report uncovered so the nearest
+    //    READY ancestor paints the whole footprint coarse-first.
+    sel.render.truncate(checkpoint);
     push_load(ctx, sel, i, dist);
-    // Not renderable itself either (contentless interiors included): the
-    // footprint is genuinely unpainted — report uncovered so OUR ancestor
-    // kicks and backfills it.
     VisitOut { covered: false, any_rendered_last: false }
 }
 
@@ -789,6 +799,37 @@ mod tests {
         // The pending two remain queued so the swap to full detail lands.
         let queued: Vec<usize> = sel.loads.iter().map(|r| r.tile).collect();
         assert!(queued.contains(&kids[2]) && queued.contains(&kids[3]));
+    }
+
+    /// A pending tile under a CONTENTLESS parent (P3DT's grafted interiors)
+    /// whose siblings were on screen must NOT wipe them: the cascade brakes,
+    /// the rendered siblings stay, the pending one is a small hole until it
+    /// lands. (Pre-brake, the uncovered signal climbed through the
+    /// contentless chain and swapped huge footprints — or the whole tileset
+    /// — to coarse/black on rotation.)
+    #[test]
+    fn contentless_parent_with_rendered_siblings_brakes_the_cascade() {
+        let mut tree = fixture_tree();
+        tree.nodes[1].content_uri = None; // consumed/grafted interior
+        let mut content = all(TileContent::Ready, tree.len());
+        content[1] = TileContent::None;
+        let kids = tree.nodes[1].children.clone();
+        content[kids[3]] = TileContent::Pending; // one new sibling streaming
+        let mut history =
+            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        for &k in &kids[0..3] {
+            history.rendered[k] = true;
+        }
+        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        // The three on-screen leaves keep rendering; no ancestor swap.
+        for &k in &kids[0..3] {
+            assert!(sel.render.contains(&k), "rendered sibling {k} kept");
+        }
+        assert!(!sel.render.contains(&0), "root does not wipe the region");
+        // The pending sibling stays queued.
+        assert!(sel.loads.iter().any(|r| r.tile == kids[3]));
+        // The other quadrants' leaves are untouched.
+        assert_eq!(sel.render.len(), 3 + 12);
     }
 
     /// Ready ancestors of the rendered cut stay `touched` — evicting them

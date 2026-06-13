@@ -75,8 +75,10 @@ pub struct Tiles3dConfig {
     pub max_concurrent_loads: usize,
     /// Main-thread time box: max decoded tiles turned into entities per frame.
     pub max_spawns_per_frame: usize,
-    /// Frames an out-of-cut tile stays resident before eviction (zoom
-    /// in-and-back reuse, mirrors basemap).
+    /// Frames an out-of-cut tile stays resident before eviction (zoom/orbit
+    /// in-and-back reuse, mirrors basemap). Generous: P3DT content is never
+    /// CAS-cached (ToS), so every eviction is a real re-download and the
+    /// view rebuilds coarse-to-fine.
     pub grace_frames: u64,
     /// Hard cap on resident (spawned) tiles per tileset.
     pub max_resident_tiles: usize,
@@ -88,8 +90,8 @@ impl Default for Tiles3dConfig {
             sse_threshold_px: traversal::DEFAULT_SSE_THRESHOLD_PX,
             max_concurrent_loads: 16,
             max_spawns_per_frame: 4,
-            grace_frames: 180,
-            max_resident_tiles: 512,
+            grace_frames: 600,
+            max_resident_tiles: 1024,
         }
     }
 }
