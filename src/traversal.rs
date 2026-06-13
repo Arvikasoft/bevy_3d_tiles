@@ -240,6 +240,48 @@ impl TileTree {
         self.nodes[at].children.push(idx);
         Ok(idx)
     }
+
+    /// Compact the tree to the nodes flagged `true` in `keep`, in place,
+    /// returning the old→new index map (`usize::MAX` for a pruned node).
+    ///
+    /// `keep` MUST be ancestor-closed: every kept node's parent is kept. The
+    /// compactor prunes whole subtrees (rooted at a grafted child), which
+    /// guarantees this — `debug_assert`ed here. Per-tile side arrays the caller
+    /// holds outside the tree (slots, last_touched, …) must be gathered with the
+    /// SAME mask so their indices stay aligned with `nodes` afterwards.
+    pub fn retain(&mut self, keep: &[bool]) -> Vec<usize> {
+        let n = self.nodes.len();
+        debug_assert_eq!(keep.len(), n);
+        let mut new_index = vec![usize::MAX; n];
+        let mut next = 0;
+        for (i, &k) in keep.iter().enumerate() {
+            if k {
+                new_index[i] = next;
+                next += 1;
+            }
+        }
+        if next == n {
+            return new_index; // nothing pruned — leave `nodes` untouched
+        }
+        let old = std::mem::take(&mut self.nodes);
+        let mut compacted = Vec::with_capacity(next);
+        for (i, mut node) in old.into_iter().enumerate() {
+            if !keep[i] {
+                continue;
+            }
+            if let Some(p) = node.parent {
+                debug_assert!(keep[p], "retain: kept node {i} has a pruned parent {p}");
+                node.parent = Some(new_index[p]);
+            }
+            node.children.retain(|c| keep[*c]);
+            for c in &mut node.children {
+                *c = new_index[*c];
+            }
+            compacted.push(node);
+        }
+        self.nodes = compacted;
+        new_index
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1239,5 +1281,70 @@ mod tests {
         // Content placement composes the same chain.
         let p = tree.nodes[3].world_from_content.transform_point3(DVec3::ZERO);
         assert!((p - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9, "p = {p:?}");
+    }
+
+    /// A bare node for the structural `retain` tests (geometry irrelevant).
+    fn bare(parent: Option<usize>, children: Vec<usize>) -> TileNode {
+        TileNode {
+            parent,
+            children,
+            depth: 0,
+            geometric_error: 1.0,
+            refine: Refine::Replace,
+            content_uri: None,
+            volume: sphere(DVec3::ZERO, 1.0),
+            world_from_content: DMat4::IDENTITY,
+            world_from_tile: DMat4::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn retain_drops_pruned_subtrees_and_renumbers_siblings() {
+        // root(0) → [1, 2, 3]; prune the odd children, keep root + 2.
+        let mut tree = TileTree::default();
+        tree.nodes.push(bare(None, vec![1, 2, 3]));
+        tree.nodes.push(bare(Some(0), vec![]));
+        tree.nodes.push(bare(Some(0), vec![]));
+        tree.nodes.push(bare(Some(0), vec![]));
+
+        let map = tree.retain(&[true, false, true, false]);
+        assert_eq!(map[0], 0);
+        assert_eq!(map[2], 1);
+        assert_eq!(map[1], usize::MAX);
+        assert_eq!(map[3], usize::MAX);
+        assert_eq!(tree.len(), 2);
+        // root keeps only old-node-2, renumbered to new index 1.
+        assert_eq!(tree.nodes[0].children, vec![1]);
+        assert_eq!(tree.nodes[1].parent, Some(0));
+        assert!(tree.nodes[1].children.is_empty());
+    }
+
+    #[test]
+    fn retain_remaps_a_kept_chain() {
+        // root(0) → 1 → 2 (a chain), plus root → 3. Prune node 3; the chain
+        // survives and renumbers contiguously, parent/child links intact.
+        let mut tree = TileTree::default();
+        tree.nodes.push(bare(None, vec![1, 3]));
+        tree.nodes.push(bare(Some(0), vec![2]));
+        tree.nodes.push(bare(Some(1), vec![]));
+        tree.nodes.push(bare(Some(0), vec![]));
+
+        let map = tree.retain(&[true, true, true, false]);
+        assert_eq!(tree.len(), 3);
+        assert_eq!(map[3], usize::MAX);
+        assert_eq!(tree.nodes[0].children, vec![1]); // old [1,3] → [1]
+        assert_eq!(tree.nodes[1].parent, Some(0));
+        assert_eq!(tree.nodes[1].children, vec![2]);
+        assert_eq!(tree.nodes[2].parent, Some(1));
+    }
+
+    #[test]
+    fn retain_noop_when_all_kept() {
+        let mut tree = TileTree::default();
+        tree.nodes.push(bare(None, vec![1]));
+        tree.nodes.push(bare(Some(0), vec![]));
+        let map = tree.retain(&[true, true]);
+        assert_eq!(map, vec![0, 1]);
+        assert_eq!(tree.len(), 2);
     }
 }

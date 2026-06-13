@@ -93,6 +93,13 @@ pub struct Tiles3dConfig {
     pub grace_frames: u64,
     /// Hard cap on resident (spawned) tiles per tileset.
     pub max_resident_tiles: usize,
+    /// Tree-compaction floor: don't reclaim grafted subtrees until the tree has
+    /// at least this many nodes (and has grown ≥50% since the last pass). The
+    /// P3DT tree grows monotonically as external tilesets graft in while you
+    /// fly — without reclamation it crept 16k→43k nodes in ~30 s, slowing every
+    /// per-frame O(tree) pass. The compactor drops whole grafted subtrees that
+    /// have been out of view past the grace window; revisiting re-grafts them.
+    pub tree_compact_min: usize,
 }
 
 impl Default for Tiles3dConfig {
@@ -110,6 +117,11 @@ impl Default for Tiles3dConfig {
             max_spawns_per_frame: 4,
             grace_frames: 600,
             max_resident_tiles: 1024,
+            // Comfortable working set before reclaiming: the grace window keeps
+            // recently-seen grafts, so this is mostly the floor that stops us
+            // compacting tiny trees. Re-grafting a reclaimed area is a real
+            // re-fetch (P3DT is never CAS-cached), so don't set it too tight.
+            tree_compact_min: 16_384,
         }
     }
 }
@@ -161,6 +173,9 @@ pub struct Tiles3dDetach {
 #[derive(Component, Debug)]
 pub struct Tiles3dTile {
     pub set_id: u64,
+    /// Spawn-time tile index. **Debug/`Name` only** — never read for logic, and
+    /// it goes stale after `compact_grafted_subtrees` renumbers the tree (the
+    /// authoritative tile→entity map is the set's `slots`, which IS remapped).
     pub tile: usize,
 }
 
@@ -211,6 +226,20 @@ enum SetFrame {
     Ecef { built: Option<ProjectOriginInner> },
 }
 
+/// One external-tileset graft, recorded so the tree compactor can drop a stale
+/// grafted subtree and restore its graft-point's content for re-fetching.
+#[derive(Debug, Clone)]
+struct GraftRecord {
+    /// The host tile the external tileset was grafted under (its `content.uri`
+    /// was cleared at graft time).
+    at: usize,
+    /// Root of the grafted subtree (the external tileset's root node).
+    child_root: usize,
+    /// The graft-point's original `content.uri` — restored verbatim if the
+    /// subtree is reclaimed, so a later visit re-fetches and re-grafts it.
+    uri: String,
+}
+
 /// One streaming tileset.
 pub struct ActiveTileset {
     id: u64,
@@ -221,6 +250,11 @@ pub struct ActiveTileset {
     history: History,
     /// Frame each tile was last in the wanted set (eviction clock).
     last_touched: Vec<u64>,
+    /// External tilesets grafted into `tree`, for compaction (reclaim + restore).
+    grafts: Vec<GraftRecord>,
+    /// `tree.len()` at the last compaction pass — the compactor only re-scans
+    /// once the tree has grown ≥50% past this (amortizes its O(tree) cost).
+    compact_high_water: usize,
     root_entity: Entity,
     /// Anchor entity when attached via D6 (None = world-anchored dev set).
     anchor: Option<Entity>,
@@ -707,6 +741,8 @@ fn receive_tiles3d(
                                 slots: vec![TileSlot::NotLoaded; n],
                                 history,
                                 last_touched: vec![0; n],
+                                grafts: Vec::new(),
+                                compact_high_water: n,
                                 root_entity,
                                 anchor: attach.as_ref().map(|a| a.anchor),
                                 twin_id: attach.and_then(|a| a.twin_id),
@@ -782,6 +818,17 @@ fn receive_tiles3d(
                                 set.rtc_centers.resize(n, None);
                                 set.history.resize(n);
                                 set.slots[tile] = TileSlot::NotLoaded;
+                                // Record the graft so the compactor can later
+                                // reclaim this subtree and restore the host's
+                                // content for re-fetching (consumed_uri is Some —
+                                // the tile had external-tileset content).
+                                if let Some(uri) = consumed_uri {
+                                    set.grafts.push(GraftRecord {
+                                        at: tile,
+                                        child_root: new_root,
+                                        uri,
+                                    });
+                                }
                                 info!(
                                     "tiles3d: {}: external tileset grafted at tile {tile} \
                                      (tree now {n} tiles)",
@@ -1016,6 +1063,89 @@ fn spawn_tile_content(
     tile_root
 }
 
+/// Keep the `true`-flagged entries of `v`, preserving order — the index-aligned
+/// twin of [`TileTree::retain`] for the per-tile side arrays.
+fn gather<T: Clone>(v: &[T], keep: &[bool]) -> Vec<T> {
+    v.iter().zip(keep).filter(|&(_, &k)| k).map(|(x, _)| x.clone()).collect()
+}
+
+/// Reclaim grafted subtrees that have fallen out of view past the grace window,
+/// bounding the otherwise monotonically-growing P3DT tree (external tilesets
+/// graft in as you fly and were never removed — the 16k→43k-node session creep
+/// that slowed every per-frame O(tree) pass). Keeps the base tileset and
+/// everything recently touched / still resident / in flight; drops whole stale
+/// grafted subtrees and restores each graft-point's `content_uri` so revisiting
+/// re-grafts. Renumbers tiles, so it runs occasionally (amortized), never per
+/// frame. Returns the number of tiles reclaimed.
+fn compact_grafted_subtrees(set: &mut ActiveTileset, frame: u64, grace: u64) -> usize {
+    let n = set.tree.len();
+    let stale = |i: usize| frame.saturating_sub(set.last_touched[i]) > grace;
+
+    // `keep[i]` defaults true; a prunable grafted subtree flips its nodes false.
+    // Because we only ever drop COMPLETE subtrees rooted at a grafted child,
+    // `keep` stays ancestor-closed (a kept node's parent is kept) — the
+    // invariant `TileTree::retain` relies on.
+    let mut keep = vec![true; n];
+    let mut reclaimed = 0usize;
+    for g in &set.grafts {
+        let r = g.child_root;
+        // Already inside an outer pruned subtree, or still wanted near-view.
+        if !keep[r] || !stale(r) {
+            continue;
+        }
+        // Scan the subtree: prune only if NOTHING in it is resident or in flight
+        // (else we'd leak its entity or abort a live fetch). `r` stale ⇒ every
+        // descendant is stale too (a touched tile always touches its parent),
+        // so the root's staleness check covers the subtree; here we just guard
+        // against lingering content.
+        let mut subtree = Vec::new();
+        let mut stack = vec![r];
+        let mut prunable = true;
+        while let Some(x) = stack.pop() {
+            if matches!(set.slots[x], TileSlot::Ready { .. } | TileSlot::InFlight { .. }) {
+                prunable = false;
+                break;
+            }
+            subtree.push(x);
+            stack.extend(set.tree.nodes[x].children.iter().copied());
+        }
+        if prunable {
+            for x in subtree {
+                keep[x] = false;
+            }
+            reclaimed += 1;
+        }
+    }
+    if reclaimed == 0 {
+        return 0;
+    }
+
+    // Restore content on surviving graft-points whose child was pruned, so a
+    // later visit re-fetches + re-grafts the external tileset (OLD indices).
+    for g in &set.grafts {
+        if keep[g.at] && !keep[g.child_root] {
+            set.tree.nodes[g.at].content_uri = Some(g.uri.clone());
+        }
+    }
+
+    // Gather the parallel per-tile arrays with the same mask, then remap the
+    // tree (parent/children) and the graft records to the new indices. A
+    // surviving record's `child_root` is kept ⇒ its `at` is kept too
+    // (ancestor-closed), so both remap cleanly.
+    set.slots = gather(&set.slots, &keep);
+    set.last_touched = gather(&set.last_touched, &keep);
+    set.rtc_centers = gather(&set.rtc_centers, &keep);
+    set.history.rendered = gather(&set.history.rendered, &keep);
+    set.history.refined = gather(&set.history.refined, &keep);
+    set.grafts.retain(|g| keep[g.child_root]);
+    let map = set.tree.retain(&keep);
+    for g in &mut set.grafts {
+        g.at = map[g.at];
+        g.child_root = map[g.child_root];
+    }
+    n - set.tree.len()
+}
+
 // ── Per-frame manager ────────────────────────────────────────────────────────
 
 /// Run the selection pass per tileset, apply the render cut as visibility,
@@ -1077,7 +1207,31 @@ fn drive_tiles3d(
     let mut any_in_flight = false;
     let mut google_visible = false;
     let mut ground_covering = false;
+    let mut compacted_this_frame = false;
     for set in sets.iter_mut() {
+        // Reclaim stale grafted subtrees once the tree has grown well past the
+        // last pass — bounds the monotonic P3DT graft creep so the per-frame
+        // O(tree) bookkeeping below stops getting slower the longer you fly.
+        // Renumbers tiles, so it's amortized (≥50% growth) and capped to one
+        // set per frame to avoid a multi-set spike. Runs BEFORE selection so
+        // everything downstream sees the compacted indices.
+        if !compacted_this_frame
+            && set.tree.len() >= config.tree_compact_min
+            && set.tree.len() >= set.compact_high_water.saturating_mul(3) / 2
+        {
+            let reclaimed = compact_grafted_subtrees(set, *frame, config.grace_frames);
+            set.compact_high_water = set.tree.len();
+            compacted_this_frame = true;
+            if reclaimed > 0 {
+                info!(
+                    "tiles3d: {}: compacted tree — reclaimed {reclaimed} stale tile(s) \
+                     ({} remain)",
+                    set.label,
+                    set.tree.len()
+                );
+            }
+        }
+
         // The set's frame. Anchored: world_from_set = anchor chain ×
         // correction (the root entity's GlobalTransform — last frame's
         // propagation, fine for streaming decisions); selection runs in
