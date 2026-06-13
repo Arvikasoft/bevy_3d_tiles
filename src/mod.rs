@@ -42,7 +42,6 @@ use bevy_panorbit_camera::PanOrbitCamera;
 
 pub mod archive;
 pub mod content;
-pub mod dither;
 pub mod draco;
 pub mod fetch;
 pub mod geo;
@@ -55,7 +54,6 @@ pub mod traversal;
 
 use archive::Archive3tz;
 use content::{DecodedItem, DecodedTile};
-use dither::{TileDither, TileFade, TileMat};
 use fetch::{BudgetCounter, ByteSource, ExplodedBase, LiveSession, TilesetSource};
 use traversal::{History, SelectParams, TileContent, TileTree, TreeFrame, ZUP_TO_BEVY};
 
@@ -636,7 +634,7 @@ fn receive_tiles3d(
     origin: Res<ProjectOrigin>,
     mut sets: ResMut<Tiles3dSets>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<TileMat>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut clouds: ResMut<Assets<bevy_pointcloud::point_cloud::PointCloud>>,
     mut splats: ResMut<Assets<bevy_gaussian_splatting::PlanarGaussian3d>>,
@@ -919,7 +917,7 @@ fn beyond_horizon(cam: DVec3, center: DVec3, radius: f64, planet_r: f64) -> bool
 fn spawn_tile_content(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<TileMat>,
+    materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     clouds: &mut Assets<bevy_pointcloud::point_cloud::PointCloud>,
     splats: &mut Assets<bevy_gaussian_splatting::PlanarGaussian3d>,
@@ -933,11 +931,9 @@ fn spawn_tile_content(
         .spawn((
             Tiles3dTile { set_id: set.id, tile },
             transform,
-            // Spawned hidden + faded out; `drive_tiles3d` sets the fade target
-            // and `tick_tile_fade` dissolves it in — a freshly loaded tile must
-            // never flash over the coarser one it replaces.
+            // Spawned hidden; `drive_tiles3d` flips it visible once the render
+            // cut selects this tile (children inherit the root's visibility).
             Visibility::Hidden,
-            TileFade::default(),
             ChildOf(set.root_entity),
             Name::new(format!("Tiles3dTile({} #{tile})", set.label)),
         ))
@@ -957,7 +953,13 @@ fn spawn_tile_content(
                     }),
                     _ => None,
                 };
-                let base = StandardMaterial {
+                // Plain OPAQUE StandardMaterial: no `discard`, no alpha blend, so
+                // the GPU keeps early-Z depth testing — dense, overlapping P3DT
+                // photogrammetry would otherwise pay full overdraw on every
+                // occluded fragment. (The dithered LOD cross-fade prototype that
+                // lived here forced late-Z for the whole pipeline and tanked the
+                // frame rate; reverted — LODs pop, but the view runs.)
+                let material = StandardMaterial {
                     base_color: Color::LinearRgba(LinearRgba::new(
                         prim.material.base_color[0],
                         prim.material.base_color[1],
@@ -974,17 +976,8 @@ fn spawn_tile_content(
                     } else {
                         Some(bevy::render::render_resource::Face::Back)
                     },
-                    // LOD-keyed draw order: `depth_bias` biases the opaque sort
-                    // distance, so a finer (deeper) tile draws AFTER the coarse
-                    // one it overlaps and wins the equal-depth test — the finer
-                    // detail dissolves cleanly on top instead of z-fighting the
-                    // coarse tile held opaque beneath it during the cross-fade.
-                    depth_bias: set.tree.nodes[tile].depth as f32,
                     ..default()
                 };
-                // Dithered LOD cross-fade: starts fully dissolved (fade 0); the
-                // cut + `tick_tile_fade` ramp it in.
-                let material = TileMat { base, extension: TileDither { fade: 0.0 } };
                 let mut child = commands.spawn((
                     Mesh3d(meshes.add(prim.mesh)),
                     MeshMaterial3d(materials.add(material)),
@@ -1037,7 +1030,7 @@ fn drive_tiles3d(
     mut credits: ResMut<TilesetCredits>,
     camera: Query<(&Camera, &GlobalTransform, &Projection, &Frustum), With<PanOrbitCamera>>,
     transforms: Query<&GlobalTransform>,
-    mut fade_q: Query<&mut TileFade, With<Tiles3dTile>>,
+    mut vis_q: Query<&mut Visibility, With<Tiles3dTile>>,
     mut tile_transforms: Query<&mut Transform, With<Tiles3dTile>>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut commands: Commands,
@@ -1199,19 +1192,21 @@ fn drive_tiles3d(
             }
         }
 
-        // Apply the render cut as a per-tile-root dither fade TARGET; the swap
-        // dissolves rather than pops. `tick_tile_fade` eases current→target,
-        // pushes it into the materials, and owns the actual `Visibility`.
+        // Apply the render cut as per-tile-root visibility — the selected tiles
+        // show, everything else hides (children inherit the root's visibility).
         let mut want_visible = vec![false; tree.len()];
         for &t in &sel.render {
             want_visible[t] = true;
         }
         for (i, slot) in set.slots.iter().enumerate() {
             if let TileSlot::Ready { entity } = slot
-                && let Ok(mut fade) = fade_q.get_mut(*entity)
-                && fade.wanted != want_visible[i]
+                && let Ok(mut vis) = vis_q.get_mut(*entity)
             {
-                fade.wanted = want_visible[i];
+                let want =
+                    if want_visible[i] { Visibility::Visible } else { Visibility::Hidden };
+                if *vis != want {
+                    *vis = want;
+                }
             }
         }
 
