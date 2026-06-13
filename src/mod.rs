@@ -100,7 +100,10 @@ impl Default for Tiles3dConfig {
             // against the live autzen P3DT view (cam ~10–20 m up); raise for
             // high-altitude orbits, lower if the tree still grows too far out.
             detail_falloff_m: 2000.0,
-            max_concurrent_loads: 16,
+            // 32 (up from 16): the startup descent walks a ~20-deep chain of
+            // nested tileset.json grafts to reach street-level detail; more
+            // parallel slots resolve the breadth of that descent faster.
+            max_concurrent_loads: 32,
             max_spawns_per_frame: 4,
             grace_frames: 600,
             max_resident_tiles: 1024,

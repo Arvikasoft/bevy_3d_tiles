@@ -355,13 +355,19 @@ pub fn screen_space_error(ge: f64, dist: f64, k_px: f64) -> f64 {
     }
 }
 
-/// Load-priority tiers, highest first. `Ord`: `Urgent < Normal < Preload`
-/// so an ascending sort puts the most important requests first.
+/// Load-priority tiers, highest first. `Ord`: `Urgent < Descend < Normal <
+/// Preload` so an ascending sort puts the most important requests first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
     /// Camera inside the tile's bounding volume.
     Urgent,
-    /// In the current render cut.
+    /// Refinement frontier: a childless tile the camera still wants finer than.
+    /// Loading it either grafts a deeper subtree (descending toward sharp) or
+    /// paints the best-available coarse content there — so ranking it above
+    /// settled `Normal` content makes the view reach target LOD before the
+    /// periphery fills (faster "my view is sharp" at startup).
+    Descend,
+    /// In the current render cut at its chosen LOD.
     Normal,
     /// Ancestors of the cut — zoom-out insurance, loaded when idle.
     Preload,
@@ -578,6 +584,18 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     if !wants_refine {
         // Render this tile (leaves always land here).
         push_load(ctx, sel, i, dist);
+        // Refinement frontier: a childless tile the camera still wants finer
+        // than is the edge we descend from. Upgrade its load to `Descend` so
+        // the tree extends toward the view (and the nearest detail paints)
+        // before slots go to already-good-enough content elsewhere.
+        if node.children.is_empty()
+            && sse > threshold
+            && let Some(req) = sel.loads.last_mut()
+            && req.tile == i
+            && req.priority == Priority::Normal
+        {
+            req.priority = Priority::Descend;
+        }
         if ctx.content[i] == TileContent::Ready {
             sel.render.push(i);
         }
@@ -772,6 +790,33 @@ mod tests {
         let relaxed = SelectParams { detail_falloff_m: 500.0, ..params(cam) };
         let far = select(&tree, &content, &history, &no_cull, relaxed);
         assert_eq!(far.render, vec![0], "falloff keeps the distant tile coarse");
+    }
+
+    #[test]
+    fn refine_frontier_loads_at_descend_priority() {
+        // A childless tile the camera wants finer than (here SSE ≫ threshold)
+        // is the refinement frontier — its load outranks settled Normal
+        // content but still yields to Urgent.
+        let mut tree = TileTree::default();
+        tree.nodes.push(TileNode {
+            parent: None,
+            children: vec![],
+            depth: 0,
+            geometric_error: 16.0,
+            refine: Refine::Replace,
+            content_uri: Some("x.glb".into()),
+            volume: sphere(DVec3::ZERO, 30.0),
+            world_from_content: DMat4::IDENTITY,
+            world_from_tile: DMat4::IDENTITY,
+        });
+        let content = vec![TileContent::Pending];
+        let history = History { rendered: vec![false; 1], refined: vec![false; 1] };
+        // 10 m off the surface: SSE ≫ threshold, but the camera is NOT inside.
+        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 0.0, 40.0)));
+        let req = sel.loads.iter().find(|r| r.tile == 0).expect("queued");
+        assert_eq!(req.priority, Priority::Descend);
+        // And Descend outranks Normal / Preload in the sort.
+        assert!(Priority::Urgent < Priority::Descend && Priority::Descend < Priority::Normal);
     }
 
     #[test]
