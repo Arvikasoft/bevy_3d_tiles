@@ -30,6 +30,7 @@ use bevy_gaussian_splatting::gaussian::formats::planar_3d::Gaussian3d;
 use bevy_pointcloud::point_cloud::PointCloudData;
 
 use super::draco;
+use super::meshopt;
 
 /// One decoded glTF primitive, positioned by its node's global transform
 /// (glTF Y-up frame — the spawned tile entity applies
@@ -205,9 +206,23 @@ fn extract_planetary_root_offset(json: &mut serde_json::Value) -> Option<DVec3> 
 
 /// Decode a GLB (or self-contained glTF JSON) tile into renderable items.
 pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
+    let (json, bin) = split_glb(bytes)?;
+
+    // EXT_meshopt_compression (T6/D12 — what our mesh tiler emits, and POINTS
+    // tiles too): decode the compressed buffer views on the CPU into a vanilla
+    // GLB, then re-enter. Synchronous (no JS shim, unlike Draco), so it lives
+    // here rather than in the async `decode_tile` preprocess — both the fast
+    // path and direct callers get it. The rebuilt GLB carries no marker, so
+    // the recursion routes to the splat/plain path below without looping.
+    if memmem(json, b"EXT_meshopt_compression") {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(json).map_err(|e| format!("meshopt tile json: {e}"))?;
+        let vanilla = preprocess_meshopt(&mut value, bin)?;
+        return decode_glb(&vanilla);
+    }
+
     // Splat tiles bypass the gltf crate entirely (see module docs). The
     // marker check is a cheap substring scan of the JSON chunk.
-    let (json, bin) = split_glb(bytes)?;
     if memmem(json, b"KHR_gaussian_splatting") {
         let value: serde_json::Value =
             serde_json::from_slice(json).map_err(|e| format!("splat tile json: {e}"))?;
@@ -506,6 +521,105 @@ fn assemble_glb(json_bytes: &[u8], bin: &[u8]) -> Vec<u8> {
         glb.extend_from_slice(&bin);
     }
     glb
+}
+
+// ── EXT_meshopt_compression preprocessing (T6 — our emitted geometry) ────────
+
+/// Rewrite an `EXT_meshopt_compression` GLB into a vanilla self-contained GLB:
+/// decode every meshopt buffer view on the CPU ([`meshopt::decode_buffer_view`]),
+/// copy through non-meshopt views (embedded image bytes), collapse to a single
+/// buffer (the fallback buffer is virtual — no GLB bytes), and strip the
+/// extension. The strict `gltf` crate path then decodes it unchanged.
+///
+/// Buffer-view *indices* are preserved (accessors and images keep referencing
+/// the same slots); only each view's `byteOffset`/`byteLength`/`buffer` are
+/// rebuilt against the freshly decoded BIN. The encoder stores compressed data
+/// in the GLB BIN (`ext.buffer == 0`) while the view's own `buffer` points at
+/// the discarded fallback — so we always read compressed bytes via `ext`.
+fn preprocess_meshopt(
+    json: &mut serde_json::Value,
+    bin: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let bin = bin.ok_or("meshopt GLB has no BIN chunk")?;
+    let view_count = json["bufferViews"].as_array().map(|a| a.len()).unwrap_or(0);
+    let mut new_bin: Vec<u8> = Vec::new();
+    let mut new_views: Vec<serde_json::Value> = Vec::with_capacity(view_count);
+
+    for i in 0..view_count {
+        let bv = &json["bufferViews"][i];
+        let ext = &bv["extensions"]["EXT_meshopt_compression"];
+        let def = if ext.is_object() {
+            if ext["buffer"].as_u64().unwrap_or(0) != 0 {
+                return Err("meshopt ext references a non-BIN buffer".into());
+            }
+            let off = ext["byteOffset"].as_u64().unwrap_or(0) as usize;
+            let len = ext["byteLength"].as_u64().ok_or("meshopt ext without byteLength")? as usize;
+            let stride =
+                ext["byteStride"].as_u64().ok_or("meshopt ext without byteStride")? as usize;
+            let count = ext["count"].as_u64().ok_or("meshopt ext without count")? as usize;
+            let mode = ext["mode"].as_str().ok_or("meshopt ext without mode")?.to_string();
+            let filter = ext["filter"].as_str().unwrap_or("NONE").to_string();
+            let src = bin
+                .get(off..off + len)
+                .ok_or("meshopt compressed data out of BIN bounds")?;
+            let decoded = meshopt::decode_buffer_view(&mode, &filter, count, stride, src)?;
+            while !new_bin.len().is_multiple_of(4) {
+                new_bin.push(0);
+            }
+            let new_off = new_bin.len();
+            new_bin.extend_from_slice(&decoded);
+            let mut def = serde_json::json!({
+                "buffer": 0, "byteOffset": new_off, "byteLength": decoded.len(),
+            });
+            // Vertex views keep their stride (honors interleaving for foreign
+            // gltfpack output; == element size for our non-interleaved tiles).
+            if mode == "ATTRIBUTES" {
+                def["byteStride"] = serde_json::json!(stride);
+            }
+            def
+        } else {
+            // Pass-through view (e.g. an embedded image): copy its BIN bytes.
+            if bv["buffer"].as_u64().unwrap_or(0) != 0 {
+                return Err("non-meshopt bufferView references a non-BIN buffer".into());
+            }
+            let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
+            let len = bv["byteLength"].as_u64().ok_or("bufferView without byteLength")? as usize;
+            let bytes = bin
+                .get(off..off + len)
+                .ok_or("bufferView out of BIN bounds")?
+                .to_vec();
+            while !new_bin.len().is_multiple_of(4) {
+                new_bin.push(0);
+            }
+            let new_off = new_bin.len();
+            new_bin.extend_from_slice(&bytes);
+            let mut def = serde_json::json!({
+                "buffer": 0, "byteOffset": new_off, "byteLength": len,
+            });
+            if let Some(s) = bv["byteStride"].as_u64() {
+                def["byteStride"] = serde_json::json!(s);
+            }
+            if let Some(t) = bv["target"].as_u64() {
+                def["target"] = serde_json::json!(t);
+            }
+            def
+        };
+        new_views.push(def);
+    }
+
+    json["bufferViews"] = serde_json::Value::Array(new_views);
+    json["buffers"] = serde_json::json!([{ "byteLength": new_bin.len() }]);
+    for list in ["extensionsUsed", "extensionsRequired"] {
+        if let Some(arr) = json.get_mut(list).and_then(|v| v.as_array_mut()) {
+            arr.retain(|v| v.as_str() != Some("EXT_meshopt_compression"));
+            if arr.is_empty() {
+                json.as_object_mut().unwrap().remove(list);
+            }
+        }
+    }
+
+    let json_bytes = serde_json::to_vec(&json).map_err(|e| format!("meshopt splice json: {e}"))?;
+    Ok(assemble_glb(&json_bytes, &new_bin))
 }
 
 /// Resolve a glTF buffer: GLB BIN chunk only (tiles are self-contained).
@@ -1244,5 +1358,60 @@ mod tests {
         let g1 = &gaussians[1];
         // xyzw [1,0,0,0] → wxyz [0,1,0,0].
         assert_eq!(g1.rotation.rotation, [0.0, 1.0, 0.0, 0.0]);
+    }
+
+    /// End-to-end T6: an `EXT_meshopt_compression` GLB produced by the exact
+    /// writer config (`tile_mesh.mjs`: QUANTIZE method, no quantization → filter
+    /// NONE → lossless) decodes through `preprocess_meshopt` + the strict gltf
+    /// path to **byte-identical** positions/colors and the same triangle set.
+    /// The GLB bytes are captured from `@gltf-transform` + `meshoptimizer` (see
+    /// the BEVY-3D-TILES T6 commit notes).
+    #[test]
+    fn decodes_meshopt_tile_byte_identical() {
+        use base64::Engine;
+
+        const GLB_B64: &str = "Z2xURgIAAABMBgAAaAUAAEpTT057ImFzc2V0Ijp7ImdlbmVyYXRvciI6ImdsVEYtVHJhbnNmb3JtIHY0LjMuMCIsInZlcnNpb24iOiIyLjAifSwiYWNjZXNzb3JzIjpbeyJ0eXBlIjoiVkVDMyIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50Ijo2LCJtYXgiOlsyLDMsM10sIm1pbiI6Wy0xLDAsMF0sIm5vcm1hbGl6ZWQiOmZhbHNlLCJieXRlT2Zmc2V0IjowLCJidWZmZXJWaWV3IjowfSx7InR5cGUiOiJWRUM0IiwiY29tcG9uZW50VHlwZSI6NTEyNiwiY291bnQiOjYsIm5vcm1hbGl6ZWQiOmZhbHNlLCJieXRlT2Zmc2V0IjowLCJidWZmZXJWaWV3IjoxfSx7InR5cGUiOiJTQ0FMQVIiLCJjb21wb25lbnRUeXBlIjo1MTI1LCJjb3VudCI6MTIsIm5vcm1hbGl6ZWQiOmZhbHNlLCJieXRlT2Zmc2V0IjowLCJidWZmZXJWaWV3IjoyfV0sImJ1ZmZlclZpZXdzIjpbeyJidWZmZXIiOjEsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjcyLCJ0YXJnZXQiOjM0OTYyLCJieXRlU3RyaWRlIjoxMiwiZXh0ZW5zaW9ucyI6eyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiI6eyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjgwLCJtb2RlIjoiQVRUUklCVVRFUyIsImJ5dGVTdHJpZGUiOjEyLCJjb3VudCI6Nn19fSx7ImJ1ZmZlciI6MSwiYnl0ZU9mZnNldCI6NzIsImJ5dGVMZW5ndGgiOjk2LCJ0YXJnZXQiOjM0OTYyLCJieXRlU3RyaWRlIjoxNiwiZXh0ZW5zaW9ucyI6eyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiI6eyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjgwLCJieXRlTGVuZ3RoIjo5NSwibW9kZSI6IkFUVFJJQlVURVMiLCJieXRlU3RyaWRlIjoxNiwiY291bnQiOjZ9fX0seyJidWZmZXIiOjEsImJ5dGVPZmZzZXQiOjE2OCwiYnl0ZUxlbmd0aCI6NDgsInRhcmdldCI6MzQ5NjMsImV4dGVuc2lvbnMiOnsiRVhUX21lc2hvcHRfY29tcHJlc3Npb24iOnsiYnVmZmVyIjowLCJieXRlT2Zmc2V0IjoxNzYsImJ5dGVMZW5ndGgiOjIyLCJtb2RlIjoiVFJJQU5HTEVTIiwiYnl0ZVN0cmlkZSI6NCwiY291bnQiOjEyfX19XSwiYnVmZmVycyI6W3siYnl0ZUxlbmd0aCI6MjAwfSx7ImJ5dGVMZW5ndGgiOjIxNiwiZXh0ZW5zaW9ucyI6eyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiI6eyJmYWxsYmFjayI6dHJ1ZX19fV0sIm1lc2hlcyI6W3sicHJpbWl0aXZlcyI6W3siYXR0cmlidXRlcyI6eyJQT1NJVElPTiI6MCwiQ09MT1JfMCI6MX0sIm1vZGUiOjQsImluZGljZXMiOjJ9XX1dLCJub2RlcyI6W3sidHJhbnNsYXRpb24iOlsxMCwwLDBdLCJtZXNoIjowfV0sInNjZW5lcyI6W3sibm9kZXMiOlswXX1dLCJleHRlbnNpb25zVXNlZCI6WyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiJdLCJleHRlbnNpb25zUmVxdWlyZWQiOlsiRVhUX21lc2hvcHRfY29tcHJlc3Npb24iXX0gyAAAAEJJTgCgAAABAMAAAP8BM/AAAIB/fv8AAAEA8AAA/38BDGAAAIAAAAEA8AAAgIABANAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAAEz8AAA/////wEz8AAAfX59fgAAAT8wAAD/////AT8wAAB+fX59AAABD8AAAP///wEPwAAAfn1+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AOHwAP4FAgB2h1ZneKmGZYlomAFpAAAAAA==";
+        let glb = base64::engine::general_purpose::STANDARD.decode(GLB_B64).unwrap();
+
+        let items = decode_glb(&glb).expect("meshopt decode");
+        assert_eq!(items.len(), 1);
+        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
+
+        // Node translation [10,0,0] carried onto the primitive transform.
+        assert_eq!(p.transform.w_axis.truncate(), Vec3::new(10.0, 0.0, 0.0));
+
+        // Positions are byte-identical (lossless meshopt vertex codec).
+        let pos = p
+            .mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap();
+        let expect_pos: [[f32; 3]; 6] = [
+            [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0], [1.0, 1.0, 3.0], [-1.0, 3.0, 1.0],
+        ];
+        assert_eq!(pos, &expect_pos, "positions must round-trip byte-identical");
+        assert!(p.mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
+
+        // The triangle SET is preserved (meshopt may cyclically rotate each
+        // triangle — winding kept, a rendering no-op).
+        let Some(Indices::U32(idx)) = p.mesh.indices() else { panic!("expected u32 indices") };
+        assert_eq!(idx.len(), 12);
+        let as_sorted_tris = |flat: &[u32]| {
+            let mut tris: Vec<[u32; 3]> = flat
+                .chunks_exact(3)
+                .map(|t| {
+                    let mut v = [t[0], t[1], t[2]];
+                    v.sort_unstable(); // set comparison ignores winding/rotation
+                    v
+                })
+                .collect();
+            tris.sort_unstable();
+            tris
+        };
+        let got = as_sorted_tris(idx);
+        let want = as_sorted_tris(&[0, 1, 2, 0, 2, 3, 2, 4, 5, 0, 4, 2]);
+        assert_eq!(got, want, "same triangle set");
     }
 }

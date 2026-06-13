@@ -45,6 +45,7 @@ pub mod content;
 pub mod draco;
 pub mod fetch;
 pub mod geo;
+pub mod meshopt;
 pub mod schema;
 pub mod traversal;
 
