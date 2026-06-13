@@ -528,7 +528,11 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     let dist = node.volume.distance_to(ctx.params.cam_pos);
     let sse = screen_space_error(node.geometric_error, dist, ctx.params.k_px);
 
-    let mut wants_refine = !node.children.is_empty() && sse > ctx.params.sse_threshold_px;
+    // Contentless tiles with children ALWAYS refine — there is nothing to
+    // render at this level (structural interiors, and tiles whose external
+    // tileset was grafted away), so stopping per SSE would paint a hole.
+    let mut wants_refine = !node.children.is_empty()
+        && (sse > ctx.params.sse_threshold_px || node.content_uri.is_none());
     // Zoom-out protection (§7.4): this tile became the desired cut but its
     // content isn't here yet — keep refining (descendants stay visible) while
     // the coarser content loads.
@@ -589,9 +593,20 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     }
     if any_last {
         // Part of the refined cut was already on screen last frame — keep it
-        // (removing it to kick would regress detail); the missing pieces stay
-        // queued and pop in as they land.
-        return VisitOut { covered: true, any_rendered_last: any_last };
+        // (removing it to kick would regress detail). BACKFILL the pending
+        // siblings' footprints by rendering this tile's own content BEHIND
+        // the partial children — without this, a moving camera punches holes
+        // into the nearest geometry while children stream (live P3DT
+        // finding). The ready children draw over the coarse parent.
+        if ctx.content[i] == TileContent::Ready {
+            sel.render.push(i);
+        } else {
+            push_load(ctx, sel, i, dist);
+        }
+        return VisitOut {
+            covered: ctx.content[i] == TileContent::Ready,
+            any_rendered_last: any_last,
+        };
     }
     // Kick (§7.5): none of the selected descendants have ever shown — drop
     // them from the render list (their loads stay queued) and paint this
@@ -602,11 +617,10 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
         return VisitOut { covered: true, any_rendered_last: ctx.history.rendered[i] };
     }
     push_load(ctx, sel, i, dist);
-    // Not renderable itself either — report uncovered so OUR ancestor kicks.
-    VisitOut {
-        covered: ctx.content[i] == TileContent::None && node.content_uri.is_none(),
-        any_rendered_last: false,
-    }
+    // Not renderable itself either (contentless interiors included): the
+    // footprint is genuinely unpainted — report uncovered so OUR ancestor
+    // kicks and backfills it.
+    VisitOut { covered: false, any_rendered_last: false }
 }
 
 #[cfg(test)]
@@ -777,7 +791,9 @@ mod tests {
         let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
         // The two ready leaves stay on screen (no kick of child 1)…
         assert!(sel.render.contains(&kids[0]) && sel.render.contains(&kids[1]));
-        assert!(!sel.render.contains(&1));
+        // …their parent renders BEHIND them, backfilling the pending
+        // siblings' footprints (no holes while they stream)…
+        assert!(sel.render.contains(&1));
         // …while the pending two remain queued.
         let queued: Vec<usize> = sel.loads.iter().map(|r| r.tile).collect();
         assert!(queued.contains(&kids[2]) && queued.contains(&kids[3]));
@@ -911,6 +927,38 @@ mod tests {
         let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 1.0, 0.0)));
         assert_eq!(sel.render, vec![1, 2]);
         assert!(sel.loads.is_empty());
+
+        // FAR camera: SSE alone would stop at the contentless root and paint
+        // a hole — empty tiles must refine through to their children (the
+        // grafted-subtree shape: the consumed tile keeps its volume but has
+        // nothing to draw).
+        let sel_far =
+            select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 0.0, 5000.0)));
+        assert_eq!(sel_far.render, vec![1, 2], "refines through the empty root");
+    }
+
+    /// A contentless interior whose children are ALL pending must report its
+    /// footprint uncovered, so the ancestor kick backfills it (pre-fix it
+    /// claimed coverage and left a hole while a grafted subtree streamed).
+    #[test]
+    fn pending_subtree_under_contentless_interior_kicks_to_ancestor() {
+        let mut tree = fixture_tree();
+        // Make child 1 contentless (a consumed/grafted interior).
+        tree.nodes[1].content_uri = None;
+        let mut content = all(TileContent::Ready, tree.len());
+        content[1] = TileContent::None;
+        for &leaf in tree.nodes[1].children.clone().iter() {
+            content[leaf] = TileContent::Pending;
+        }
+        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        // Child 1's subtree is unpainted → the ROOT kicks and renders itself.
+        assert_eq!(sel.render, vec![0], "root backfills the unpainted quadrant");
+        // The pending leaves stay queued.
+        let queued: Vec<usize> = sel.loads.iter().map(|r| r.tile).collect();
+        for &leaf in &tree.nodes[1].children {
+            assert!(queued.contains(&leaf), "leaf {leaf} queued");
+        }
     }
 
     #[test]
