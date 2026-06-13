@@ -166,6 +166,24 @@ pub struct Tiles3dTile {
     pub tile: usize,
 }
 
+/// Per-feature picking table on a tile mesh entity (T8). The tile mesh is
+/// already `TwinMeshGroup`-tagged with the tileset's anchor twin, so a click
+/// resolves to the whole tileset by default; this refines a *specific*
+/// triangle to the section twin that embodies it. `selection` reads it on a
+/// pick: triangle ordinal → `feature_of_triangle` → `node_of_feature` path →
+/// `sections::resolve_feature_twin(.., anchor_twin)` → the twin to select.
+#[derive(Component, Clone)]
+pub struct TileFeatureTable {
+    /// featureId per triangle (index-buffer order; the pick raycast's triangle
+    /// ordinal indexes straight in).
+    pub feature_of_triangle: Vec<u32>,
+    /// featureId → source-node path (shared across the tile's primitives).
+    pub node_of_feature: std::sync::Arc<Vec<String>>,
+    /// The tileset's owning twin — the anchor the node→twin resolution is
+    /// scoped to (and the fallback when no path segment matches a section).
+    pub anchor_twin: String,
+}
+
 /// Per-tile load slot.
 #[derive(Debug, Clone, Copy)]
 enum TileSlot {
@@ -928,6 +946,17 @@ fn spawn_tile_content(
     for item in items {
         let child = match item {
             DecodedItem::Mesh(prim) => {
+                // T8: refine click-selection to the picked feature when the
+                // tile carries per-feature ids AND it's anchored to a twin
+                // (world-layer tilesets have no twin to resolve to).
+                let feature_table = match (prim.features, set.twin_id.as_ref()) {
+                    (Some(f), Some(tid)) => Some(TileFeatureTable {
+                        feature_of_triangle: f.feature_of_triangle,
+                        node_of_feature: f.node_of_feature,
+                        anchor_twin: tid.clone(),
+                    }),
+                    _ => None,
+                };
                 let base = StandardMaterial {
                     base_color: Color::LinearRgba(LinearRgba::new(
                         prim.material.base_color[0],
@@ -950,14 +979,16 @@ fn spawn_tile_content(
                 // Dithered LOD cross-fade: starts fully dissolved (fade 0); the
                 // cut + `tick_tile_fade` ramp it in.
                 let material = TileMat { base, extension: TileDither { fade: 0.0 } };
-                commands
-                    .spawn((
-                        Mesh3d(meshes.add(prim.mesh)),
-                        MeshMaterial3d(materials.add(material)),
-                        Transform::from_matrix(prim.transform),
-                        ChildOf(tile_root),
-                    ))
-                    .id()
+                let mut child = commands.spawn((
+                    Mesh3d(meshes.add(prim.mesh)),
+                    MeshMaterial3d(materials.add(material)),
+                    Transform::from_matrix(prim.transform),
+                    ChildOf(tile_root),
+                ));
+                if let Some(ft) = feature_table {
+                    child.insert(ft);
+                }
+                child.id()
             }
             DecodedItem::Points { transform, points } => commands
                 .spawn((

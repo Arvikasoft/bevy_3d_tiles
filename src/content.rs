@@ -22,7 +22,8 @@
 //! error rather than fetched — a tile that needs side files defeats the
 //! one-blob range-read design.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{CompressedImageFormats, Image, ImageSampler, ImageType};
@@ -105,6 +106,18 @@ fn warn_ktx2_once(detail: &str) {
     });
 }
 
+/// Per-feature picking data for one mesh primitive (T8): `EXT_mesh_features`
+/// (`_FEATURE_ID_0`) + the tile's `EXT_structural_metadata` property table.
+pub struct TileFeatures {
+    /// featureId per triangle, in the spawned mesh's index-buffer order — so
+    /// the pick raycast's triangle ordinal indexes straight into it.
+    pub feature_of_triangle: Vec<u32>,
+    /// Shared per-tile table: featureId → source-node path (the `/`-joined node
+    /// names the sections resolver matches `mesh_section` against). `Arc` so
+    /// every primitive of one tile shares one decode.
+    pub node_of_feature: Arc<Vec<String>>,
+}
+
 /// One decoded glTF primitive, positioned by its node's global transform
 /// (glTF Y-up frame — the spawned tile entity applies
 /// [`super::traversal::TileNode::world_from_content`] above it).
@@ -112,6 +125,9 @@ pub struct DecodedPrimitive {
     pub transform: Mat4,
     pub mesh: Mesh,
     pub material: DecodedMaterial,
+    /// Feature metadata when the tile carries `EXT_mesh_features` (T8); `None`
+    /// for plain/scenery tiles. Drives feature → node → twin picking.
+    pub features: Option<TileFeatures>,
 }
 
 /// One decoded piece of tile content. A tile may carry several (multiple
@@ -331,12 +347,125 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
     let doc = gltf.document;
     let blob = gltf.blob;
 
+    // Feature metadata (T8): EXT_mesh_features + EXT_structural_metadata. The
+    // gltf crate models neither, so decode them from the raw JSON side-channel
+    // (like the splat/draco paths). Built once per tile; attached per primitive.
+    // By the time we reach here the GLB is vanilla (meshopt/basisu already
+    // preprocessed above), so the property-table + `_FEATURE_ID_0` accessors
+    // read plain bytes.
+    let feat = if memmem(json, b"EXT_mesh_features") {
+        match FeatureCtx::build(json, bin) {
+            Ok(ctx) => Some(ctx),
+            // A malformed table loses picking, never the geometry.
+            Err(e) => {
+                bevy::log::warn!("tiles3d: feature metadata ignored ({e})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut out = Vec::new();
     let Some(scene) = doc.default_scene().or_else(|| doc.scenes().next()) else {
         return Ok(out); // empty content tile — legal, renders nothing
     };
     for node in scene.nodes() {
-        decode_node(&node, Mat4::IDENTITY, blob.as_deref(), &mut out)?;
+        decode_node(&node, Mat4::IDENTITY, blob.as_deref(), feat.as_ref(), &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Decoded `EXT_mesh_features` + `EXT_structural_metadata` context for a tile
+/// (T8). Owns the parsed JSON so `_FEATURE_ID_0` accessors can be read lazily
+/// per primitive against the BIN chunk.
+struct FeatureCtx {
+    json: serde_json::Value,
+    /// featureId → source-node path, shared across the tile's primitives.
+    node_of_feature: Arc<Vec<String>>,
+    /// (mesh index, primitive index) → `_FEATURE_ID_N` accessor index.
+    accessor: HashMap<(u64, u64), usize>,
+}
+
+impl FeatureCtx {
+    fn build(json: &[u8], bin: Option<&[u8]>) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_slice(json).map_err(|e| format!("feature json: {e}"))?;
+        let node_of_feature = Arc::new(read_node_of_feature(&value, bin)?);
+        let mut accessor = HashMap::new();
+        if let Some(meshes) = value["meshes"].as_array() {
+            for (m, mesh) in meshes.iter().enumerate() {
+                let Some(prims) = mesh["primitives"].as_array() else { continue };
+                for (p, prim) in prims.iter().enumerate() {
+                    let ext = &prim["extensions"]["EXT_mesh_features"];
+                    // featureIds[0].attribute = N → the `_FEATURE_ID_N` attribute.
+                    let Some(n) = ext["featureIds"][0]["attribute"].as_u64() else { continue };
+                    let key = format!("_FEATURE_ID_{n}");
+                    if let Some(acc) = prim["attributes"][&key].as_u64() {
+                        accessor.insert((m as u64, p as u64), acc as usize);
+                    }
+                }
+            }
+        }
+        Ok(Self { json: value, node_of_feature, accessor })
+    }
+
+    /// `feature_of_triangle` for primitive `(mesh_ix, prim_ix)` in `indices`
+    /// order (matching the spawned mesh + pick raycast), or `None` when this
+    /// primitive carries no feature ids.
+    fn for_primitive(
+        &self,
+        bin: Option<&[u8]>,
+        mesh_ix: u64,
+        prim_ix: u64,
+        indices: Option<&[u32]>,
+        vertex_count: usize,
+    ) -> Result<Option<TileFeatures>, String> {
+        let Some(&acc) = self.accessor.get(&(mesh_ix, prim_ix)) else {
+            return Ok(None);
+        };
+        let per_vertex = read_accessor::<1>(&self.json, bin, acc)?;
+        let feature_of = |v: usize| per_vertex.get(v).map(|f| f[0].round() as u32).unwrap_or(0);
+        let feature_of_triangle = match indices {
+            Some(idx) => idx.chunks_exact(3).map(|t| feature_of(t[0] as usize)).collect(),
+            // Non-indexed: triangle t spans vertices 3t..3t+3.
+            None => (0..vertex_count / 3).map(|t| feature_of(t * 3)).collect(),
+        };
+        Ok(Some(TileFeatures {
+            feature_of_triangle,
+            node_of_feature: self.node_of_feature.clone(),
+        }))
+    }
+}
+
+/// Read the `nodePath` STRING property of `EXT_structural_metadata`'s first
+/// property table → `featureId → node path`. UINT32 string offsets (what our
+/// writer emits); other offset widths are unsupported (we control the writer).
+fn read_node_of_feature(json: &serde_json::Value, bin: Option<&[u8]>) -> Result<Vec<String>, String> {
+    let pt = &json["extensions"]["EXT_structural_metadata"]["propertyTables"][0];
+    let count = pt["count"].as_u64().ok_or("property table without count")? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let prop = &pt["properties"]["nodePath"];
+    let values_bv = prop["values"].as_u64().ok_or("nodePath property without values")? as usize;
+    let offsets_bv =
+        prop["stringOffsets"].as_u64().ok_or("nodePath property without stringOffsets")? as usize;
+    let values = buffer_view_slice(json, bin, values_bv)
+        .map_err(|e| format!("nodePath values: {e}"))?;
+    let offsets = buffer_view_slice(json, bin, offsets_bv)
+        .map_err(|e| format!("nodePath offsets: {e}"))?;
+    if offsets.len() < (count + 1) * 4 {
+        return Err("nodePath stringOffsets too short".into());
+    }
+    let read_u32 = |i: usize| u32::from_le_bytes(offsets[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let (lo, hi) = (read_u32(i), read_u32(i + 1));
+        let s = values
+            .get(lo..hi)
+            .ok_or("nodePath string range out of bounds")?;
+        out.push(String::from_utf8_lossy(s).into_owned());
     }
     Ok(out)
 }
@@ -765,15 +894,17 @@ fn decode_node(
     node: &gltf::Node<'_>,
     parent: Mat4,
     blob: Option<&[u8]>,
+    feat: Option<&FeatureCtx>,
     out: &mut Vec<DecodedItem>,
 ) -> Result<(), String> {
     let global = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(mesh) = node.mesh() {
+        let mesh_ix = mesh.index() as u64;
         for primitive in mesh.primitives() {
             match primitive.mode() {
                 gltf::mesh::Mode::Triangles => {
                     out.push(DecodedItem::Mesh(Box::new(decode_primitive(
-                        &primitive, global, blob,
+                        &primitive, global, blob, feat, mesh_ix,
                     )?)));
                 }
                 gltf::mesh::Mode::Points => {
@@ -786,7 +917,7 @@ fn decode_node(
         }
     }
     for child in node.children() {
-        decode_node(&child, global, blob, out)?;
+        decode_node(&child, global, blob, feat, out)?;
     }
     Ok(())
 }
@@ -795,6 +926,8 @@ fn decode_primitive(
     primitive: &gltf::Primitive<'_>,
     transform: Mat4,
     blob: Option<&[u8]>,
+    feat: Option<&FeatureCtx>,
+    mesh_ix: u64,
 ) -> Result<DecodedPrimitive, String> {
     let reader = primitive.reader(|buffer| resolve_buffer(&buffer, blob));
 
@@ -807,6 +940,19 @@ fn decode_primitive(
     let colors: Option<Vec<[f32; 4]>> =
         reader.read_colors(0).map(|c| c.into_rgba_f32().collect());
     let indices: Option<Vec<u32>> = reader.read_indices().map(|ix| ix.into_u32().collect());
+
+    // T8: per-feature picking — derive feature_of_triangle from `_FEATURE_ID_0`
+    // (raw JSON) in the SAME index order as the mesh below.
+    let features = match feat {
+        Some(ctx) => ctx.for_primitive(
+            blob,
+            mesh_ix,
+            primitive.index() as u64,
+            indices.as_deref(),
+            positions.len(),
+        )?,
+        None => None,
+    };
 
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -833,7 +979,7 @@ fn decode_primitive(
     }
 
     let material = decode_material(&primitive.material(), blob)?;
-    Ok(DecodedPrimitive { transform, mesh, material })
+    Ok(DecodedPrimitive { transform, mesh, material, features })
 }
 
 /// `POINTS`-mode primitive → point-renderer data. Positions stay in the glTF
@@ -1552,6 +1698,103 @@ mod tests {
         let got = as_sorted_tris(idx);
         let want = as_sorted_tris(&[0, 1, 2, 0, 2, 3, 2, 4, 5, 0, 4, 2]);
         assert_eq!(got, want, "same triangle set");
+    }
+
+    /// T8: a GLB with `EXT_mesh_features` (`_FEATURE_ID_0`, FLOAT) + a minimal
+    /// `EXT_structural_metadata` STRING property table (the exact shape our
+    /// tiler injects). Two triangles, two features; decode must produce a
+    /// per-triangle featureId array (index-buffer order) and the node-path
+    /// table — the inputs the pick → node → twin resolver consumes.
+    #[test]
+    fn decodes_feature_metadata() {
+        // 6 verts (2 tris). Tri 0 → feature 0, tri 1 → feature 1.
+        let positions: [[f32; 3]; 6] = [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0],
+        ];
+        let feature_ids: [f32; 6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let indices: [u32; 6] = [0, 1, 2, 3, 4, 5];
+        let strings: [&str; 2] = ["AlphaModule", "BetaModule/sub"];
+
+        let mut bin: Vec<u8> = Vec::new();
+        for p in positions.iter().flatten() {
+            bin.extend_from_slice(&p.to_le_bytes());
+        }
+        let feat_off = bin.len();
+        for f in feature_ids {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        let idx_off = bin.len();
+        for i in indices {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        // EXT_structural_metadata STRING column: values + UINT32 stringOffsets.
+        let values_off = bin.len();
+        let mut offsets = vec![0u32];
+        for s in strings {
+            bin.extend_from_slice(s.as_bytes());
+            offsets.push((bin.len() - values_off) as u32);
+        }
+        let values_len = bin.len() - values_off;
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+        let offsets_off = bin.len();
+        for o in &offsets {
+            bin.extend_from_slice(&o.to_le_bytes());
+        }
+
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "extensionsUsed": ["EXT_mesh_features", "EXT_structural_metadata"],
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{
+                "attributes": { "POSITION": 0, "_FEATURE_ID_0": 1 },
+                "indices": 2,
+                "mode": 4,
+                "extensions": { "EXT_mesh_features": {
+                    "featureIds": [{ "featureCount": 2, "attribute": 0, "propertyTable": 0 }]
+                }}
+            }]}],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 6, "type": "VEC3",
+                  "min": [0.0, 0.0, 0.0], "max": [3.0, 1.0, 0.0] },
+                { "bufferView": 1, "componentType": 5126, "count": 6, "type": "SCALAR" },
+                { "bufferView": 2, "componentType": 5125, "count": 6, "type": "SCALAR" }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": feat_off },
+                { "buffer": 0, "byteOffset": feat_off, "byteLength": idx_off - feat_off },
+                { "buffer": 0, "byteOffset": idx_off, "byteLength": values_off - idx_off },
+                { "buffer": 0, "byteOffset": values_off, "byteLength": values_len },
+                { "buffer": 0, "byteOffset": offsets_off, "byteLength": offsets.len() * 4 }
+            ],
+            "buffers": [{ "byteLength": bin.len() }],
+            "extensions": { "EXT_structural_metadata": {
+                "schema": { "id": "tt_features", "classes": { "feature": {
+                    "properties": { "nodePath": { "type": "STRING" } }
+                }}},
+                "propertyTables": [{
+                    "class": "feature", "count": 2,
+                    "properties": { "nodePath": { "values": 3, "stringOffsets": 4 } }
+                }]
+            }}
+        });
+        let glb = assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin);
+
+        let items = decode_glb(&glb).expect("decode features");
+        assert_eq!(items.len(), 1);
+        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
+        let feats = p.features.as_ref().expect("feature metadata decoded");
+        // featureId per triangle, in index-buffer order.
+        assert_eq!(feats.feature_of_triangle, vec![0, 1]);
+        // Property table → node paths (one carries a `/` path the resolver splits).
+        assert_eq!(
+            &**feats.node_of_feature,
+            &["AlphaModule".to_string(), "BetaModule/sub".to_string()]
+        );
     }
 
     /// T7: a GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,
