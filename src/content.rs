@@ -22,6 +22,8 @@
 //! error rather than fetched — a tile that needs side files defeats the
 //! one-blob range-read design.
 
+use std::sync::OnceLock;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{CompressedImageFormats, Image, ImageSampler, ImageType};
 use bevy::math::{DVec3, Mat4, Vec3};
@@ -31,6 +33,77 @@ use bevy_pointcloud::point_cloud::PointCloudData;
 
 use super::draco;
 use super::meshopt;
+
+/// Adapter-supported GPU-compressed texture formats (BC on desktop WebGPU,
+/// ASTC/ETC on mobile, NONE headless/native-before-init). Latched ONCE at
+/// startup ([`set_supported_compressed_formats`]) — the adapter never changes,
+/// and the MSAA lesson is latch-don't-toggle. Read by KTX2 transcode in
+/// [`decode_material`]: UASTC transcodes to a member format (BC7…) or, when the
+/// set is empty, to uncompressed RGBA8 — so KTX2 tiles render everywhere (T7).
+static SUPPORTED_FORMATS: OnceLock<CompressedImageFormats> = OnceLock::new();
+
+/// Latch the adapter's supported compressed formats — call once at startup from
+/// the `CompressedImageFormatSupport` resource. Idempotent.
+pub fn set_supported_compressed_formats(formats: CompressedImageFormats) {
+    let _ = SUPPORTED_FORMATS.set(formats);
+}
+
+fn supported_formats() -> CompressedImageFormats {
+    SUPPORTED_FORMATS.get().copied().unwrap_or(CompressedImageFormats::NONE)
+}
+
+/// Resolve deferred KTX2 base-color textures (T7): transcode each pending
+/// `image/ktx2` payload to a GPU `Image`. Async because the transcoder is a JS
+/// shim on wasm; on native it's bevy's basis transcoder. A failed transcode
+/// degrades cleanly to the base-color factor (untextured) — never fatal.
+async fn resolve_pending_textures(items: &mut [DecodedItem]) -> Result<(), String> {
+    for item in items.iter_mut() {
+        let DecodedItem::Mesh(p) = item else { continue };
+        let Some(bytes) = p.material.base_color_ktx2.take() else { continue };
+        match transcode_ktx2(&bytes).await {
+            Ok(img) => p.material.base_color_image = Some(img),
+            Err(e) => warn_ktx2_once(&e),
+        }
+    }
+    Ok(())
+}
+
+/// wasm: transcode via the `__tt_ktx2_transcode` shim (KTX-Software libktx),
+/// targeting BC7 when the adapter supports it, else RGBA8.
+#[cfg(target_arch = "wasm32")]
+async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, String> {
+    let want_bc = supported_formats().contains(CompressedImageFormats::BC);
+    super::ktx2::transcode(bytes, want_bc).await
+}
+
+/// native: bevy's `basis-universal` feature (C++; builds off-wasm). Every real
+/// native adapter has a block format (llvmpipe included); bevy 0.18's UASTC →
+/// uncompressed-RGBA path is broken, so require one rather than hit it.
+#[cfg(not(target_arch = "wasm32"))]
+async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, String> {
+    if supported_formats() == CompressedImageFormats::NONE {
+        return Err("no GPU block format for KTX2 transcode".into());
+    }
+    Image::from_buffer(
+        bytes,
+        ImageType::MimeType("image/ktx2"),
+        supported_formats(),
+        true, // base color is sRGB
+        ImageSampler::Default,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .map_err(|e| format!("ktx2 native decode: {e}"))
+}
+
+/// One-time warning when a KTX2 tile texture can't be transcoded; per-tile spam
+/// would bury it, and the geometry still renders (untextured).
+fn warn_ktx2_once(detail: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let detail = detail.to_string();
+    ONCE.call_once(move || {
+        bevy::log::warn!("tiles3d: KTX2 tile texture transcode failed ({detail}); rendering untextured");
+    });
+}
 
 /// One decoded glTF primitive, positioned by its node's global transform
 /// (glTF Y-up frame — the spawned tile entity applies
@@ -59,6 +132,11 @@ pub struct DecodedMaterial {
     /// Linear RGBA base color factor.
     pub base_color: [f32; 4],
     pub base_color_image: Option<Image>,
+    /// Raw `image/ktx2` (KHR_texture_basisu) base-color bytes awaiting transcode
+    /// in the async resolve pass (T7) — the transcoder is a JS shim on wasm /
+    /// bevy basis on native, neither callable from the sync decode. Mutually
+    /// exclusive with `base_color_image`.
+    pub base_color_ktx2: Option<Vec<u8>>,
     pub metallic: f32,
     pub roughness: f32,
     pub double_sided: bool,
@@ -72,6 +150,7 @@ impl Default for DecodedMaterial {
         Self {
             base_color: [1.0; 4],
             base_color_image: None,
+            base_color_ktx2: None,
             metallic: 0.0,
             roughness: 1.0,
             double_sided: false,
@@ -105,7 +184,9 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
     let has_draco = memmem(json, b"KHR_draco_mesh_compression");
     let has_rtc = memmem(json, b"CESIUM_RTC");
     if !(georeferenced || has_splat || has_draco || has_rtc || memmem(json, b"copyright")) {
-        return Ok(DecodedTile { items: decode_glb(bytes)?, rtc_center: None, copyright: None });
+        let mut items = decode_glb(bytes)?;
+        resolve_pending_textures(&mut items).await?;
+        return Ok(DecodedTile { items, rtc_center: None, copyright: None });
     }
 
     let mut value: serde_json::Value =
@@ -133,12 +214,13 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         nodes_rebased = true;
     }
 
-    let items = if has_draco || has_rtc || nodes_rebased {
+    let mut items = if has_draco || has_rtc || nodes_rebased {
         let vanilla = preprocess_glb(&mut value, bin).await?;
         decode_glb(&vanilla)?
     } else {
         decode_glb(bytes)?
     };
+    resolve_pending_textures(&mut items).await?;
     Ok(DecodedTile { items, rtc_center, copyright })
 }
 
@@ -219,6 +301,22 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
             serde_json::from_slice(json).map_err(|e| format!("meshopt tile json: {e}"))?;
         let vanilla = preprocess_meshopt(&mut value, bin)?;
         return decode_glb(&vanilla);
+    }
+
+    // KTX2/Basis textures (T7): the gltf crate (1.4) doesn't resolve
+    // KHR_texture_basisu — the KTX2 image hangs off the texture *extension*,
+    // not the standard `source`. Rewrite the source onto the standard slot and
+    // strip the ext (JSON-only; the KTX2 bytes stay put), then re-enter so the
+    // gltf path finds the image and `decode_material` hands the `image/ktx2`
+    // bytes to bevy's transcoder.
+    if memmem(json, b"KHR_texture_basisu") {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(json).map_err(|e| format!("basisu tile json: {e}"))?;
+        preprocess_basisu(&mut value);
+        let json_bytes =
+            serde_json::to_vec(&value).map_err(|e| format!("basisu splice json: {e}"))?;
+        let glb = assemble_glb(&json_bytes, bin.unwrap_or(&[]));
+        return decode_glb(&glb);
     }
 
     // Splat tiles bypass the gltf crate entirely (see module docs). The
@@ -622,6 +720,39 @@ fn preprocess_meshopt(
     Ok(assemble_glb(&json_bytes, &new_bin))
 }
 
+// ── KHR_texture_basisu preprocessing (T7 — KTX2 tile textures) ───────────────
+
+/// Rewrite `KHR_texture_basisu` textures so the `gltf` crate (which doesn't
+/// resolve the extension) finds the KTX2 image: move each texture's
+/// `extensions.KHR_texture_basisu.source` to the standard `source`, then strip
+/// the extension everywhere. JSON-only — the KTX2 image bytes (mimeType
+/// `image/ktx2`, in a buffer view) are untouched; [`decode_material`] passes
+/// them to bevy's KTX2/Basis transcoder with the adapter's supported formats.
+fn preprocess_basisu(json: &mut serde_json::Value) {
+    if let Some(textures) = json["textures"].as_array_mut() {
+        for tex in textures.iter_mut() {
+            let Some(src) = tex["extensions"]["KHR_texture_basisu"]["source"].as_u64() else {
+                continue;
+            };
+            tex["source"] = serde_json::json!(src);
+            if let Some(ext) = tex.get_mut("extensions").and_then(|e| e.as_object_mut()) {
+                ext.remove("KHR_texture_basisu");
+                if ext.is_empty() {
+                    tex.as_object_mut().unwrap().remove("extensions");
+                }
+            }
+        }
+    }
+    for list in ["extensionsUsed", "extensionsRequired"] {
+        if let Some(arr) = json.get_mut(list).and_then(|v| v.as_array_mut()) {
+            arr.retain(|v| v.as_str() != Some("KHR_texture_basisu"));
+            if arr.is_empty() {
+                json.as_object_mut().unwrap().remove(list);
+            }
+        }
+    }
+}
+
 /// Resolve a glTF buffer: GLB BIN chunk only (tiles are self-contained).
 fn resolve_buffer<'b>(buffer: &gltf::Buffer<'_>, blob: Option<&'b [u8]>) -> Option<&'b [u8]> {
     match buffer.source() {
@@ -743,6 +874,7 @@ fn decode_material(
         roughness: pbr.roughness_factor(),
         double_sided: material.double_sided(),
         base_color_image: None,
+        base_color_ktx2: None,
         unlit: material.unlit(),
     };
     if let Some(info) = pbr.base_color_texture() {
@@ -754,17 +886,24 @@ fn decode_material(
                 let bytes = buf
                     .get(view.offset()..view.offset() + view.length())
                     .ok_or("texture bufferView out of bounds")?;
-                let decoded = Image::from_buffer(
-                    bytes,
-                    ImageType::MimeType(mime_type),
-                    CompressedImageFormats::NONE,
-                    true, // base color is sRGB
-                    ImageSampler::Default,
-                    // GPU-only: tile textures are never read back on the CPU.
-                    RenderAssetUsages::RENDER_WORLD,
-                )
-                .map_err(|e| format!("texture decode ({mime_type}): {e}"))?;
-                out.base_color_image = Some(decoded);
+                if mime_type == "image/ktx2" {
+                    // T7: defer the UASTC transcode to the async resolve pass
+                    // (JS shim on wasm / bevy basis on native) — neither is
+                    // callable from this sync decode.
+                    out.base_color_ktx2 = Some(bytes.to_vec());
+                } else {
+                    let decoded = Image::from_buffer(
+                        bytes,
+                        ImageType::MimeType(mime_type),
+                        CompressedImageFormats::NONE, // png/jpeg: format irrelevant
+                        true,                         // base color is sRGB
+                        ImageSampler::Default,
+                        // GPU-only: tile textures are never read back on the CPU.
+                        RenderAssetUsages::RENDER_WORLD,
+                    )
+                    .map_err(|e| format!("texture decode ({mime_type}): {e}"))?;
+                    out.base_color_image = Some(decoded);
+                }
             }
             gltf::image::Source::Uri { .. } => {
                 return Err("external texture URIs unsupported in tile content".into());
@@ -1413,5 +1552,38 @@ mod tests {
         let got = as_sorted_tris(idx);
         let want = as_sorted_tris(&[0, 1, 2, 0, 2, 3, 2, 4, 5, 0, 4, 2]);
         assert_eq!(got, want, "same triangle set");
+    }
+
+    /// T7: a GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,
+    /// the writer's exact output) decodes through `preprocess_basisu` + the gltf
+    /// path + the async texture-resolve pass. The `gltf` crate can't resolve the
+    /// extension and the transcoder isn't callable from the sync decode, so this
+    /// proves the source rewrite + deferred transcode work end-to-end. On native
+    /// (this test) the resolve uses bevy's `basis-universal`; we latch `BC` (as a
+    /// desktop adapter would) so UASTC → BC7 on the CPU. GLB captured from
+    /// `@gltf-transform` + `ktx create --encode uastc` (BEVY-3D-TILES T7).
+    #[test]
+    fn decodes_basisu_ktx2_base_color() {
+        use base64::Engine;
+        use bevy::tasks::block_on;
+
+        // Pretend the adapter supports BC (desktop WebGPU). OnceLock first-wins;
+        // no other test latches it, and it only affects KTX2 decode.
+        set_supported_compressed_formats(CompressedImageFormats::BC);
+
+        const GLB_B64: &str = "Z2xURgIAAACUBQAAMAQAAEpTT057ImFzc2V0Ijp7ImdlbmVyYXRvciI6ImdsVEYtVHJhbnNmb3JtIHY0LjMuMCIsInZlcnNpb24iOiIyLjAifSwiYWNjZXNzb3JzIjpbeyJ0eXBlIjoiVkVDMyIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJtYXgiOlsxLDEsMF0sIm1pbiI6WzAsMCwwXSwiYnVmZmVyVmlldyI6MSwiYnl0ZU9mZnNldCI6MH0seyJ0eXBlIjoiVkVDMiIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJidWZmZXJWaWV3IjoxLCJieXRlT2Zmc2V0IjoxMn0seyJ0eXBlIjoiU0NBTEFSIiwiY29tcG9uZW50VHlwZSI6NTEyNSwiY291bnQiOjMsImJ1ZmZlclZpZXciOjIsImJ5dGVPZmZzZXQiOjB9XSwiYnVmZmVyVmlld3MiOlt7ImJ1ZmZlciI6MCwiYnl0ZU9mZnNldCI6NzIsImJ5dGVMZW5ndGgiOjI1NH0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjYwLCJieXRlU3RyaWRlIjoyMCwidGFyZ2V0IjozNDk2Mn0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjYwLCJieXRlTGVuZ3RoIjoxMiwidGFyZ2V0IjozNDk2M31dLCJzYW1wbGVycyI6W3sid3JhcFMiOjEwNDk3LCJ3cmFwVCI6MTA0OTd9XSwidGV4dHVyZXMiOlt7InNhbXBsZXIiOjAsImV4dGVuc2lvbnMiOnsiS0hSX3RleHR1cmVfYmFzaXN1Ijp7InNvdXJjZSI6MH19fV0sImltYWdlcyI6W3sibmFtZSI6ImJhc2UiLCJtaW1lVHlwZSI6ImltYWdlL2t0eDIiLCJidWZmZXJWaWV3IjowfV0sImJ1ZmZlcnMiOlt7ImJ5dGVMZW5ndGgiOjMyOH1dLCJtYXRlcmlhbHMiOlt7Im5hbWUiOiJtIiwicGJyTWV0YWxsaWNSb3VnaG5lc3MiOnsiYmFzZUNvbG9yVGV4dHVyZSI6eyJpbmRleCI6MH19fV0sIm1lc2hlcyI6W3sicHJpbWl0aXZlcyI6W3siYXR0cmlidXRlcyI6eyJQT1NJVElPTiI6MCwiVEVYQ09PUkRfMCI6MX0sIm1vZGUiOjQsIm1hdGVyaWFsIjowLCJpbmRpY2VzIjoyfV19XSwibm9kZXMiOlt7Im1lc2giOjB9XSwic2NlbmVzIjpbeyJub2RlcyI6WzBdfV0sImV4dGVuc2lvbnNVc2VkIjpbIktIUl90ZXh0dXJlX2Jhc2lzdSJdLCJleHRlbnNpb25zUmVxdWlyZWQiOlsiS0hSX3RleHR1cmVfYmFzaXN1Il19SAEAAEJJTgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAQAAAAIAAACrS1RYIDIwuw0KGgoAAAAAAQAAAAgAAAAIAAAAAAAAAAAAAAABAAAAAQAAAAIAAABoAAAALAAAAJQAAABQAAAAAAAAAAAAAAAAAAAAAAAAAOQAAAAAAAAAGgAAAAAAAABAAAAAAAAAACwAAAAAAAAAAgAoAKYBAgADAwAAEAAAAAAAAAAAAH8AAAAAAAAAAAD/////LAAAAEtUWHdyaXRlcgBrdHggY3JlYXRlIHY0LjQuMiAvIGxpYmt0eCB2NC40LjIAHAAAAEtUWHdyaXRlclNjUGFyYW1zAC0tenN0ZCAxOAAotS/9IECNAABIVwGZ5/87vgEAAgDNjCADRwAA";
+        let glb = base64::engine::general_purpose::STANDARD.decode(GLB_B64).unwrap();
+
+        let tile = block_on(decode_tile(&glb, false)).expect("ktx2 decode");
+        assert_eq!(tile.items.len(), 1);
+        let DecodedItem::Mesh(p) = &tile.items[0] else { panic!("expected mesh") };
+        // Resolved to a real image; the pending KTX2 bytes were consumed.
+        assert!(p.material.base_color_ktx2.is_none(), "pending KTX2 must be taken");
+        let img = p
+            .material
+            .base_color_image
+            .as_ref()
+            .expect("KTX2 base color transcoded");
+        assert_eq!((img.width(), img.height()), (8, 8), "8x8 source dimensions kept");
     }
 }

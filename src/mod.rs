@@ -45,6 +45,9 @@ pub mod content;
 pub mod draco;
 pub mod fetch;
 pub mod geo;
+// wasm-only KTX2 transcode shim binding (T7); native uses bevy basis-universal.
+#[cfg(target_arch = "wasm32")]
+pub mod ktx2;
 pub mod meshopt;
 pub mod schema;
 pub mod traversal;
@@ -365,7 +368,7 @@ impl Plugin for Tiles3dPlugin {
             .init_resource::<TilesetCredits>()
             .add_message::<Tiles3dAttach>()
             .add_message::<Tiles3dDetach>()
-            .add_systems(Startup, init_dev_tileset)
+            .add_systems(Startup, (latch_compressed_formats, init_dev_tileset))
             .add_systems(
                 Update,
                 (
@@ -376,6 +379,17 @@ impl Plugin for Tiles3dPlugin {
                 )
                     .chain(),
             );
+    }
+}
+
+/// Latch the adapter's supported GPU-compressed texture formats for KTX2 tile
+/// decode (T7). `CompressedImageFormatSupport` is inserted into the main world
+/// by `RenderPlugin::finish` from the render device; absent on a headless build,
+/// where KTX2/UASTC transcodes to RGBA8 instead. One-shot — the OnceLock ignores
+/// later sets (the latch-don't-toggle discipline from the MSAA work).
+fn latch_compressed_formats(support: Option<Res<bevy::image::CompressedImageFormatSupport>>) {
+    if let Some(support) = support {
+        content::set_supported_compressed_formats(support.0);
     }
 }
 
