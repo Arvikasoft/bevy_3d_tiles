@@ -69,6 +69,11 @@ const FIXTURE_SPEC: &str = "assets/fixtures/tiles3d-demo/tileset.json";
 pub struct Tiles3dConfig {
     /// Refine while a tile's screen-space error exceeds this (px).
     pub sse_threshold_px: f64,
+    /// Distance-relaxed detail falloff (metres) — see
+    /// [`SelectParams::detail_falloff_m`]. Caps how far the cut refines toward
+    /// the horizon so a grazing view doesn't graft+stream the whole visible
+    /// hemisphere (the P3DT "tilt → 98 k-tile tree" finding). `0` disables.
+    pub detail_falloff_m: f64,
     /// Max tile fetch+decode tasks in flight per tileset. Basemap's proven
     /// starting point; retune against CesiumJS's 50/18 once Front Door
     /// HTTP/2 carries tile traffic (D10).
@@ -88,6 +93,10 @@ impl Default for Tiles3dConfig {
     fn default() -> Self {
         Self {
             sse_threshold_px: traversal::DEFAULT_SSE_THRESHOLD_PX,
+            // ~2 km: near terrain stays sharp, the horizon coarsens. Tuned
+            // against the live autzen P3DT view (cam ~10–20 m up); raise for
+            // high-altitude orbits, lower if the tree still grows too far out.
+            detail_falloff_m: 2000.0,
             max_concurrent_loads: 16,
             max_spawns_per_frame: 4,
             grace_frames: 600,
@@ -1035,6 +1044,7 @@ fn drive_tiles3d(
             cam_forward,
             k_px,
             sse_threshold_px: config.sse_threshold_px,
+            detail_falloff_m: config.detail_falloff_m,
         };
 
         // Content readiness as the traversal sees it.
@@ -1070,38 +1080,6 @@ fn drive_tiles3d(
         };
 
         let sel = traversal::select(tree, &tiles_content, &set.history, &culled, params);
-
-        // TEMP DIAG (tilt-vanish hunt) — remove once root-caused. Every 10
-        // frames: camera pitch (deg above horizon), how many tree nodes the
-        // frustum culled, how many tiles the pass chose to RENDER, and how many
-        // of those are actually Ready (spawned). If `render` stays high while
-        // the screen blanks → render/Bevy-culling side; if `render` collapses
-        // → selection/cull side.
-        {
-            let culled_n = (0..tree.len()).filter(|&i| culled(i)).count();
-            let ready_in_cut = sel
-                .render
-                .iter()
-                .filter(|&&t| matches!(set.slots[t], TileSlot::Ready { .. }))
-                .count();
-            let pitch_deg = cam_forward_world.y.clamp(-1.0, 1.0).asin().to_degrees();
-            if *frame % 10 == 0 {
-                info!(
-                    "tiles3d DIAG {}: pitch={:+.1}° render={} ready_in_cut={} \
-                     culled={}/{} cam_y={:.0} fwd=({:.2},{:.2},{:.2})",
-                    set.label,
-                    pitch_deg,
-                    sel.render.len(),
-                    ready_in_cut,
-                    culled_n,
-                    tree.len(),
-                    cam_pos_world.y,
-                    cam_forward_world.x,
-                    cam_forward_world.y,
-                    cam_forward_world.z,
-                );
-            }
-        }
 
         // Eviction clock: everything the pass wanted stays fresh.
         for (i, &touched) in sel.touched.iter().enumerate() {

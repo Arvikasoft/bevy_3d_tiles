@@ -10,7 +10,10 @@
 //!    the whole-file decision-5 degeneracy: the camera is inside the *root*
 //!    but outside most *leaves*.
 //! 3. `sse > threshold` → refine into the tileset's children; else render
-//!    this tile. Leaves always render.
+//!    this tile. Leaves always render. The threshold is **distance-relaxed**
+//!    (`threshold × (1 + dist/detail_falloff_m)`): far terrain stops
+//!    subdividing so a grazing horizon view doesn't pull the whole visible
+//!    hemisphere to full LOD (and graft+stream thousands of far subtrees).
 //! 4. **Zoom-out protection**: a tile that refined last frame but isn't
 //!    renderable yet keeps refining — its descendants stay visible until the
 //!    coarser tile loads.
@@ -332,6 +335,14 @@ pub struct SelectParams {
     pub k_px: f64,
     /// Refine while `sse > threshold` (px).
     pub sse_threshold_px: f64,
+    /// Distance-relaxed detail falloff (metres). The effective refine
+    /// threshold grows with the tile's distance from the camera —
+    /// `threshold × (1 + dist / detail_falloff_m)` — so terrain toward the
+    /// horizon stops subdividing instead of pulling the whole visible
+    /// hemisphere to full LOD (the live P3DT "tilt → 98 k-tile tree" finding).
+    /// `dist ≪ falloff` ⇒ normal threshold; `dist ≫ falloff` ⇒ coarse. `0`
+    /// disables (constant threshold = pre-falloff behaviour).
+    pub detail_falloff_m: f64,
 }
 
 /// Screen-space error of a tile with geometric error `ge` at `dist` metres.
@@ -531,11 +542,27 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     let dist = node.volume.distance_to(ctx.params.cam_pos);
     let sse = screen_space_error(node.geometric_error, dist, ctx.params.k_px);
 
+    // Distance-relaxed refine threshold: detail falls off with distance so a
+    // grazing horizon view doesn't refine the whole visible hemisphere to full
+    // LOD (and then graft+stream thousands of far subtrees it can't keep up
+    // with). Near tiles (`dist ≪ falloff`) keep the base threshold; far tiles
+    // need a proportionally larger error to subdivide, so the cut — and the
+    // descent that triggers grafting — stays bounded to roughly the near view.
+    // A camera *inside* the volume still has `dist == 0` ⇒ infinite SSE ⇒
+    // refine, so detail directly under the camera is unaffected.
+    let threshold = if ctx.params.detail_falloff_m > 0.0 {
+        ctx.params.sse_threshold_px * (1.0 + dist / ctx.params.detail_falloff_m)
+    } else {
+        ctx.params.sse_threshold_px
+    };
+
     // Contentless tiles with children ALWAYS refine — there is nothing to
     // render at this level (structural interiors, and tiles whose external
     // tileset was grafted away), so stopping per SSE would paint a hole.
-    let mut wants_refine = !node.children.is_empty()
-        && (sse > ctx.params.sse_threshold_px || node.content_uri.is_none());
+    // (Distance falloff can't stop here, but the content-bearing parent that
+    // led here was already distance-gated, so far interiors are never reached.)
+    let mut wants_refine =
+        !node.children.is_empty() && (sse > threshold || node.content_uri.is_none());
     // Zoom-out protection (§7.4): this tile became the desired cut but its
     // content isn't here yet — keep refining (descendants stay visible) while
     // the coarser content loads.
@@ -641,6 +668,9 @@ mod tests {
             cam_forward: (DVec3::ZERO - cam).normalize_or(DVec3::NEG_Z),
             k_px: k_1080(),
             sse_threshold_px: DEFAULT_SSE_THRESHOLD_PX,
+            // Disabled in most tests so the SSE assertions stay exact; the
+            // falloff has its own dedicated test below.
+            detail_falloff_m: 0.0,
         }
     }
 
@@ -718,6 +748,27 @@ mod tests {
         assert!((sse - 16.0 * k / 1000.0).abs() < 1e-9);
         assert_eq!(screen_space_error(16.0, 0.0, k), f64::INFINITY);
         assert_eq!(screen_space_error(0.0, 100.0, k), 0.0);
+    }
+
+    #[test]
+    fn distance_falloff_stops_far_refinement() {
+        let tree = fixture_tree();
+        let content = all(TileContent::Ready, tree.len());
+        let history =
+            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        // ~970 m out: root SSE ≈ 21 px > the 16 px base threshold.
+        let cam = DVec3::new(0.0, 0.0, 1000.0);
+
+        // No falloff → the root refines into its children (pre-fix behaviour).
+        let near = select(&tree, &content, &history, &no_cull, params(cam));
+        assert_eq!(near.render, vec![1, 2, 3, 4], "without falloff the root refines");
+
+        // 500 m falloff → the root's threshold relaxes to ≈47 px (> its 21 px
+        // SSE), so it renders coarse and its far subtree is never descended —
+        // no graft/stream storm toward the horizon.
+        let relaxed = SelectParams { detail_falloff_m: 500.0, ..params(cam) };
+        let far = select(&tree, &content, &history, &no_cull, relaxed);
+        assert_eq!(far.render, vec![0], "falloff keeps the distant tile coarse");
     }
 
     #[test]
