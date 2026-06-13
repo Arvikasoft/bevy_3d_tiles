@@ -475,6 +475,14 @@ fn is_archive_spec(spec: &str) -> bool {
     spec.split(['?', '#']).next().unwrap_or(spec).ends_with(".3tz")
 }
 
+/// Directory prefix (with trailing `/`) of a tileset-relative URI, for
+/// rebasing an external tileset's content URIs onto its own location.
+/// `None` when the URI has no directory part (root-level subtree).
+fn uri_dir_prefix(uri: &str) -> Option<String> {
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    path.rsplit_once('/').map(|(dir, _)| format!("{dir}/"))
+}
+
 /// Walk a parsed tileset for the first content URI carrying a `session`
 /// query param and adopt it into the live session (the P3DT protocol: the
 /// root response embeds the token in its child URIs; every subsequent
@@ -677,8 +685,26 @@ fn receive_tiles3d(
                         if let TilesetSource::Live(live) = &set.source {
                             adopt_session(live, &external);
                         }
+                        let consumed_uri = set.tree.nodes[tile].content_uri.clone();
                         match set.tree.graft(tile, &external, set.tree_frame()) {
-                            Ok(_) => {
+                            Ok(new_root) => {
+                                // Per spec, an external tileset's relative
+                                // content URIs resolve against ITS location,
+                                // not the host root — rebase them onto the
+                                // subtree's directory. (P3DT URIs are
+                                // absolute paths; untouched.)
+                                if let Some(prefix) =
+                                    consumed_uri.as_deref().and_then(uri_dir_prefix)
+                                {
+                                    for node in &mut set.tree.nodes[new_root..] {
+                                        if let Some(u) = &node.content_uri
+                                            && !u.starts_with('/')
+                                            && !u.contains("://")
+                                        {
+                                            node.content_uri = Some(format!("{prefix}{u}"));
+                                        }
+                                    }
+                                }
                                 // The graft consumed the content: the tile is
                                 // a plain interior node now; its subtree's
                                 // slots ride the same per-tile arrays.
@@ -1278,6 +1304,19 @@ mod tests {
         assert!(is_archive_spec("https://x/a/demo.3tz#frag"));
         assert!(!is_archive_spec("assets/fixtures/tiles3d-demo/tileset.json"));
         assert!(!is_archive_spec("https://x/a/tileset.json?sas=1"));
+    }
+
+    #[test]
+    fn uri_dir_prefix_for_subtree_rebasing() {
+        assert_eq!(uri_dir_prefix("sub/tileset.json"), Some("sub/".to_string()));
+        assert_eq!(uri_dir_prefix("a/b/c.json?session=x"), Some("a/b/".to_string()));
+        assert_eq!(uri_dir_prefix("tileset.json"), None);
+        // Absolute-path subtrees (P3DT) yield their directory; the rebase
+        // loop skips absolute CONTENT uris anyway.
+        assert_eq!(
+            uri_dir_prefix("/v1/3dtiles/datasets/x/files/a.json"),
+            Some("/v1/3dtiles/datasets/x/files/".to_string())
+        );
     }
 
     /// The committed fixture round-trips through the full native stack:

@@ -646,7 +646,7 @@ mod tests {
             content_uri: Some("root.glb".into()),
             volume: sphere(DVec3::ZERO, 30.0),
             world_from_content: DMat4::IDENTITY,
-                world_from_tile: DMat4::IDENTITY,
+            world_from_tile: DMat4::IDENTITY,
         });
         let quad = [(-10.0, -10.0), (10.0, -10.0), (-10.0, 10.0), (10.0, 10.0)];
         for (cx, cz) in quad {
@@ -677,7 +677,7 @@ mod tests {
                     content_uri: Some(format!("l{l}.glb")),
                     volume: sphere(DVec3::new(cx + lx * 0.25, 0.0, cz + lz * 0.25), 4.0),
                     world_from_content: DMat4::IDENTITY,
-                world_from_tile: DMat4::IDENTITY,
+                    world_from_tile: DMat4::IDENTITY,
                 });
                 let cc = tree.nodes[c].children.clone();
                 tree.nodes[c].children = [cc, vec![l]].concat();
@@ -890,7 +890,7 @@ mod tests {
             content_uri: None,
             volume: sphere(DVec3::ZERO, 10.0),
             world_from_content: DMat4::IDENTITY,
-                world_from_tile: DMat4::IDENTITY,
+            world_from_tile: DMat4::IDENTITY,
         });
         for i in 0..2 {
             tree.nodes.push(TileNode {
