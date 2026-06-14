@@ -719,9 +719,23 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     }
     // 3. Nothing finer shown AND nothing to swap to (contentless/pending):
     //    drop the partial selections and report uncovered so the nearest READY
-    //    ancestor paints the whole footprint coarse-first.
+    //    ancestor paints the whole footprint coarse-first. Load the fallback
+    //    URGENTLY: this is a genuine HOLE (no Ready ancestor covers here yet),
+    //    and the worst case is right under the camera, where the nadir refines
+    //    hardest and its fine children stream slowest. At Normal priority the
+    //    coarse backdrop queued behind all that fine detail and the gap
+    //    persisted; Urgent makes the coarse backdrop win the race, so the view
+    //    fills coarse-first and refines on top instead of holing. Every tile on
+    //    the uncovered ancestor path lands here, so the SHALLOWEST loadable one
+    //    (the quickest, smallest coarse tile) paints the footprint first.
     sel.render.truncate(checkpoint);
-    push_load(ctx, sel, i, dist);
+    if ctx.content[i].loadable() {
+        sel.loads.push(LoadRequest {
+            tile: i,
+            priority: Priority::Urgent,
+            key: load_key(ctx, i, dist),
+        });
+    }
     VisitOut { covered: false, any_rendered_last: false }
 }
 
