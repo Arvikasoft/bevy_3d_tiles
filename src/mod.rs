@@ -53,14 +53,16 @@ pub mod schema;
 pub mod traversal;
 
 use archive::Archive3tz;
-use content::{DecodedItem, DecodedTile};
+use content::{DecodedItem, DecodedPrimitive, DecodedTile};
 use fetch::{BudgetCounter, ByteSource, ExplodedBase, LiveSession, TilesetSource};
 use traversal::{History, SelectParams, TileContent, TileTree, TreeFrame, ZUP_TO_BEVY};
 
 use turbotwin_sdk_rs::enu::WGS84_EQUATORIAL_RADIUS_M;
 
+use crate::plugins::relationships::RelationshipIndex;
 use crate::plugins::scene_layout::TwinMeshGroup;
-use crate::plugins::spatial_source::{ProjectOrigin, ProjectOriginInner};
+use crate::plugins::sections::{resolve_in_section_map, section_map_for_anchor};
+use crate::plugins::spatial_source::{MetadataIndex, ProjectOrigin, ProjectOriginInner};
 
 /// The Google Photorealistic 3D Tiles root tileset (D7). The org's API key
 /// is appended per request, never stored in the row.
@@ -116,10 +118,12 @@ impl Default for Tiles3dConfig {
             // against the live autzen P3DT view (cam ~10–20 m up); raise for
             // high-altitude orbits, lower if the tree still grows too far out.
             detail_falloff_m: 2000.0,
-            // 32 (up from 16): the startup descent walks a ~20-deep chain of
-            // nested tileset.json grafts to reach street-level detail; more
-            // parallel slots resolve the breadth of that descent faster.
-            max_concurrent_loads: 32,
+            // 16 (the basemap baseline): on wasm every tile decode runs on the
+            // single main thread, so a full-LOD wave of large leaves at 32-wide
+            // floods it and stutters. 16 halves that burst while still resolving
+            // P3DT's ~20-deep tileset.json graft chain with ample breadth. The
+            // real fix for the decode hitch is a worker pool (off-main-thread).
+            max_concurrent_loads: 16,
             max_spawns_per_frame: 4,
             grace_frames: 600,
             max_resident_tiles: 1024,
@@ -185,12 +189,14 @@ pub struct Tiles3dTile {
     pub tile: usize,
 }
 
-/// Per-feature picking table on a tile mesh entity (T8). The tile mesh is
-/// already `TwinMeshGroup`-tagged with the tileset's anchor twin, so a click
-/// resolves to the whole tileset by default; this refines a *specific*
-/// triangle to the section twin that embodies it. `selection` reads it on a
-/// pick: triangle ordinal → `feature_of_triangle` → `node_of_feature` path →
-/// `sections::resolve_feature_twin(.., anchor_twin)` → the twin to select.
+/// Per-feature picking table — the original T8 slice-C mechanism (click only).
+///
+/// SUPERSEDED and no longer attached: `spawn_tile_content` now splits each
+/// feature tile into per-section-twin submeshes, each `TwinMeshGroup`-tagged
+/// with its resolved twin, so click + hover + outline all work through the
+/// existing whole-file machinery. The component + the `selection` override that
+/// reads it are dead (harmless — the override falls through to the submesh's
+/// `TwinMeshGroup`) and can be removed in a cleanup pass.
 #[derive(Component, Clone)]
 pub struct TileFeatureTable {
     /// featureId per triangle (index-buffer order; the pick raycast's triangle
@@ -681,6 +687,10 @@ fn receive_tiles3d(
     mut clouds: ResMut<Assets<bevy_pointcloud::point_cloud::PointCloud>>,
     mut splats: ResMut<Assets<bevy_gaussian_splatting::PlanarGaussian3d>>,
     shared_point_material: Res<crate::plugins::point_cloud::SharedPointMaterial>,
+    // T8 highlight: resolve each tile feature to its section twin at spawn so
+    // per-feature submeshes carry the right TwinMeshGroup (click/hover/outline).
+    metadata: Res<MetadataIndex>,
+    relationships: Res<RelationshipIndex>,
     mut commands: Commands,
 ) {
     let mut spawned = 0usize;
@@ -884,6 +894,8 @@ fn receive_tiles3d(
                             &mut clouds,
                             &mut splats,
                             &shared_point_material,
+                            &metadata,
+                            &relationships,
                             set,
                             tile,
                             transform,
@@ -981,6 +993,8 @@ fn spawn_tile_content(
     clouds: &mut Assets<bevy_pointcloud::point_cloud::PointCloud>,
     splats: &mut Assets<bevy_gaussian_splatting::PlanarGaussian3d>,
     shared_point_material: &crate::plugins::point_cloud::SharedPointMaterial,
+    metadata: &MetadataIndex,
+    relationships: &RelationshipIndex,
     set: &ActiveTileset,
     tile: usize,
     transform: Transform,
@@ -997,82 +1011,188 @@ fn spawn_tile_content(
             Name::new(format!("Tiles3dTile({} #{tile})", set.label)),
         ))
         .id();
-    let group = set.twin_id.as_ref().map(|tid| TwinMeshGroup { twin_id: tid.clone() });
+    let anchor = set.twin_id.as_deref();
+    let anchor_group = anchor.map(|tid| TwinMeshGroup { twin_id: tid.to_string() });
+    // T8 highlight: build the section node-name → twin map ONCE for this tile
+    // (reused across every feature of every primitive) so split submeshes carry
+    // the right TwinMeshGroup — the existing click/hover/outline machinery then
+    // treats each section's geometry as that twin, exactly like the whole-file
+    // sections path.
+    let section_map = anchor.map(|a| section_map_for_anchor(a, metadata, relationships));
+
     for item in items {
-        let child = match item {
+        match item {
             DecodedItem::Mesh(prim) => {
-                // T8: refine click-selection to the picked feature when the
-                // tile carries per-feature ids AND it's anchored to a twin
-                // (world-layer tilesets have no twin to resolve to).
-                let feature_table = match (prim.features, set.twin_id.as_ref()) {
-                    (Some(f), Some(tid)) => Some(TileFeatureTable {
-                        feature_of_triangle: f.feature_of_triangle,
-                        node_of_feature: f.node_of_feature,
-                        anchor_twin: tid.clone(),
-                    }),
-                    _ => None,
-                };
-                // Plain OPAQUE StandardMaterial: no `discard`, no alpha blend, so
-                // the GPU keeps early-Z depth testing — dense, overlapping P3DT
-                // photogrammetry would otherwise pay full overdraw on every
-                // occluded fragment. (The dithered LOD cross-fade prototype that
-                // lived here forced late-Z for the whole pipeline and tanked the
-                // frame rate; reverted — LODs pop, but the view runs.)
-                let material = StandardMaterial {
+                let DecodedPrimitive { transform: ptf, mesh, material, features } = *prim;
+                let prim_transform = Transform::from_matrix(ptf);
+                // One OPAQUE StandardMaterial per primitive, SHARED by all of its
+                // feature submeshes (no per-submesh texture duplication). Opaque:
+                // no discard/alpha so the GPU keeps early-Z (dense P3DT overdraw).
+                let standard = StandardMaterial {
                     base_color: Color::LinearRgba(LinearRgba::new(
-                        prim.material.base_color[0],
-                        prim.material.base_color[1],
-                        prim.material.base_color[2],
-                        prim.material.base_color[3],
+                        material.base_color[0],
+                        material.base_color[1],
+                        material.base_color[2],
+                        material.base_color[3],
                     )),
-                    base_color_texture: prim.material.base_color_image.map(|img| images.add(img)),
-                    metallic: prim.material.metallic,
-                    perceptual_roughness: prim.material.roughness,
-                    // Photogrammetry (P3DT) ships baked lighting.
-                    unlit: prim.material.unlit,
-                    cull_mode: if prim.material.double_sided {
+                    base_color_texture: material.base_color_image.map(|img| images.add(img)),
+                    metallic: material.metallic,
+                    perceptual_roughness: material.roughness,
+                    unlit: material.unlit,
+                    cull_mode: if material.double_sided {
                         None
                     } else {
                         Some(bevy::render::render_resource::Face::Back)
                     },
                     ..default()
                 };
-                let mut child = commands.spawn((
-                    Mesh3d(meshes.add(prim.mesh)),
-                    MeshMaterial3d(materials.add(material)),
-                    Transform::from_matrix(prim.transform),
-                    ChildOf(tile_root),
-                ));
-                if let Some(ft) = feature_table {
-                    child.insert(ft);
+                let mat_handle = materials.add(standard);
+
+                match (features, &section_map) {
+                    // Feature tile under a twin: split into per-section-twin
+                    // submeshes so highlight/hover/select resolve per module.
+                    (Some(f), Some(map)) => {
+                        let twin_of_feature: Vec<String> = f
+                            .node_of_feature
+                            .iter()
+                            .map(|path| resolve_in_section_map(path, anchor.unwrap_or(""), map))
+                            .collect();
+                        let fallback = anchor.unwrap_or("");
+                        let mut tris_by_twin: std::collections::HashMap<String, Vec<usize>> =
+                            std::collections::HashMap::new();
+                        for (tri, &fid) in f.feature_of_triangle.iter().enumerate() {
+                            // Out-of-range id (malformed tile) falls back to the
+                            // anchor rather than dropping the triangle (a hole).
+                            let twin = twin_of_feature.get(fid as usize).map(String::as_str).unwrap_or(fallback);
+                            tris_by_twin.entry(twin.to_string()).or_default().push(tri);
+                        }
+                        for (twin, tris) in tris_by_twin {
+                            commands.spawn((
+                                Mesh3d(meshes.add(build_submesh(&mesh, &tris))),
+                                MeshMaterial3d(mat_handle.clone()),
+                                prim_transform,
+                                ChildOf(tile_root),
+                                TwinMeshGroup { twin_id: twin },
+                            ));
+                        }
+                    }
+                    // Plain/scenery/world-layer tile: one mesh, anchor-tagged.
+                    _ => {
+                        let mut e = commands.spawn((
+                            Mesh3d(meshes.add(mesh)),
+                            MeshMaterial3d(mat_handle),
+                            prim_transform,
+                            ChildOf(tile_root),
+                        ));
+                        if let Some(group) = &anchor_group {
+                            e.insert(group.clone());
+                        }
+                    }
                 }
-                child.id()
             }
-            DecodedItem::Points { transform, points } => commands
-                .spawn((
-                    crate::plugins::point_cloud::cloud_components(
-                        clouds.add(bevy_pointcloud::point_cloud::PointCloud { points }),
-                        shared_point_material,
-                    ),
-                    Transform::from_matrix(transform),
-                    ChildOf(tile_root),
-                ))
-                .id(),
-            DecodedItem::Splat { transform, gaussians } => commands
-                .spawn((
-                    crate::plugins::splat::splat_components(splats.add(
-                        bevy_gaussian_splatting::PlanarGaussian3d::from(gaussians),
-                    )),
-                    Transform::from_matrix(transform),
-                    ChildOf(tile_root),
-                ))
-                .id(),
-        };
-        if let Some(group) = &group {
-            commands.entity(child).insert(group.clone());
+            DecodedItem::Points { transform, points } => {
+                let child = commands
+                    .spawn((
+                        crate::plugins::point_cloud::cloud_components(
+                            clouds.add(bevy_pointcloud::point_cloud::PointCloud { points }),
+                            shared_point_material,
+                        ),
+                        Transform::from_matrix(transform),
+                        ChildOf(tile_root),
+                    ))
+                    .id();
+                if let Some(group) = &anchor_group {
+                    commands.entity(child).insert(group.clone());
+                }
+            }
+            DecodedItem::Splat { transform, gaussians } => {
+                let child = commands
+                    .spawn((
+                        crate::plugins::splat::splat_components(splats.add(
+                            bevy_gaussian_splatting::PlanarGaussian3d::from(gaussians),
+                        )),
+                        Transform::from_matrix(transform),
+                        ChildOf(tile_root),
+                    ))
+                    .id();
+                if let Some(group) = &anchor_group {
+                    commands.entity(child).insert(group.clone());
+                }
+            }
         }
     }
     tile_root
+}
+
+/// Build a sub-mesh from a subset of `mesh`'s triangles (by triangle ordinal),
+/// remapped to a compact vertex range — splits a feature tile into per-section-
+/// twin pieces at spawn (T8 highlight). Copies POSITION plus whatever of
+/// NORMAL/UV0/COLOR the source carries; `MAIN_WORLD` usage so the pick raycast
+/// can read it.
+fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
+    use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues as Vav};
+    let mut out = Mesh::new(PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::default());
+    let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).and_then(|a| a.as_float3()) else {
+        return out;
+    };
+    let normals = mesh.attribute(Mesh::ATTRIBUTE_NORMAL).and_then(|a| a.as_float3());
+    let uvs = match mesh.attribute(Mesh::ATTRIBUTE_UV_0) {
+        Some(Vav::Float32x2(v)) => Some(v.as_slice()),
+        _ => None,
+    };
+    let colors = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+        Some(Vav::Float32x4(v)) => Some(v.as_slice()),
+        _ => None,
+    };
+    let vertex_of = |t: usize, k: usize| -> Option<usize> {
+        match mesh.indices() {
+            Some(Indices::U32(v)) => v.get(t * 3 + k).map(|&i| i as usize),
+            Some(Indices::U16(v)) => v.get(t * 3 + k).map(|&i| i as usize),
+            None => Some(t * 3 + k),
+        }
+    };
+    let mut remap: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut out_pos: Vec<[f32; 3]> = Vec::new();
+    let mut out_nrm: Vec<[f32; 3]> = Vec::new();
+    let mut out_uv: Vec<[f32; 2]> = Vec::new();
+    let mut out_col: Vec<[f32; 4]> = Vec::new();
+    let mut out_idx: Vec<u32> = Vec::new();
+    for &t in tris {
+        for k in 0..3 {
+            let Some(v) = vertex_of(t, k).filter(|&v| v < positions.len()) else { continue };
+            let local = match remap.get(&v) {
+                Some(&l) => l,
+                None => {
+                    let l = out_pos.len() as u32;
+                    remap.insert(v, l);
+                    out_pos.push(positions[v]);
+                    if let Some(n) = normals {
+                        out_nrm.push(n[v]);
+                    }
+                    if let Some(u) = uvs {
+                        out_uv.push(u[v]);
+                    }
+                    if let Some(c) = colors {
+                        out_col.push(c[v]);
+                    }
+                    l
+                }
+            };
+            out_idx.push(local);
+        }
+    }
+    out.insert_attribute(Mesh::ATTRIBUTE_POSITION, out_pos);
+    if !out_nrm.is_empty() {
+        out.insert_attribute(Mesh::ATTRIBUTE_NORMAL, out_nrm);
+    }
+    if !out_uv.is_empty() {
+        out.insert_attribute(Mesh::ATTRIBUTE_UV_0, out_uv);
+    }
+    if !out_col.is_empty() {
+        out.insert_attribute(Mesh::ATTRIBUTE_COLOR, out_col);
+    }
+    out.insert_indices(Indices::U32(out_idx));
+    out
 }
 
 /// Keep the `true`-flagged entries of `v`, preserving order — the index-aligned
@@ -1612,6 +1732,33 @@ fn set_google_logo_dom(_show: bool) {}
 mod tests {
     use super::*;
     use bevy::tasks::block_on;
+
+    /// `build_submesh` (T8 highlight) extracts a triangle subset into a compact
+    /// mesh, copying the attributes the source has and remapping indices.
+    #[test]
+    fn build_submesh_extracts_triangle_subset() {
+        use bevy::mesh::{Indices, PrimitiveTopology};
+        let mut mesh =
+            Mesh::new(PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::default());
+        // A quad: 4 verts, 2 triangles [0,1,2] and [0,2,3].
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_COLOR,
+            vec![[1.0, 0.0, 0.0, 1.0]; 4],
+        );
+        mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
+
+        // Keep only triangle 1 (verts 0,2,3) → 3 verts, 1 triangle, remapped.
+        let sub = build_submesh(&mesh, &[1]);
+        let pos = sub.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().as_float3().unwrap();
+        assert_eq!(pos, &[[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
+        assert!(sub.attribute(Mesh::ATTRIBUTE_COLOR).is_some(), "color carried through");
+        let Some(Indices::U32(idx)) = sub.indices() else { panic!("u32 indices") };
+        assert_eq!(idx, &[0, 1, 2]);
+    }
 
     #[test]
     fn horizon_cull_hides_the_far_side_keeps_the_near() {
