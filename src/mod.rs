@@ -953,33 +953,6 @@ fn compose_ecef_tile_matrix(
     m
 }
 
-/// Whether a tile's bounding sphere is entirely beyond the horizon — occluded
-/// by the planet (radius `planet_r`, centred at the **set-frame origin**) as
-/// seen from `cam`. Both `cam` and `center` are in the set frame (ECEF metres
-/// for globe sets). Cesium's scaled-space occlusion test, specialised to a
-/// sphere; the test point is lifted to the top of the bounding sphere (the
-/// part most likely to peek over the limb) so tiles straddling the horizon are
-/// kept — it only culls tiles that are *fully* behind the curve.
-fn beyond_horizon(cam: DVec3, center: DVec3, radius: f64, planet_r: f64) -> bool {
-    let up = center.length();
-    if up < 1.0 {
-        return false; // planet-centred (whole-globe) volume — never cull
-    }
-    // Lift the test point radially out to the top of the bounding sphere.
-    let test = center * (1.0 + radius / up);
-    // Scale so the planet is the unit sphere.
-    let c = cam / planet_r;
-    let p = test / planet_r;
-    let vh2 = c.length_squared() - 1.0; // squared scaled camera→horizon distance
-    if vh2 <= 0.0 {
-        return false; // camera at/under the surface — disable the cull
-    }
-    let vt = p - c;
-    let vt_dot_vc = -vt.dot(c);
-    // Occluded ⇔ the point is past the horizon plane AND inside the limb cone.
-    vt_dot_vc > vh2 && (vt_dot_vc * vt_dot_vc) / vt.length_squared() > vh2
-}
-
 /// Spawn one tile's decoded items under a hidden tile-root entity. The
 /// render cut flips the root's visibility; children inherit. Twin-anchored
 /// sets tag content with `TwinMeshGroup` so selection/highlight/focus treat
@@ -1452,40 +1425,25 @@ fn drive_tiles3d(
             })
             .collect();
 
-        // DIAGNOSTIC (2026-06-14): the horizon cull is the prime suspect for the
-        // "tiles below vanish, backsides show through the horizon" hole — it's
-        // what could remove an on-screen near-limb tile. Flip OFF to test; with
-        // compaction bounding the tree it's no longer load-bearing. Counters
-        // below report what each cull removed so the log pins the cause.
-        const HORIZON_CULL: bool = false;
         let tree = &set.tree;
-        let horizon_culls = std::cell::Cell::new(0u32);
-        let frustum_culls = std::cell::Cell::new(0u32);
         let culled = |i: usize| {
             let (center, radius) = tree.nodes[i].volume.bounding_sphere();
-            // HORIZON CULL (globe sets): a tile entirely behind the planet's limb
-            // for the camera's altitude. Runs in the set frame (planet origin).
-            if HORIZON_CULL
-                && let Some(planet_r) = planet_radius
-                && beyond_horizon(cam_pos, center, radius, planet_r)
-            {
-                horizon_culls.set(horizon_culls.get() + 1);
-                return true;
-            }
-            // Frustum test happens in world space: local volume → world. Inflate
-            // the test sphere 25% so tiles whose extent sits just past the edge
-            // don't pop out as the view rotates. `intersect_far = false` like the
-            // basemap: distant tiles coarsen via SSE; clipping handles the rest.
+            // Frustum test in world space: local volume → world. Inflate the test
+            // sphere 25% so tiles whose extent sits just past the edge don't pop
+            // out (and stop loading) as the view rotates. `intersect_far = false`
+            // like the basemap: distant tiles coarsen via SSE; clipping the rest.
+            //
+            // NO horizon/limb cull: it removed tiles that were genuinely on
+            // screen — you could see ground PAST the limb that it had culled,
+            // which broke the whole view — and the distance falloff (bounds far
+            // refinement) + compaction (reclaims stale grafts) cover its old job.
+            // Removed 2026-06-14; see git history for `beyond_horizon`.
             let world_center = world_from_set.transform_point3(center);
             let sphere = Sphere {
                 center: Vec3A::from(world_center.as_vec3()),
                 radius: (radius * set_scale * 1.25) as f32,
             };
-            let out = !frustum.intersects_sphere(&sphere, false);
-            if out {
-                frustum_culls.set(frustum_culls.get() + 1);
-            }
-            out
+            !frustum.intersects_sphere(&sphere, false)
         };
 
         let sel = traversal::select(tree, &tiles_content, &set.history, &culled, params);
@@ -1651,14 +1609,8 @@ fn drive_tiles3d(
                 }
                 set.last_cut = Some(cut);
                 info!(
-                    "tiles3d: {}: cut {} tile(s) at depth {dmin}..{dmax} \
-                     [covered={} hcull={} fcull={} loads={}]",
-                    set.label,
-                    cut.0,
-                    sel.covered,
-                    horizon_culls.get(),
-                    frustum_culls.get(),
-                    sel.loads.len(),
+                    "tiles3d: {}: cut {} tile(s) at depth {dmin}..{dmax} (covered={})",
+                    set.label, cut.0, sel.covered,
                 );
             }
         }
@@ -1774,29 +1726,6 @@ mod tests {
         assert!(sub.attribute(Mesh::ATTRIBUTE_COLOR).is_some(), "color carried through");
         let Some(Indices::U32(idx)) = sub.indices() else { panic!("u32 indices") };
         assert_eq!(idx, &[0, 1, 2]);
-    }
-
-    #[test]
-    fn horizon_cull_hides_the_far_side_keeps_the_near() {
-        let r = WGS84_EQUATORIAL_RADIUS_M;
-        // Camera 1 km above the north pole, looking down the globe.
-        let cam = DVec3::new(0.0, 0.0, r + 1_000.0);
-        let small = 50.0; // a tile-sized bounding sphere
-        // Directly below → visible.
-        assert!(!beyond_horizon(cam, DVec3::new(0.0, 0.0, r), small, r));
-        // Far side of the planet (south pole) → occluded.
-        assert!(beyond_horizon(cam, DVec3::new(0.0, 0.0, -r), small, r));
-        // Just past the geometric horizon (≈113 km along the surface at 1 km
-        // altitude) → occluded; well inside it → visible.
-        let d_h = (2.0 * r * 1_000.0_f64).sqrt(); // ~112.9 km straight-line
-        let ang_far = (d_h * 1.5) / r; // past the limb
-        let far = DVec3::new(r * ang_far.sin(), 0.0, r * ang_far.cos());
-        assert!(beyond_horizon(cam, far, small, r), "past the limb is culled");
-        let ang_near = (d_h * 0.3) / r;
-        let near = DVec3::new(r * ang_near.sin(), 0.0, r * ang_near.cos());
-        assert!(!beyond_horizon(cam, near, small, r), "inside the limb stays");
-        // Whole-globe root volume (centre at the planet centre) is never culled.
-        assert!(!beyond_horizon(cam, DVec3::ZERO, r, r));
     }
 
     #[test]
