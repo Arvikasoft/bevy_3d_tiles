@@ -1452,34 +1452,40 @@ fn drive_tiles3d(
             })
             .collect();
 
+        // DIAGNOSTIC (2026-06-14): the horizon cull is the prime suspect for the
+        // "tiles below vanish, backsides show through the horizon" hole — it's
+        // what could remove an on-screen near-limb tile. Flip OFF to test; with
+        // compaction bounding the tree it's no longer load-bearing. Counters
+        // below report what each cull removed so the log pins the cause.
+        const HORIZON_CULL: bool = false;
         let tree = &set.tree;
+        let horizon_culls = std::cell::Cell::new(0u32);
+        let frustum_culls = std::cell::Cell::new(0u32);
         let culled = |i: usize| {
             let (center, radius) = tree.nodes[i].volume.bounding_sphere();
-            // HORIZON CULL (globe sets): a tile entirely behind the planet's
-            // limb for the camera's altitude is never refined, grafted, or
-            // loaded — looking at the horizon no longer drags the whole far
-            // hemisphere into the tree. Altitude-adaptive for free: the higher
-            // the camera, the farther the limb, so more becomes visible. Runs
-            // in the set frame (planet at the origin), where `cam_pos` and the
-            // tile volume already live.
-            if let Some(planet_r) = planet_radius
+            // HORIZON CULL (globe sets): a tile entirely behind the planet's limb
+            // for the camera's altitude. Runs in the set frame (planet origin).
+            if HORIZON_CULL
+                && let Some(planet_r) = planet_radius
                 && beyond_horizon(cam_pos, center, radius, planet_r)
             {
+                horizon_culls.set(horizon_culls.get() + 1);
                 return true;
             }
-            // Frustum test happens in world space: local volume → world.
+            // Frustum test happens in world space: local volume → world. Inflate
+            // the test sphere 25% so tiles whose extent sits just past the edge
+            // don't pop out as the view rotates. `intersect_far = false` like the
+            // basemap: distant tiles coarsen via SSE; clipping handles the rest.
             let world_center = world_from_set.transform_point3(center);
             let sphere = Sphere {
                 center: Vec3A::from(world_center.as_vec3()),
-                // Inflate the test sphere 25%: keep tiles whose extent sits just
-                // past the frustum edge so they don't pop out (and stop loading)
-                // as the view rotates/tilts — the "tiles vanish at this exact
-                // angle" finding. Cheap now that compaction bounds the tree.
                 radius: (radius * set_scale * 1.25) as f32,
             };
-            // `intersect_far = false`, like the basemap: distant tiles coarsen
-            // via SSE; clipping handles the rest.
-            !frustum.intersects_sphere(&sphere, false)
+            let out = !frustum.intersects_sphere(&sphere, false);
+            if out {
+                frustum_culls.set(frustum_culls.get() + 1);
+            }
+            out
         };
 
         let sel = traversal::select(tree, &tiles_content, &set.history, &culled, params);
@@ -1645,8 +1651,14 @@ fn drive_tiles3d(
                 }
                 set.last_cut = Some(cut);
                 info!(
-                    "tiles3d: {}: cut {} tile(s) at depth {dmin}..{dmax}",
-                    set.label, cut.0
+                    "tiles3d: {}: cut {} tile(s) at depth {dmin}..{dmax} \
+                     [covered={} hcull={} fcull={} loads={}]",
+                    set.label,
+                    cut.0,
+                    sel.covered,
+                    horizon_culls.get(),
+                    frustum_culls.get(),
+                    sel.loads.len(),
                 );
             }
         }

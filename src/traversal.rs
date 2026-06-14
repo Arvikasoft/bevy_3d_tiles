@@ -443,6 +443,10 @@ pub struct Selection {
     /// Tiles that are part of this frame's wanted set (render ∪ loads ∪
     /// traversed interior) — the eviction grace clock resets for these.
     pub touched: Vec<bool>,
+    /// Whether the root subtree painted its whole footprint. `false` ⇒ a
+    /// genuine traversal HOLE: some on-screen area has no Ready tile to render
+    /// (vs. a render-side problem where `covered` is true but pixels are wrong).
+    pub covered: bool,
 }
 
 /// Frame history needed by zoom-out protection + kicking.
@@ -525,12 +529,13 @@ pub fn select<F: Fn(usize) -> bool>(
         loads: Vec::new(),
         refined: vec![false; n],
         touched: vec![false; n],
+        covered: false,
     };
     if n == 0 {
         return sel;
     }
     let ctx = Ctx { tree, content, history, culled, params };
-    visit(&ctx, 0, &mut sel);
+    sel.covered = visit(&ctx, 0, &mut sel).covered;
 
     // Preload tier: ancestors of the rendered cut that have unloaded content.
     // REPLACE refinement means a loaded ancestor gives instant zoom-out (and a
