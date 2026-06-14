@@ -1403,12 +1403,22 @@ fn drive_tiles3d(
         // off by up to ~21 km away from the equator, which would wreck the floor.
         let cam_height_m =
             if planet_radius.is_some() { cam_pos_world.y.max(0.0) } else { 0.0 };
+        // The distance falloff is a globe/horizon guard: it bounds the P3DT
+        // graft+stream storm toward the horizon on an ECEF set. A local-frame
+        // tileset is a BOUNDED model with no horizon hemisphere to stream, and
+        // `cam_height_m == 0` there makes the falloff measure RAW camera
+        // distance — so it coarsens the ENTIRE model the moment you pull back
+        // (the "local terrain stays blurry until I'm much closer than I expect"
+        // finding). Natural 1/dist SSE already coarsens the far edge on its own;
+        // disable the extra relaxation for local sets, keep it for ECEF/globe.
+        let detail_falloff_m =
+            if planet_radius.is_some() { config.detail_falloff_m } else { 0.0 };
         let params = SelectParams {
             cam_pos,
             cam_forward,
             k_px,
             sse_threshold_px: config.sse_threshold_px,
-            detail_falloff_m: config.detail_falloff_m,
+            detail_falloff_m,
             cam_height_m,
         };
 
