@@ -1417,10 +1417,14 @@ fn drive_tiles3d(
         let cam_forward = set_from_world
             .transform_vector3(cam_forward_world)
             .normalize_or(DVec3::NEG_Z);
-        // Camera height above the planet surface (globe sets only): the falloff
-        // measures from here, so flying high keeps the nadir tile sharp.
+        // Camera height above the origin ground plane (globe sets only). World
+        // +Y is ENU up, and the world↔set transform is rigid (distance-
+        // preserving), so `cam_pos_world.y` is a valid metres floor for the
+        // set-frame tile distances in the traversal. NOTE: use the world Y, NOT
+        // `cam_pos.length() - equatorial_radius` — that sphere approximation is
+        // off by up to ~21 km away from the equator, which would wreck the floor.
         let cam_height_m =
-            planet_radius.map(|r| (cam_pos.length() - r).max(0.0)).unwrap_or(0.0);
+            if planet_radius.is_some() { cam_pos_world.y.max(0.0) } else { 0.0 };
         let params = SelectParams {
             cam_pos,
             cam_forward,

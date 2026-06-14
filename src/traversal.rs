@@ -592,7 +592,18 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     let node = &ctx.tree.nodes[i];
     sel.touched[i] = true;
 
-    let dist = node.volume.distance_to(ctx.params.cam_pos);
+    // Floor the SSE distance at the camera's height above the ground. A coarse
+    // ground tile's bounding box is TALL (its big geometric error inflates the
+    // vertical extent), so at 10-15 km the camera sits INSIDE it ⇒
+    // `distance_to` returns 0 ⇒ infinite SSE ⇒ the tile is forced to refine
+    // into street-level children that (rightly) aren't loaded from that height
+    // ⇒ a permanent hole right under the camera (the live "tiles below vanish
+    // in the 10-15 km band" finding). But the tile's CONTENT is the ground,
+    // ~cam_height below, so the real viewing distance is never less than that —
+    // flooring there caps the nadir at an altitude-appropriate LOD that IS
+    // loaded, so it renders instead of holing. `cam_height_m == 0` for non-globe
+    // sets ⇒ no change (genuine camera-inside still gives infinite SSE).
+    let dist = node.volume.distance_to(ctx.params.cam_pos).max(ctx.params.cam_height_m);
     let sse = screen_space_error(node.geometric_error, dist, ctx.params.k_px);
 
     // Distance-relaxed refine threshold: detail falls off with distance so a
@@ -601,8 +612,8 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     // with). Near tiles (`dist ≪ falloff`) keep the base threshold; far tiles
     // need a proportionally larger error to subdivide, so the cut — and the
     // descent that triggers grafting — stays bounded to roughly the near view.
-    // A camera *inside* the volume still has `dist == 0` ⇒ infinite SSE ⇒
-    // refine, so detail directly under the camera is unaffected.
+    // (`dist` is floored at the camera height above, so a high top-down view
+    // refines to an altitude-appropriate level under the camera, never infinitely.)
     let threshold = if ctx.params.detail_falloff_m > 0.0 {
         // Measure the falloff from the camera's HEIGHT, not its position: the
         // tile right under a high top-down view has `dist ≈ cam_height_m` ⇒
@@ -857,6 +868,35 @@ mod tests {
         let relaxed = SelectParams { detail_falloff_m: 500.0, ..params(cam) };
         let far = select(&tree, &content, &history, &no_cull, relaxed);
         assert_eq!(far.render, vec![0], "falloff keeps the distant tile coarse");
+    }
+
+    #[test]
+    fn high_camera_inside_tall_volume_renders_coarse_not_a_hole() {
+        // The fixture root (ge 16, r 30) is centred at the origin, so a camera
+        // AT the origin sits INSIDE it ⇒ `distance_to == 0` ⇒ infinite SSE ⇒
+        // forced refinement to the finest leaves. That's the tall-bounding-box
+        // trap behind the live "tiles directly below vanish in the 10-15 km
+        // band" finding: a coarse ground tile's box reaches up to the camera, so
+        // the nadir demands street-level tiles that aren't loaded from altitude.
+        let tree = fixture_tree();
+        let content = all(TileContent::Ready, tree.len());
+        let history =
+            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let cam = DVec3::ZERO; // inside the root volume
+
+        // No height floor (the bug): infinite SSE forces refinement to the leaves.
+        let unfloored = select(&tree, &content, &history, &no_cull, params(cam));
+        assert!(
+            !unfloored.render.is_empty() && unfloored.render.iter().all(|&t| t >= 5),
+            "without the floor an inside camera over-refines to the leaves: {:?}",
+            unfloored.render
+        );
+
+        // 2 km height floor: root SSE ≈ 10 px < the 16 px threshold, so the
+        // coarse root renders — altitude-appropriate, no over-refine, no hole.
+        let floored = SelectParams { cam_height_m: 2000.0, ..params(cam) };
+        let sel = select(&tree, &content, &history, &no_cull, floored);
+        assert_eq!(sel.render, vec![0], "the height floor renders the coarse tile, not a hole");
     }
 
     #[test]
