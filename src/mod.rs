@@ -105,7 +105,13 @@ pub struct Tiles3dConfig {
 impl Default for Tiles3dConfig {
     fn default() -> Self {
         Self {
-            sse_threshold_px: traversal::DEFAULT_SSE_THRESHOLD_PX,
+            // 10 px, below the 3D-Tiles standard 16 (`DEFAULT_SSE_THRESHOLD_PX`):
+            // a tile selected at 16 can cover ~16 screen px per geometric-error
+            // unit, so its baked texture upscales and reads blurry — especially
+            // zoomed out, where each tile fills more screen. 10 pulls one finer
+            // level so texel≈pixel (crisper), affordable now compaction bounds
+            // the tree. Costs more P3DT requests; raise toward 16 to cut quota.
+            sse_threshold_px: 10.0,
             // ~2 km: near terrain stays sharp, the horizon coarsens. Tuned
             // against the live autzen P3DT view (cam ~10–20 m up); raise for
             // high-altitude orbits, lower if the tree still grows too far out.
