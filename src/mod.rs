@@ -1304,7 +1304,12 @@ fn drive_tiles3d(
         Projection::Perspective(p) => p.fov as f64,
         _ => std::f64::consts::FRAC_PI_4,
     };
-    let viewport_h = cam.logical_viewport_size().map(|v| v.y as f64).unwrap_or(1080.0);
+    // PHYSICAL pixels, not logical: the tile geometry rasterises at the
+    // framebuffer resolution, so SSE must too. On a high-DPI/retina display
+    // logical = physical / devicePixelRatio, so a logical-pixel k underestimated
+    // the error by ~2× and selected one LOD too coarse — the "blurry zoomed out"
+    // finding. `sse_threshold_px` is now in physical pixels (texel ≈ device pixel).
+    let viewport_h = cam.physical_viewport_size().map(|v| v.y as f64).unwrap_or(1080.0);
     let k_px = viewport_h / (2.0 * (fov_y * 0.5).tan()).max(1e-6);
     let cam_pos_world = cam_gt.translation().as_dvec3();
     let cam_forward_world = Vec3::from(cam_gt.forward()).as_dvec3();
