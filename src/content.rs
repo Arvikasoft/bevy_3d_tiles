@@ -356,7 +356,17 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
         return decode_splat_gltf(&value, bin);
     }
 
-    let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| format!("gltf parse: {e}"))?;
+    let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| {
+        // Diagnostic: a parse failure here means the bytes reaching the gltf
+        // crate aren't the clean vanilla glTF we expect (bad archive range-read,
+        // meshopt rebuild, or a stray required extension). Surface the JSON
+        // head/tail + length so the cause is visible in the log without a
+        // round-trip — the raw tile is usually structurally valid.
+        let (j, _) = split_glb(bytes).unwrap_or((bytes, None));
+        let head = String::from_utf8_lossy(&j[..j.len().min(180)]);
+        let tail = String::from_utf8_lossy(&j[j.len().saturating_sub(180)..]);
+        format!("gltf parse: {e} | json_len={} head={head:?} tail={tail:?}", j.len())
+    })?;
     let doc = gltf.document;
     let blob = gltf.blob;
 
