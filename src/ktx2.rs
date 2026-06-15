@@ -48,6 +48,9 @@ pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, String> {
     let format = get("format")?.as_string().ok_or("ktx2 format not a string")?;
     let width = get("width")?.as_f64().ok_or("ktx2 width not a number")? as u32;
     let height = get("height")?.as_f64().ok_or("ktx2 height not a number")? as u32;
+    // `levels` is the mip count; `data` is every level concatenated (base → 1×1)
+    // in GPU-upload order. Older shims omit it ⇒ single level.
+    let levels = get("levels").ok().and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0) as u32;
     let data = js_sys::Uint8Array::new(&get("data")?).to_vec();
 
     let tex_format = match format.as_str() {
@@ -55,11 +58,15 @@ pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, String> {
         "rgba8" => TextureFormat::Rgba8UnormSrgb,
         other => return Err(format!("ktx2 shim returned unknown format {other}")),
     };
-    Ok(Image::new(
+    // `new_uninit` + manual data avoids `Image::new`'s single-mip length
+    // debug-assert (and its `pixel_size()` call, which panics on block formats).
+    let mut image = Image::new_uninit(
         Extent3d { width, height, depth_or_array_layers: 1 },
         TextureDimension::D2,
-        data,
         tex_format,
         RenderAssetUsages::RENDER_WORLD,
-    ))
+    );
+    image.texture_descriptor.mip_level_count = levels;
+    image.data = Some(data);
+    Ok(image)
 }

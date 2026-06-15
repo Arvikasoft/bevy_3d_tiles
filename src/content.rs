@@ -1045,6 +1045,10 @@ fn sampler_from_gltf(texture: &gltf::Texture<'_>) -> ImageSamplerDescriptor {
         mag_filter: ImageFilterMode::Linear,
         min_filter: ImageFilterMode::Linear,
         mipmap_filter: ImageFilterMode::Linear,
+        // Trilinear + anisotropic over the baked mip pyramid: terrain is viewed
+        // at grazing angles where isotropic mips alone still shimmer. Clamped to
+        // the device max by wgpu; a no-op on single-mip fallback (png/jpeg).
+        anisotropy_clamp: 16,
         ..ImageSamplerDescriptor::default()
     }
 }
