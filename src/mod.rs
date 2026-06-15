@@ -375,6 +375,16 @@ impl Tiles3dSets {
         let (center, radius) = set.tree.nodes.first()?.volume.bounding_sphere();
         Some((set.root_entity, center.as_vec3(), radius as f32))
     }
+
+    /// Root entity of the **anchored** tileset on `anchor`, whose local
+    /// `Transform` is the rendition correction (the asset loader re-applies a
+    /// changed correction to it for live alignment — Phase 1 hot-reload). ECEF
+    /// (world-layer / P3DT) sets place themselves via the project origin, so
+    /// their root carries no editable correction and is excluded.
+    pub fn root_entity_for_anchor(&self, anchor: Entity) -> Option<Entity> {
+        let set = self.sets.iter().find(|s| s.anchor == Some(anchor))?;
+        matches!(set.frame, SetFrame::Anchored).then_some(set.root_entity)
+    }
 }
 
 /// Anchor info carried through the async tileset open.
