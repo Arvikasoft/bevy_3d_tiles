@@ -26,7 +26,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use bevy::asset::RenderAssetUsages;
-use bevy::image::{CompressedImageFormats, Image, ImageSampler, ImageType};
+use bevy::image::{
+    CompressedImageFormats, Image, ImageAddressMode, ImageFilterMode, ImageSampler,
+    ImageSamplerDescriptor, ImageType,
+};
 use bevy::math::{DVec3, Mat4, Vec3};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy_gaussian_splatting::gaussian::formats::planar_3d::Gaussian3d;
@@ -62,7 +65,12 @@ async fn resolve_pending_textures(items: &mut [DecodedItem]) -> Result<(), Strin
         let DecodedItem::Mesh(p) = item else { continue };
         let Some(bytes) = p.material.base_color_ktx2.take() else { continue };
         match transcode_ktx2(&bytes).await {
-            Ok(img) => p.material.base_color_image = Some(img),
+            Ok(mut img) => {
+                // Stamp the glTF wrap/filter sampler onto the transcoded image
+                // (the transcoders return `ImageSampler::Default` = ClampToEdge).
+                img.sampler = ImageSampler::Descriptor(p.material.base_color_sampler.clone());
+                p.material.base_color_image = Some(img);
+            }
             Err(e) => warn_ktx2_once(&e),
         }
     }
@@ -153,6 +161,10 @@ pub struct DecodedMaterial {
     /// bevy basis on native, neither callable from the sync decode. Mutually
     /// exclusive with `base_color_image`.
     pub base_color_ktx2: Option<Vec<u8>>,
+    /// Wrap/filter sampler for the base-color texture, read from the glTF
+    /// sampler (defaulting to REPEAT per the glTF spec). Carried separately so
+    /// the deferred KTX2 transcode can stamp it onto its `Image` too.
+    pub base_color_sampler: ImageSamplerDescriptor,
     pub metallic: f32,
     pub roughness: f32,
     pub double_sided: bool,
@@ -167,6 +179,7 @@ impl Default for DecodedMaterial {
             base_color: [1.0; 4],
             base_color_image: None,
             base_color_ktx2: None,
+            base_color_sampler: ImageSamplerDescriptor::default(),
             metallic: 0.0,
             roughness: 1.0,
             double_sided: false,
@@ -1009,6 +1022,33 @@ fn decode_points(
     Ok(DecodedItem::Points { transform, points })
 }
 
+/// glTF `WrappingMode` → bevy `ImageAddressMode`.
+fn gltf_address_mode(w: gltf::texture::WrappingMode) -> ImageAddressMode {
+    use gltf::texture::WrappingMode;
+    match w {
+        WrappingMode::ClampToEdge => ImageAddressMode::ClampToEdge,
+        WrappingMode::MirroredRepeat => ImageAddressMode::MirrorRepeat,
+        WrappingMode::Repeat => ImageAddressMode::Repeat,
+    }
+}
+
+/// Build a bevy sampler descriptor from a glTF texture's sampler. The `gltf`
+/// crate returns the spec default (REPEAT, linear) for an unauthored sampler,
+/// so this both honours authored wrap modes and revives tiling textures the old
+/// `ImageSampler::Default` (ClampToEdge) silently flattened. Linear filtering;
+/// mips are deferred crate-wide.
+fn sampler_from_gltf(texture: &gltf::Texture<'_>) -> ImageSamplerDescriptor {
+    let s = texture.sampler();
+    ImageSamplerDescriptor {
+        address_mode_u: gltf_address_mode(s.wrap_s()),
+        address_mode_v: gltf_address_mode(s.wrap_t()),
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..ImageSamplerDescriptor::default()
+    }
+}
+
 fn decode_material(
     material: &gltf::Material<'_>,
     blob: Option<&[u8]>,
@@ -1021,10 +1061,21 @@ fn decode_material(
         double_sided: material.double_sided(),
         base_color_image: None,
         base_color_ktx2: None,
+        base_color_sampler: ImageSamplerDescriptor::default(),
         unlit: material.unlit(),
     };
     if let Some(info) = pbr.base_color_texture() {
-        let image = info.texture().source();
+        let texture = info.texture();
+        // Honour the glTF wrap mode. The loader used to hardcode
+        // `ImageSampler::Default` (bevy's engine default is ClampToEdge), so a
+        // material whose UVs run past [0,1] — tiling/atlas-wrapping textures —
+        // sampled the EDGE texel everywhere and the surface read as a flat smear
+        // ("the tiled texture disappears in the 3dtiles version"). The glTF spec
+        // default wrap is REPEAT, which the `gltf` crate returns when no sampler
+        // is authored, so this revives tiling textures and respects authored
+        // CLAMP (e.g. the tiler's per-footprint crops).
+        out.base_color_sampler = sampler_from_gltf(&texture);
+        let image = texture.source();
         match image.source() {
             gltf::image::Source::View { view, mime_type } => {
                 let buf = resolve_buffer(&view.buffer(), blob)
@@ -1035,7 +1086,8 @@ fn decode_material(
                 if mime_type == "image/ktx2" {
                     // T7: defer the UASTC transcode to the async resolve pass
                     // (JS shim on wasm / bevy basis on native) — neither is
-                    // callable from this sync decode.
+                    // callable from this sync decode. The sampler rides
+                    // `base_color_sampler` and is stamped on after transcode.
                     out.base_color_ktx2 = Some(bytes.to_vec());
                 } else {
                     let decoded = Image::from_buffer(
@@ -1043,7 +1095,7 @@ fn decode_material(
                         ImageType::MimeType(mime_type),
                         CompressedImageFormats::NONE, // png/jpeg: format irrelevant
                         true,                         // base color is sRGB
-                        ImageSampler::Default,
+                        ImageSampler::Descriptor(out.base_color_sampler.clone()),
                         // GPU-only: tile textures are never read back on the CPU.
                         RenderAssetUsages::RENDER_WORLD,
                     )
