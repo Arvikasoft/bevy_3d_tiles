@@ -38,13 +38,14 @@ use bevy::camera::Projection;
 use bevy::math::{DMat4, DVec3, Vec3A};
 use bevy::prelude::*;
 use bevy::window::RequestRedraw;
-use bevy_panorbit_camera::PanOrbitCamera;
 
+pub mod api;
 pub mod archive;
 pub mod content;
 pub mod draco;
 pub mod fetch;
 pub mod geo;
+pub mod geodesy;
 // wasm-only KTX2 transcode shim binding (T7); native uses bevy basis-universal.
 #[cfg(target_arch = "wasm32")]
 pub mod ktx2;
@@ -52,17 +53,26 @@ pub mod meshopt;
 pub mod schema;
 pub mod traversal;
 
+pub use api::{EcefOrigin, TileFeatureResolver, TileOwner, Tiles3dCamera};
+#[cfg(feature = "points")]
+pub use api::PointTileMaterial;
+
 use archive::Archive3tz;
 use content::{DecodedItem, DecodedPrimitive, DecodedTile};
 use fetch::{BudgetCounter, ByteSource, ExplodedBase, LiveSession, TilesetSource};
 use traversal::{History, SelectParams, TileContent, TileTree, TreeFrame, ZUP_TO_BEVY};
 
-use turbotwin_sdk_rs::enu::WGS84_EQUATORIAL_RADIUS_M;
+use geodesy::WGS84_EQUATORIAL_RADIUS_M;
 
-use crate::plugins::relationships::RelationshipIndex;
-use crate::plugins::scene_layout::TwinMeshGroup;
-use crate::plugins::sections::{resolve_in_section_map, section_map_for_anchor};
-use crate::plugins::spatial_source::{MetadataIndex, ProjectOrigin, ProjectOriginInner};
+// Heavy tile-content renderer types — point clouds (`points`) and Gaussian
+// splats (`splats`). The host supplies the `Assets` stores (its own render
+// plugins register them) and, for points, the shared [`PointTileMaterial`].
+#[cfg(feature = "points")]
+use bevy_pointcloud::point_cloud::{PointCloud, PointCloud3d};
+#[cfg(feature = "points")]
+use bevy_pointcloud::point_cloud_material::PointCloudMaterial3d;
+#[cfg(feature = "splats")]
+use bevy_gaussian_splatting::{CloudSettings, PlanarGaussian3d, PlanarGaussian3dHandle};
 
 /// The Google Photorealistic 3D Tiles root tileset (D7). The org's API key
 /// is appended per request, never stored in the row.
@@ -160,10 +170,10 @@ pub struct Tiles3dAttach {
     pub url: String,
     /// Per-rendition correction transform (pivot/facing/unit fix-up).
     pub local: Transform,
-    /// Owning twin, when anchored to one — spawned tile content gets
-    /// `TwinMeshGroup` so click-select / highlight / focus keep working, and
-    /// the twin's placeholder cube clears on the first rendered cut.
-    pub twin_id: Option<String>,
+    /// Owning entity id, when anchored to one — spawned tile content gets a
+    /// [`TileOwner`] tag so the host's selection / highlight / focus keep
+    /// working. `None` for world-anchored / standalone tilesets.
+    pub owner_id: Option<String>,
     /// Display label for logs/debug (asset id, twin id…).
     pub label: String,
     /// Google P3DT session config: routes the open through a live, keyed,
@@ -235,7 +245,7 @@ enum SetFrame {
     /// positions — a spaceborne anchor puts ground tiles at their real
     /// height far below, exactly like basemap terrain). `built` = the
     /// origin resident tile transforms were composed at.
-    Ecef { built: Option<ProjectOriginInner> },
+    Ecef { built: Option<DMat4> },
 }
 
 /// One external-tileset graft, recorded so the tree compactor can drop a stale
@@ -270,7 +280,7 @@ pub struct ActiveTileset {
     root_entity: Entity,
     /// Anchor entity when attached via D6 (None = world-anchored dev set).
     anchor: Option<Entity>,
-    /// Owning twin id (TwinMeshGroup tagging + placeholder clearing).
+    /// Owning entity id ([`TileOwner`] tagging + placeholder clearing).
     twin_id: Option<String>,
     /// Whether the anchor's placeholder cube has been stripped yet.
     placeholder_cleared: bool,
@@ -442,6 +452,11 @@ impl Plugin for Tiles3dPlugin {
             .init_resource::<Tiles3dSets>()
             .init_resource::<Tiles3dChannel>()
             .init_resource::<TilesetCredits>()
+            // Host-supplied seams (defaults are inert: no origin, no resolver).
+            // The host overwrites these via its own adapter systems; a
+            // standalone viewer leaves them and streams local/relative sets.
+            .init_resource::<EcefOrigin>()
+            .init_resource::<TileFeatureResolver>()
             .add_message::<Tiles3dAttach>()
             .add_message::<Tiles3dDetach>()
             .add_systems(Startup, (latch_compressed_formats, init_dev_tileset))
@@ -455,6 +470,9 @@ impl Plugin for Tiles3dPlugin {
                 )
                     .chain(),
             );
+        // The shared point material the host sets before any POINTS tile spawns.
+        #[cfg(feature = "points")]
+        app.init_resource::<PointTileMaterial>();
     }
 }
 
@@ -534,7 +552,7 @@ fn apply_attach_detach(
             Some(AttachTarget {
                 anchor: msg.anchor,
                 local: msg.local,
-                twin_id: msg.twin_id.clone(),
+                twin_id: msg.owner_id.clone(),
             }),
             channel.tx.clone(),
         );
@@ -689,18 +707,19 @@ async fn open_tileset(
 fn receive_tiles3d(
     channel: Res<Tiles3dChannel>,
     config: Res<Tiles3dConfig>,
-    origin: Res<ProjectOrigin>,
+    origin: Res<EcefOrigin>,
+    // Per-feature owner resolver: at spawn, a feature tile's triangles are
+    // tagged with their resolved owner id ([`TileOwner`]) so the host's
+    // click/hover/outline machinery treats each feature as its own entity.
+    // Inert by default — every feature falls back to the tile's anchor owner.
+    resolver: Res<TileFeatureResolver>,
     mut sets: ResMut<Tiles3dSets>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut clouds: ResMut<Assets<bevy_pointcloud::point_cloud::PointCloud>>,
-    mut splats: ResMut<Assets<bevy_gaussian_splatting::PlanarGaussian3d>>,
-    shared_point_material: Res<crate::plugins::point_cloud::SharedPointMaterial>,
-    // T8 highlight: resolve each tile feature to its section twin at spawn so
-    // per-feature submeshes carry the right TwinMeshGroup (click/hover/outline).
-    metadata: Res<MetadataIndex>,
-    relationships: Res<RelationshipIndex>,
+    #[cfg(feature = "points")] mut clouds: ResMut<Assets<PointCloud>>,
+    #[cfg(feature = "points")] point_material: Res<PointTileMaterial>,
+    #[cfg(feature = "splats")] mut splats: ResMut<Assets<PlanarGaussian3d>>,
     mut commands: Commands,
 ) {
     let mut spawned = 0usize;
@@ -891,21 +910,27 @@ fn receive_tiles3d(
                         // ECEF sets compose placement against the CURRENT
                         // origin in f64; tiles landing before the origin
                         // resolves wait (re-requested once it exists).
-                        let Some(transform) = tile_spawn_transform(set, tile, origin.get())
+                        let Some(transform) = tile_spawn_transform(set, tile, origin.world_from_ecef)
                         else {
                             set.slots[tile] = TileSlot::NotLoaded;
                             continue;
+                        };
+                        let renderers = ContentRenderers {
+                            #[cfg(feature = "points")]
+                            clouds: &mut clouds,
+                            #[cfg(feature = "points")]
+                            point_material: &point_material,
+                            #[cfg(feature = "splats")]
+                            splats: &mut splats,
+                            _marker: std::marker::PhantomData,
                         };
                         let entity = spawn_tile_content(
                             &mut commands,
                             &mut meshes,
                             &mut materials,
                             &mut images,
-                            &mut clouds,
-                            &mut splats,
-                            &shared_point_material,
-                            &metadata,
-                            &relationships,
+                            renderers,
+                            &resolver,
                             set,
                             tile,
                             transform,
@@ -936,7 +961,7 @@ fn receive_tiles3d(
 fn tile_spawn_transform(
     set: &ActiveTileset,
     tile: usize,
-    origin: Option<ProjectOriginInner>,
+    origin: Option<DMat4>,
 ) -> Option<Transform> {
     let node = &set.tree.nodes[tile];
     match set.frame {
@@ -951,11 +976,10 @@ fn tile_spawn_transform(
 
 /// `world_from_ecef(origin) × ecef_from_content × T(rtc_center)`, in f64.
 fn compose_ecef_tile_matrix(
-    origin: ProjectOriginInner,
+    world_from_ecef: DMat4,
     ecef_from_content: DMat4,
     rtc_center: Option<DVec3>,
 ) -> DMat4 {
-    let world_from_ecef = crate::plugins::spatial_source::enu::world_from_ecef(origin);
     let mut m = world_from_ecef * ecef_from_content;
     if let Some(rtc) = rtc_center {
         m *= DMat4::from_translation(rtc);
@@ -963,21 +987,32 @@ fn compose_ecef_tile_matrix(
     m
 }
 
+/// Heavy-renderer asset stores threaded into [`spawn_tile_content`] for
+/// point-cloud (`points`) and Gaussian-splat (`splats`) tile content. Each
+/// field exists only under its feature; with neither, this is just the
+/// lifetime marker. The host's render plugins own the `Assets` stores.
+struct ContentRenderers<'a> {
+    #[cfg(feature = "points")]
+    clouds: &'a mut Assets<PointCloud>,
+    #[cfg(feature = "points")]
+    point_material: &'a PointTileMaterial,
+    #[cfg(feature = "splats")]
+    splats: &'a mut Assets<PlanarGaussian3d>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
 /// Spawn one tile's decoded items under a hidden tile-root entity. The
-/// render cut flips the root's visibility; children inherit. Twin-anchored
-/// sets tag content with `TwinMeshGroup` so selection/highlight/focus treat
-/// tiles like any other twin geometry.
-#[allow(clippy::too_many_arguments)]
+/// render cut flips the root's visibility; children inherit. Owner-anchored
+/// sets tag content with [`TileOwner`] so the host's selection/highlight/focus
+/// treat tiles like any other owned geometry.
+#[allow(clippy::too_many_arguments, unused_variables)]
 fn spawn_tile_content(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
-    clouds: &mut Assets<bevy_pointcloud::point_cloud::PointCloud>,
-    splats: &mut Assets<bevy_gaussian_splatting::PlanarGaussian3d>,
-    shared_point_material: &crate::plugins::point_cloud::SharedPointMaterial,
-    metadata: &MetadataIndex,
-    relationships: &RelationshipIndex,
+    renderers: ContentRenderers<'_>,
+    resolver: &TileFeatureResolver,
     set: &ActiveTileset,
     tile: usize,
     transform: Transform,
@@ -995,13 +1030,15 @@ fn spawn_tile_content(
         ))
         .id();
     let anchor = set.twin_id.as_deref();
-    let anchor_group = anchor.map(|tid| TwinMeshGroup { twin_id: tid.to_string() });
-    // T8 highlight: build the section node-name → twin map ONCE for this tile
-    // (reused across every feature of every primitive) so split submeshes carry
-    // the right TwinMeshGroup — the existing click/hover/outline machinery then
-    // treats each section's geometry as that twin, exactly like the whole-file
-    // sections path.
-    let section_map = anchor.map(|a| section_map_for_anchor(a, metadata, relationships));
+    let anchor_group = anchor.map(|id| TileOwner { id: id.to_string() });
+    // T8 highlight: a feature tile under an owner splits into per-feature
+    // submeshes, each tagged with its resolved owner id via the host
+    // [`TileFeatureResolver`] — the host's click/hover/outline machinery then
+    // treats each feature's geometry as its own entity, exactly like the
+    // whole-file sections path. `has_resolver` gates the split: with no
+    // resolver every feature resolves to the anchor anyway, so we keep the
+    // cheaper single-mesh path.
+    let has_resolver = anchor.is_some() && resolver.0.is_some();
 
     for item in items {
         match item {
@@ -1031,31 +1068,31 @@ fn spawn_tile_content(
                 };
                 let mat_handle = materials.add(standard);
 
-                match (features, &section_map) {
-                    // Feature tile under a twin: split into per-section-twin
-                    // submeshes so highlight/hover/select resolve per module.
-                    (Some(f), Some(map)) => {
-                        let twin_of_feature: Vec<String> = f
+                match (features, has_resolver) {
+                    // Feature tile under an owner with a resolver: split into
+                    // per-feature submeshes so highlight/hover/select resolve.
+                    (Some(f), true) => {
+                        let fallback = anchor.unwrap_or("");
+                        let owner_of_feature: Vec<String> = f
                             .node_of_feature
                             .iter()
-                            .map(|path| resolve_in_section_map(path, anchor.unwrap_or(""), map))
+                            .map(|path| resolver.resolve(fallback, path))
                             .collect();
-                        let fallback = anchor.unwrap_or("");
-                        let mut tris_by_twin: std::collections::HashMap<String, Vec<usize>> =
+                        let mut tris_by_owner: std::collections::HashMap<String, Vec<usize>> =
                             std::collections::HashMap::new();
                         for (tri, &fid) in f.feature_of_triangle.iter().enumerate() {
                             // Out-of-range id (malformed tile) falls back to the
                             // anchor rather than dropping the triangle (a hole).
-                            let twin = twin_of_feature.get(fid as usize).map(String::as_str).unwrap_or(fallback);
-                            tris_by_twin.entry(twin.to_string()).or_default().push(tri);
+                            let owner = owner_of_feature.get(fid as usize).map(String::as_str).unwrap_or(fallback);
+                            tris_by_owner.entry(owner.to_string()).or_default().push(tri);
                         }
-                        for (twin, tris) in tris_by_twin {
+                        for (owner, tris) in tris_by_owner {
                             commands.spawn((
                                 Mesh3d(meshes.add(build_submesh(&mesh, &tris))),
                                 MeshMaterial3d(mat_handle.clone()),
                                 prim_transform,
                                 ChildOf(tile_root),
-                                TwinMeshGroup { twin_id: twin },
+                                TileOwner { id: owner },
                             ));
                         }
                     }
@@ -1073,13 +1110,13 @@ fn spawn_tile_content(
                     }
                 }
             }
+            #[cfg(feature = "points")]
             DecodedItem::Points { transform, points } => {
+                let handle = renderers.clouds.add(PointCloud { points });
                 let child = commands
                     .spawn((
-                        crate::plugins::point_cloud::cloud_components(
-                            clouds.add(bevy_pointcloud::point_cloud::PointCloud { points }),
-                            shared_point_material,
-                        ),
+                        PointCloud3d(handle),
+                        PointCloudMaterial3d(renderers.point_material.0.clone()),
                         Transform::from_matrix(transform),
                         ChildOf(tile_root),
                     ))
@@ -1088,12 +1125,13 @@ fn spawn_tile_content(
                     commands.entity(child).insert(group.clone());
                 }
             }
+            #[cfg(feature = "splats")]
             DecodedItem::Splat { transform, gaussians } => {
+                let handle = renderers.splats.add(PlanarGaussian3d::from(gaussians));
                 let child = commands
                     .spawn((
-                        crate::plugins::splat::splat_components(splats.add(
-                            bevy_gaussian_splatting::PlanarGaussian3d::from(gaussians),
-                        )),
+                        PlanarGaussian3dHandle(handle),
+                        CloudSettings::default(),
                         Transform::from_matrix(transform),
                         ChildOf(tile_root),
                     ))
@@ -1270,10 +1308,10 @@ fn compact_grafted_subtrees(set: &mut ActiveTileset, frame: u64, grace: u64) -> 
 fn drive_tiles3d(
     config: Res<Tiles3dConfig>,
     channel: Res<Tiles3dChannel>,
-    origin: Res<ProjectOrigin>,
+    origin: Res<EcefOrigin>,
     mut sets: ResMut<Tiles3dSets>,
     mut credits: ResMut<TilesetCredits>,
-    camera: Query<(&Camera, &GlobalTransform, &Projection, &Frustum), With<PanOrbitCamera>>,
+    camera: Query<(&Camera, &GlobalTransform, &Projection, &Frustum), With<Tiles3dCamera>>,
     transforms: Query<&GlobalTransform>,
     mut vis_q: Query<&mut Visibility, With<Tiles3dTile>>,
     mut tile_transforms: Query<&mut Transform, With<Tiles3dTile>>,
@@ -1373,7 +1411,7 @@ fn drive_tiles3d(
                 (m, scale, None)
             }
             SetFrame::Ecef { built } => {
-                let Some(o) = origin.get() else {
+                let Some(o) = origin.world_from_ecef else {
                     // No ENU datum yet — hold the set entirely.
                     continue;
                 };
@@ -1394,7 +1432,7 @@ fn drive_tiles3d(
                     }
                 }
                 (
-                    crate::plugins::spatial_source::enu::world_from_ecef(o),
+                    o,
                     1.0,
                     Some(WGS84_EQUATORIAL_RADIUS_M),
                 )

@@ -42,7 +42,7 @@
 use std::fs;
 use std::path::Path;
 
-use bevy_client::plugins::tiles3d::archive::write_3tz;
+use bevy_3d_tiles::archive::write_3tz;
 
 const OUT_DIR: &str = "assets/fixtures/tiles3d-demo";
 const OUT_3TZ: &str = "assets/fixtures/tiles3d-demo.3tz";
@@ -175,7 +175,7 @@ fn main() {
 /// Georeferenced fixture (see module docs): host tileset with a region root
 /// + external-tileset content; sub tileset with an ENU→ECEF root transform.
 fn gen_geo_fixture(lon: f64, lat: f64, h: f64, out: &str) {
-    use turbotwin_sdk_rs::enu::geodetic_to_ecef;
+    use bevy_3d_tiles::geodesy::geodetic_to_ecef;
 
     let out_dir = Path::new(out);
     fs::create_dir_all(out_dir.join("sub/content")).expect("create geo fixture dirs");

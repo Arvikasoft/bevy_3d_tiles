@@ -1,0 +1,108 @@
+[package]
+name = "bevy_3d_tiles"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "OGC 3D Tiles 1.1 streaming renderer for Bevy — .3tz ranged reader, SSE traversal, glb/b3dm content, KTX2 + meshopt (+ Draco read), ECEF georeferencing. Backend-agnostic (WebGPU + native)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Arvikasoft/TurboTwin"
+keywords = ["bevy", "3d-tiles", "geospatial", "gis", "cesium"]
+categories = ["rendering", "game-development"]
+# NOTE: standalone crate (not a workspace member) for the same reason as
+# bevy-client — the wasm feature surface would break native sibling builds under
+# Cargo feature unification. publish = false until the crates.io step (PR C).
+publish = false
+
+[features]
+default = []
+# Point-cloud tile content (glb POINTS) via the vendored bevy_pointcloud.
+# Heavy renderer — opt-in (the plan's "feature-gate heavy renderers" rule).
+points = ["dep:bevy_pointcloud"]
+# Gaussian-splat tile content (KHR_gaussian_splatting) via bevy_gaussian_splatting.
+splats = ["dep:bevy_gaussian_splatting"]
+
+[dependencies]
+# Bevy 0.18 pinned EXACTLY — mirrors bevy-client's feature list verbatim to
+# guarantee tiles3d compiles unchanged. TODO(follow-up): trim to a minimal
+# render subset (drop default_app / winit / window / picking / x11 — a plugin
+# library doesn't need the app/windowing stack).
+bevy = { version = "=0.18.1", default-features = false, features = [
+    "std",
+    "multi_threaded",
+    "async_executor",
+    "default_app",
+    "default_font",
+    "3d_bevy_render",
+    "bevy_scene",
+    "bevy_state",
+    "bevy_winit",
+    "bevy_window",
+    "bevy_picking",
+    "bevy_log",
+    "ktx2",
+    "jpeg",
+    "zstd_rust",
+    "tonemapping_luts",
+    "webgpu",
+    "x11",
+] }
+
+# Tile GLB decode. Default features OFF; KHR_materials_unlit is REQUIRED for
+# Google P3DT tiles (baked satellite lighting) or the strict gltf crate rejects them.
+gltf = { version = "1.4", default-features = false, features = ["utils", "KHR_materials_unlit"] }
+# 3tz index hashing (MD5 of the normalized path) + DEFLATE for 3tz entries.
+md-5 = "0.10"
+miniz_oxide = "0.8"
+# tileset.json (de)serialization + the GLB/feature JSON side-channels.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Tile-texture decode (KTX2 fallback path).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Cross-thread fetch-task -> ECS bridge.
+crossbeam-channel = "0.5"
+# FetchError / archive errors.
+thiserror = "2"
+
+# Heavy tile-content renderers — optional, gated by the `points` / `splats`
+# features. bevy_pointcloud is vendored in the bevy-client tree (git-only
+# upstream); the crates.io publish step (PR C) will switch this to a git or
+# published dep.
+bevy_pointcloud = { path = "../bevy-client/vendor/bevy_pointcloud", optional = true }
+bevy_gaussian_splatting = { version = "=7.0.2", default-features = false, features = [
+    "buffer_storage",
+    "planar",
+    "sh0",
+    "io_ply",
+    "io_bincode2",
+    "sort_radix",
+    "sort_std",
+    "webgpu",
+], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# Browser HTTP (ranged GETs for .3tz + tile content).
+gloo-net = { version = "0.6", features = ["http"] }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Storage",          # P3DT daily-cap persistence
+    "CacheStorage",     # window.caches()
+    "Cache",            # content-addressed tile cache
+    "Request",
+    "Response",
+    "AbortController",   # cancel out-of-cut tile fetches
+    "AbortSignal",
+    "UrlSearchParams",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# bevy's basis transcoder is C++ (native only; won't build for wasm) — KTX2/UASTC
+# tile textures transcode via it on native, and via a JS shim on wasm.
+bevy = { version = "=0.18.1", default-features = false, features = ["basis-universal"] }
+# Native byte-range source (runs on a worker thread, never inside an async runtime).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+
+[dev-dependencies]
+base64 = "0.22"

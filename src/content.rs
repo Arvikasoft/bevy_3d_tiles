@@ -22,6 +22,16 @@
 //! error rather than fetched — a tile that needs side files defeats the
 //! one-blob range-read design.
 
+// With neither `points` nor `splats`, `DecodedItem` collapses to its single
+// `Mesh` variant, making the `let DecodedItem::Mesh(_) = … else …` filters
+// (the texture-resolve pass + the mesh-extraction tests) irrefutable. Allow it
+// only in that degenerate config; the lint stays active in the normal
+// multi-variant build so a genuinely irrefutable `let…else` is still caught.
+#![cfg_attr(
+    not(any(feature = "points", feature = "splats")),
+    allow(irrefutable_let_patterns)
+)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -30,9 +40,11 @@ use bevy::image::{
     CompressedImageFormats, Image, ImageAddressMode, ImageFilterMode, ImageSampler,
     ImageSamplerDescriptor, ImageType,
 };
-use bevy::math::{DVec3, Mat4, Vec3};
+use bevy::math::{DVec3, Mat4};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
+#[cfg(feature = "splats")]
 use bevy_gaussian_splatting::gaussian::formats::planar_3d::Gaussian3d;
+#[cfg(feature = "points")]
 use bevy_pointcloud::point_cloud::PointCloudData;
 
 use super::draco;
@@ -143,10 +155,12 @@ pub struct DecodedPrimitive {
 pub enum DecodedItem {
     Mesh(Box<DecodedPrimitive>),
     /// `POINTS`-mode primitive (positions + COLOR_0) → vendored point renderer.
+    #[cfg(feature = "points")]
     Points { transform: Mat4, points: Vec<PointCloudData> },
     /// `KHR_gaussian_splatting` primitive → `PlanarGaussian3d` renderer.
     /// Gaussians are in the primitive's local (glTF Y-up) frame; padded to a
     /// multiple of 32 like the crate's own ply path.
+    #[cfg(feature = "splats")]
     Splat { transform: Mat4, gaussians: Vec<Gaussian3d> },
 }
 
@@ -226,6 +240,7 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         <[f64; 3]>::try_from(v).ok().map(DVec3::from_array)
     });
 
+    #[cfg(feature = "splats")]
     if has_splat {
         let items = decode_splat_gltf(&value, bin)?;
         return Ok(DecodedTile { items, rtc_center, copyright });
@@ -349,7 +364,10 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
     }
 
     // Splat tiles bypass the gltf crate entirely (see module docs). The
-    // marker check is a cheap substring scan of the JSON chunk.
+    // marker check is a cheap substring scan of the JSON chunk. Without the
+    // `splats` feature a splat tile falls through to the gltf path below, which
+    // rejects the unknown required extension — that content simply doesn't show.
+    #[cfg(feature = "splats")]
     if memmem(json, b"KHR_gaussian_splatting") {
         let value: serde_json::Value =
             serde_json::from_slice(json).map_err(|e| format!("splat tile json: {e}"))?;
@@ -930,11 +948,13 @@ fn decode_node(
                         &primitive, global, blob, feat, mesh_ix,
                     )?)));
                 }
+                #[cfg(feature = "points")]
                 gltf::mesh::Mode::Points => {
                     out.push(decode_points(&primitive, global, blob)?);
                 }
-                // Lines/strips/fans: nothing renders them — skip quietly so a
-                // mixed-content tile still shows what it can.
+                // Lines/strips/fans (and POINTS without the `points` feature):
+                // nothing renders them — skip quietly so a mixed-content tile
+                // still shows what it can.
                 _ => continue,
             }
         }
@@ -1009,6 +1029,7 @@ fn decode_primitive(
 /// Y-up content frame (the tile entity transform places them); COLOR_0 when
 /// present, white otherwise. `point_size: -1.0` = the shared material's
 /// screen-space size, matching the whole-file LAZ loader.
+#[cfg(feature = "points")]
 fn decode_points(
     primitive: &gltf::Primitive<'_>,
     transform: Mat4,
@@ -1021,7 +1042,7 @@ fn decode_points(
     let mut colors = reader.read_colors(0).map(|c| c.into_rgba_f32());
     let points: Vec<PointCloudData> = positions
         .map(|p| PointCloudData {
-            position: Vec3::from(p),
+            position: bevy::math::Vec3::from(p),
             point_size: -1.0,
             color: colors
                 .as_mut()
@@ -1128,17 +1149,23 @@ fn decode_material(
 // ── Raw KHR_gaussian_splatting decode ────────────────────────────────────────
 
 /// Spec attribute names (KHR_gaussian_splatting RC).
+#[cfg(feature = "splats")]
 const ATTR_ROTATION: &str = "KHR_gaussian_splatting:ROTATION";
+#[cfg(feature = "splats")]
 const ATTR_SCALE: &str = "KHR_gaussian_splatting:SCALE";
+#[cfg(feature = "splats")]
 const ATTR_OPACITY: &str = "KHR_gaussian_splatting:OPACITY";
+#[cfg(feature = "splats")]
 const ATTR_SH0: &str = "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0";
 
 /// `SH_0` basis constant: `color = 0.5 + C0 × f_dc` (and its inverse for the
 /// COLOR_0 fallback).
+#[cfg(feature = "splats")]
 const SH_C0: f32 = 0.282_095;
 
 /// Decode every splat primitive in a raw glTF document. Node transforms are
 /// honored (matrix or TRS); non-splat primitives in the same file are skipped.
+#[cfg(feature = "splats")]
 fn decode_splat_gltf(
     json: &serde_json::Value,
     bin: Option<&[u8]>,
@@ -1155,6 +1182,7 @@ fn decode_splat_gltf(
     Ok(out)
 }
 
+#[cfg(feature = "splats")]
 fn decode_splat_node(
     json: &serde_json::Value,
     bin: Option<&[u8]>,
@@ -1192,6 +1220,7 @@ fn decode_splat_node(
 }
 
 /// A raw glTF node's local transform: `matrix` (column-major) or TRS.
+#[cfg(feature = "splats")]
 fn node_transform(node: &serde_json::Value) -> Mat4 {
     if let Some(m) = node["matrix"].as_array() {
         let vals: Vec<f32> = m.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
@@ -1225,6 +1254,7 @@ fn node_transform(node: &serde_json::Value) -> Mat4 {
     )
 }
 
+#[cfg(feature = "splats")]
 fn decode_splat_primitive(
     json: &serde_json::Value,
     bin: Option<&[u8]>,
@@ -1589,6 +1619,7 @@ mod tests {
 
     /// POINTS-mode GLB: positions + u8-normalized COLOR_0 → point items in
     /// the glTF frame with material-driven sizes.
+    #[cfg(feature = "points")]
     #[test]
     fn decodes_points_primitive() {
         let positions: [[f32; 3]; 2] = [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]];
@@ -1627,7 +1658,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         let DecodedItem::Points { points, .. } = &items[0] else { panic!("expected points") };
         assert_eq!(points.len(), 2);
-        assert_eq!(points[0].position, Vec3::new(0.0, 1.0, 2.0));
+        assert_eq!(points[0].position, bevy::math::Vec3::new(0.0, 1.0, 2.0));
         assert_eq!(points[0].point_size, -1.0);
         assert!((points[0].color[0] - 1.0).abs() < 1e-6);
         assert!((points[1].color[1] - 1.0).abs() < 1e-6);
@@ -1636,6 +1667,7 @@ mod tests {
     /// KHR_gaussian_splatting GLB (float accessors, like our tiler emits):
     /// bypasses the gltf crate, maps quaternions xyzw→wxyz, keeps linear
     /// scale/opacity, reads SH degree 0, pads to 32.
+    #[cfg(feature = "splats")]
     #[test]
     fn decodes_splat_primitive_via_raw_path() {
         let positions: [[f32; 3]; 2] = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
@@ -1729,7 +1761,7 @@ mod tests {
         let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
 
         // Node translation [10,0,0] carried onto the primitive transform.
-        assert_eq!(p.transform.w_axis.truncate(), Vec3::new(10.0, 0.0, 0.0));
+        assert_eq!(p.transform.w_axis.truncate(), bevy::math::Vec3::new(10.0, 0.0, 0.0));
 
         // Positions are byte-identical (lossless meshopt vertex codec).
         let pos = p

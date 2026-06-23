@@ -5,14 +5,13 @@
 //! box/sphere volumes under ECEF tile transforms. Trees for those tilesets
 //! are built **in the ECEF frame** ([`super::traversal::TreeFrame::Ecef`]):
 //! volumes stay planetary-magnitude f64, and the per-frame placement into the
-//! project's ENU world happens in `drive_tiles3d` via
-//! [`crate::plugins::spatial_source::enu::world_from_ecef`] — composed in f64,
-//! cast to f32 only after the magnitudes cancel (the altitude-anchored-origin
-//! jitter lesson).
+//! host's world frame happens in `drive_tiles3d` against the host-supplied
+//! [`crate::EcefOrigin`] transform — composed in f64, cast to f32 only after
+//! the magnitudes cancel (the altitude-anchored-origin jitter lesson).
 
 use bevy::math::DVec3;
 
-use turbotwin_sdk_rs::enu::{geodetic_to_ecef, WGS84_EQUATORIAL_RADIUS_M};
+use super::geodesy::{geodetic_to_ecef, WGS84_EQUATORIAL_RADIUS_M};
 
 use super::schema::{self, VolumeKind};
 use super::traversal::WorldVolume;
