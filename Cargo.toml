@@ -64,9 +64,20 @@ crossbeam-channel = "0.5"
 thiserror = "2"
 
 # Heavy tile-content renderers — optional, gated by the `points` / `splats`
-# features. bevy_pointcloud is vendored in the bevy-client tree (git-only
-# upstream); the crates.io publish step (PR C) will switch this to a git or
-# published dep.
+# features. `bevy_gaussian_splatting` (below) is a crates.io dep, so the
+# `splats` feature is already publish-ready.
+#
+# `bevy_pointcloud` is the ONE thing blocking `cargo publish` (verified:
+# `cargo package` fails with "dependency bevy_pointcloud does not specify a
+# version"). It's a vendored fork (`bevy-client/vendor/`, rev 4c16ead of
+# github.com/rlamarche/bevy_pointcloud, MIT) — and crates.io forbids BOTH path
+# AND git deps in published crates, so PR C must EITHER (a) publish the fork to
+# crates.io and switch this to `{ version = "…", optional = true }`, OR (b) drop
+# the `points` feature from the published crate (mesh + splats only; points stays
+# monorepo-internal). Note: whichever source the published crate uses,
+# bevy-client must use the SAME one (it currently uses the `vendor/` path) or
+# Cargo sees two distinct `bevy_pointcloud` crates and the `PointTileMaterial` /
+# `Assets<PointCloud>` wiring fails to typecheck — use `[patch]` if needed.
 bevy_pointcloud = { path = "../bevy-client/vendor/bevy_pointcloud", optional = true }
 bevy_gaussian_splatting = { version = "=7.0.2", default-features = false, features = [
     "buffer_storage",

@@ -199,26 +199,6 @@ pub struct Tiles3dTile {
     pub tile: usize,
 }
 
-/// Per-feature picking table — the original T8 slice-C mechanism (click only).
-///
-/// SUPERSEDED and no longer attached: `spawn_tile_content` now splits each
-/// feature tile into per-section-twin submeshes, each `TwinMeshGroup`-tagged
-/// with its resolved twin, so click + hover + outline all work through the
-/// existing whole-file machinery. The component + the `selection` override that
-/// reads it are dead (harmless — the override falls through to the submesh's
-/// `TwinMeshGroup`) and can be removed in a cleanup pass.
-#[derive(Component, Clone)]
-pub struct TileFeatureTable {
-    /// featureId per triangle (index-buffer order; the pick raycast's triangle
-    /// ordinal indexes straight in).
-    pub feature_of_triangle: Vec<u32>,
-    /// featureId → source-node path (shared across the tile's primitives).
-    pub node_of_feature: std::sync::Arc<Vec<String>>,
-    /// The tileset's owning twin — the anchor the node→twin resolution is
-    /// scoped to (and the fallback when no path segment matches a section).
-    pub anchor_twin: String,
-}
-
 /// Per-tile load slot.
 #[derive(Debug, Clone, Copy)]
 enum TileSlot {
@@ -281,7 +261,7 @@ pub struct ActiveTileset {
     /// Anchor entity when attached via D6 (None = world-anchored dev set).
     anchor: Option<Entity>,
     /// Owning entity id ([`TileOwner`] tagging + placeholder clearing).
-    twin_id: Option<String>,
+    owner_id: Option<String>,
     /// Whether the anchor's placeholder cube has been stripped yet.
     placeholder_cleared: bool,
     /// Last logged render-cut shape `(tiles, min_depth, max_depth)` —
@@ -402,7 +382,7 @@ impl Tiles3dSets {
 struct AttachTarget {
     anchor: Entity,
     local: Transform,
-    twin_id: Option<String>,
+    owner_id: Option<String>,
 }
 
 /// What one tile's content fetch produced.
@@ -552,7 +532,7 @@ fn apply_attach_detach(
             Some(AttachTarget {
                 anchor: msg.anchor,
                 local: msg.local,
-                twin_id: msg.owner_id.clone(),
+                owner_id: msg.owner_id.clone(),
             }),
             channel.tx.clone(),
         );
@@ -792,7 +772,7 @@ fn receive_tiles3d(
                                 compact_high_water: n,
                                 root_entity,
                                 anchor: attach.as_ref().map(|a| a.anchor),
-                                twin_id: attach.and_then(|a| a.twin_id),
+                                owner_id: attach.and_then(|a| a.owner_id),
                                 placeholder_cleared: false,
                                 last_cut: None,
                                 frame,
@@ -1005,7 +985,14 @@ struct ContentRenderers<'a> {
 /// render cut flips the root's visibility; children inherit. Owner-anchored
 /// sets tag content with [`TileOwner`] so the host's selection/highlight/focus
 /// treat tiles like any other owned geometry.
-#[allow(clippy::too_many_arguments, unused_variables)]
+#[allow(clippy::too_many_arguments)]
+// `renderers` is only read by the cfg-gated point/splat arms; with neither
+// feature it's unused. Scope the allow to that config so a genuinely unused
+// param in the always-on mesh path is still caught.
+#[cfg_attr(
+    not(any(feature = "points", feature = "splats")),
+    allow(unused_variables)
+)]
 fn spawn_tile_content(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -1029,7 +1016,7 @@ fn spawn_tile_content(
             Name::new(format!("Tiles3dTile({} #{tile})", set.label)),
         ))
         .id();
-    let anchor = set.twin_id.as_deref();
+    let anchor = set.owner_id.as_deref();
     let anchor_group = anchor.map(|id| TileOwner { id: id.to_string() });
     // T8 highlight: a feature tile under an owner splits into per-feature
     // submeshes, each tagged with its resolved owner id via the host
@@ -1073,11 +1060,12 @@ fn spawn_tile_content(
                     // per-feature submeshes so highlight/hover/select resolve.
                     (Some(f), true) => {
                         let fallback = anchor.unwrap_or("");
-                        let owner_of_feature: Vec<String> = f
-                            .node_of_feature
-                            .iter()
-                            .map(|path| resolver.resolve(fallback, path))
-                            .collect();
+                        // Resolve ALL of the tile's feature paths in one call so
+                        // the host builds its per-anchor lookup once per tile,
+                        // not once per feature.
+                        let paths: Vec<&str> =
+                            f.node_of_feature.iter().map(String::as_str).collect();
+                        let owner_of_feature = resolver.resolve(fallback, &paths);
                         let mut tris_by_owner: std::collections::HashMap<String, Vec<usize>> =
                             std::collections::HashMap::new();
                         for (tri, &fid) in f.feature_of_triangle.iter().enumerate() {
@@ -1539,7 +1527,7 @@ fn drive_tiles3d(
         // First painted cut: strip the anchor's placeholder cube geometry
         // (same contract as `bind_spawned_scenes` for whole-file scenes —
         // remove `Mesh3d`, keep the entity as the transform anchor).
-        if !set.placeholder_cleared && !sel.render.is_empty() && set.twin_id.is_some() {
+        if !set.placeholder_cleared && !sel.render.is_empty() && set.owner_id.is_some() {
             if let Some(anchor) = set.anchor
                 && let Ok(mut e) = commands.get_entity(anchor)
             {

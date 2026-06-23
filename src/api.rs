@@ -40,20 +40,29 @@ pub struct TileOwner {
 
 /// Optional per-feature resolver for tiles that carry `EXT_mesh_features`.
 ///
-/// Given the owning tile's id (`anchor`) and a tile node path, returns the
-/// sub-owner id to tag that feature's triangles with. `None` (the default) → no
-/// feature splitting: every triangle of a feature tile gets the anchor id. Lets
-/// the host resolve features to sub-entities (TurboTwin: sub-twins via its
-/// section map) without the crate knowing anything about the host's domain.
+/// Given the owning tile's id (`anchor`) and **all** of a tile's feature node
+/// paths, returns one sub-owner id per path to tag that feature's triangles
+/// with. `None` (the default) → no feature splitting: every feature gets the
+/// anchor id. Lets the host resolve features to sub-entities (TurboTwin:
+/// sub-twins via its section map) without the crate knowing anything about the
+/// host's domain.
+///
+/// Resolving a whole tile's paths in **one** call is deliberate: it lets the
+/// host build any per-anchor lookup (e.g. the section map) ONCE per tile and
+/// reuse it across the tile's many features, instead of rebuilding it per
+/// feature.
 #[derive(Resource, Default, Clone)]
-pub struct TileFeatureResolver(pub Option<Arc<dyn Fn(&str, &str) -> String + Send + Sync>>);
+pub struct TileFeatureResolver(
+    pub Option<Arc<dyn Fn(&str, &[&str]) -> Vec<String> + Send + Sync>>,
+);
 
 impl TileFeatureResolver {
-    /// Resolve a feature, or fall back to the anchor id when no resolver is set.
-    pub fn resolve(&self, anchor: &str, node_path: &str) -> String {
+    /// Resolve every feature path of one tile, or fall back to the anchor id
+    /// for each path when no resolver is set.
+    pub fn resolve(&self, anchor: &str, node_paths: &[&str]) -> Vec<String> {
         match &self.0 {
-            Some(f) => f(anchor, node_path),
-            None => anchor.to_string(),
+            Some(f) => f(anchor, node_paths),
+            None => node_paths.iter().map(|_| anchor.to_string()).collect(),
         }
     }
 }
