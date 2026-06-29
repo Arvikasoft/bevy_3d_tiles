@@ -322,28 +322,7 @@ pub struct Tiles3dSets {
     next_generation: u64,
 }
 
-/// Snapshot for the debug overlay / tests.
-pub struct Tiles3dDebug {
-    pub tilesets: usize,
-    pub resident: usize,
-    pub in_flight: usize,
-}
-
 impl Tiles3dSets {
-    pub fn debug_summary(&self) -> Tiles3dDebug {
-        let (mut resident, mut in_flight) = (0, 0);
-        for set in &self.sets {
-            for slot in &set.slots {
-                match slot {
-                    TileSlot::Ready { .. } => resident += 1,
-                    TileSlot::InFlight { .. } => in_flight += 1,
-                    _ => {}
-                }
-            }
-        }
-        Tiles3dDebug { tilesets: self.sets.len(), resident, in_flight }
-    }
-
     /// Whether `anchor` is taken: streaming, opening, or terminally failed.
     /// The asset loader treats `true` as "nothing to do this frame".
     pub fn has_anchor(&self, anchor: Entity) -> bool {

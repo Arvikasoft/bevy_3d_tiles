@@ -166,12 +166,6 @@ pub struct TileNode {
     pub world_from_tile: DMat4,
 }
 
-impl TileNode {
-    pub fn has_content(&self) -> bool {
-        self.content_uri.is_some()
-    }
-}
-
 /// Flattened tileset tree, ready for per-frame traversal.
 #[derive(Debug, Clone, Default)]
 pub struct TileTree {

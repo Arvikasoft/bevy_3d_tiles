@@ -8,7 +8,7 @@
 //!   crossbeam channel.
 //! * **Range requests against a single blob URL** — the `.3tz` reader
 //!   ([`super::archive`]) issues byte-range reads ([`ByteSource::read`]);
-//!   exploded tilesets fetch whole entries ([`ByteSource::read_all`] /
+//!   exploded tilesets fetch whole entries ([`ByteSource::read_all_abortable`] /
 //!   [`TilesetSource::Exploded`]).
 //! * Native gets a real implementation (filesystem + blocking reqwest on a
 //!   worker thread) instead of basemap's fail-fast stub, because the T0 gate
@@ -242,12 +242,8 @@ impl ByteSource {
         }
     }
 
-    /// Read the whole source (exploded-tileset entries; plain GET on HTTP).
-    pub async fn read_all(&self) -> Result<Vec<u8>, FetchError> {
-        self.read_all_abortable(None).await
-    }
-
-    /// [`Self::read_all`] with an optional cancellation token.
+    /// Read the whole source (exploded-tileset entries; plain GET on HTTP),
+    /// with an optional cancellation token.
     pub async fn read_all_abortable(
         &self,
         abort: Option<&AbortHandle>,
