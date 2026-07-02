@@ -1,3 +1,7 @@
 [toolchain]
 channel = "1.95.0"
 targets = ["wasm32-unknown-unknown"]
+# CI installs components for its default toolchain, but this file overrides the
+# channel at cargo time — declare them here so rustup provisions the pinned
+# toolchain completely (fmt/clippy jobs failed without this).
+components = ["rustfmt", "clippy"]
