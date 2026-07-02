@@ -29,6 +29,16 @@
 //! frame: the camera is pulled into that frame per set, which keeps SSE exact
 //! under rigid/uniform anchor transforms without rebuilding tree volumes.
 //! Dev-trigger tilesets (`TT_TILES3D=…` / `?tiles3d=…`) stay world-anchored.
+//!
+//! ## Error convention (public SDK surface)
+//!
+//! Public fallible APIs return `thiserror` types, never `String`/`anyhow`:
+//! [`fetch::FetchError`] (with cancellation as the distinct
+//! [`fetch::FetchError::Aborted`] variant — callers treat an abort differently
+//! from a failure), [`archive::ArchiveError`], and
+//! [`content::DecodeError`] (staged: permanent content failures vs
+//! environmental transcoder-shim failures). Internal helpers may pass plain
+//! `String` messages; the typed boundary is the public function signature.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1585,7 +1595,8 @@ fn drive_tiles3d(
                     }
                     Ok(bytes) => content::decode_tile(&bytes, georeferenced)
                         .await
-                        .map(|tile| TileOutput::Content(Box::new(tile))),
+                        .map(|tile| TileOutput::Content(Box::new(tile)))
+                        .map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
                 };
                 fetch::unregister_abort(generation);
