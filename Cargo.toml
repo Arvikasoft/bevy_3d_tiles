@@ -9,11 +9,8 @@ repository = "https://github.com/Arvikasoft/bevy_3d_tiles"
 readme = "README.md"
 keywords = ["bevy", "3d-tiles", "geospatial", "gis", "cesium"]
 categories = ["rendering", "game-development"]
-# NOTE: standalone crate (not a workspace member) for the same reason as
-# bevy-client — the wasm feature surface would break native sibling builds under
-# Cargo feature unification. publish = false until the crates.io step (PR C);
-# `cargo package` is kept green in the meantime.
-publish = false
+# wasm/ (browser shims + libktx) and CI ship in the repo, not the package.
+exclude = ["wasm/", ".github/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -66,12 +63,8 @@ thiserror = "2"
 # publish-ready. `bevy_pointcloud_x` is our published fork of
 # rlamarche/bevy_pointcloud (upstream is git-only — its potree/copc features
 # carry git deps crates.io forbids); the dep is ALIASED to `bevy_pointcloud`
-# so source imports stay upstream-compatible. The `path` builds the monorepo
-# against the vendored copy (`bevy-client/vendor/`) and is stripped on
-# publish, where the `version` takes over. bevy-client MUST reference the
-# same package+path or Cargo sees two distinct crates and the
-# `PointTileMaterial` / `Assets<PointCloud>` wiring fails to typecheck.
-bevy_pointcloud = { package = "bevy_pointcloud_x", version = "0.1.0", path = "../bevy-client/vendor/bevy_pointcloud", optional = true }
+# so source imports stay upstream-compatible.
+bevy_pointcloud = { package = "bevy_pointcloud_x", version = "0.1.0", optional = true }
 bevy_gaussian_splatting = { version = "7", default-features = false, features = [
     "buffer_storage",
     "planar",

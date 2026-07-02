@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt · clippy · test · wasm · features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy (native, all features)
+        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: clippy (wasm32, all features)
+        run: cargo clippy --target wasm32-unknown-unknown --all-features -- -D warnings
+      - name: test (all features)
+        run: cargo test --all-features
+      - name: feature matrix
+        run: |
+          cargo check --no-default-features
+          cargo check --features points
+          cargo check --features splats
+          cargo check --target wasm32-unknown-unknown --features points,splats
+      - name: package
+        run: cargo package --no-verify

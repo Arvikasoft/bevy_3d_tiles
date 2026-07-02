@@ -1,0 +1,27 @@
+# Publishes to crates.io via Trusted Publishing (OIDC — no long-lived token).
+# One-time setup on crates.io (crate Settings → Trusted Publishing): authorize
+# this repository + the `release` environment for `bevy_3d_tiles`.
+# Release flow: bump version in Cargo.toml → tag `vX.Y.Z` → push the tag.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
