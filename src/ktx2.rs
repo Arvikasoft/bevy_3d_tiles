@@ -16,19 +16,23 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
+use crate::content::DecodeError;
+
 /// Transcode a KTX2 base-color texture to a bevy `Image`. `want_bc` requests
 /// BC7 (desktop WebGPU); otherwise RGBA8. Both are the sRGB variants — tile
 /// base color is always sRGB.
-pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, String> {
-    fn err(label: &'static str) -> impl Fn(JsValue) -> String {
-        move |e| format!("{label}: {e:?}")
+pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, DecodeError> {
+    fn err(label: &'static str) -> impl Fn(JsValue) -> DecodeError {
+        move |e| DecodeError::ktx2(format!("{label}: {e:?}"))
     }
 
-    let window = web_sys::window().ok_or("no window")?;
+    let window = web_sys::window().ok_or_else(|| DecodeError::ktx2("no window"))?;
     let func = js_sys::Reflect::get(&window, &JsValue::from_str("__tt_ktx2_transcode"))
         .map_err(err("ktx2 shim lookup"))?;
     if !func.is_function() {
-        return Err("__tt_ktx2_transcode shim missing — index.html out of date?".into());
+        return Err(DecodeError::ktx2(
+            "__tt_ktx2_transcode shim missing — index.html out of date?",
+        ));
     }
     let func = js_sys::Function::from(func);
 
@@ -43,11 +47,17 @@ pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, String> {
 
     let get = |key: &str| {
         js_sys::Reflect::get(&result, &JsValue::from_str(key))
-            .map_err(|e| format!("ktx2 result missing {key}: {e:?}"))
+            .map_err(|e| DecodeError::ktx2(format!("ktx2 result missing {key}: {e:?}")))
     };
-    let format = get("format")?.as_string().ok_or("ktx2 format not a string")?;
-    let width = get("width")?.as_f64().ok_or("ktx2 width not a number")? as u32;
-    let height = get("height")?.as_f64().ok_or("ktx2 height not a number")? as u32;
+    let format = get("format")?
+        .as_string()
+        .ok_or_else(|| DecodeError::ktx2("ktx2 format not a string"))?;
+    let width = get("width")?
+        .as_f64()
+        .ok_or_else(|| DecodeError::ktx2("ktx2 width not a number"))? as u32;
+    let height = get("height")?
+        .as_f64()
+        .ok_or_else(|| DecodeError::ktx2("ktx2 height not a number"))? as u32;
     // `levels` is the mip count; `data` is every level concatenated (base → 1×1)
     // in GPU-upload order. Older shims omit it ⇒ single level.
     let levels = get("levels").ok().and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0) as u32;
@@ -56,7 +66,7 @@ pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, String> {
     let tex_format = match format.as_str() {
         "bc7" => TextureFormat::Bc7RgbaUnormSrgb,
         "rgba8" => TextureFormat::Rgba8UnormSrgb,
-        other => return Err(format!("ktx2 shim returned unknown format {other}")),
+        other => return Err(DecodeError::ktx2(format!("ktx2 shim returned unknown format {other}"))),
     };
     // `new_uninit` + manual data avoids `Image::new`'s single-mip length
     // debug-assert (and its `pixel_size()` call, which panics on block formats).

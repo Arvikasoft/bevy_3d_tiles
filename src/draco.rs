@@ -10,6 +10,8 @@
 //! show everything else). Swap-in candidate when it matures: `draco-oxide`'s
 //! pure-Rust decoder (reearth/draco-oxide PR #19).
 
+use crate::content::DecodeError;
+
 /// One decoded Draco mesh: triangle indices + dequantized float attributes,
 /// in the same order as the requested glTF attribute unique ids.
 pub struct DracoMesh {
@@ -19,19 +21,21 @@ pub struct DracoMesh {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, String> {
+pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, DecodeError> {
     use wasm_bindgen::JsValue;
     use wasm_bindgen_futures::JsFuture;
 
-    fn err(label: &'static str) -> impl Fn(JsValue) -> String {
-        move |e| format!("{label}: {e:?}")
+    fn err(label: &'static str) -> impl Fn(JsValue) -> DecodeError {
+        move |e| DecodeError::draco(format!("{label}: {e:?}"))
     }
 
-    let window = web_sys::window().ok_or("no window")?;
+    let window = web_sys::window().ok_or_else(|| DecodeError::draco("no window"))?;
     let func = js_sys::Reflect::get(&window, &JsValue::from_str("__tt_draco_decode"))
         .map_err(err("draco shim lookup"))?;
     if !func.is_function() {
-        return Err("__tt_draco_decode shim missing — index.html out of date?".into());
+        return Err(DecodeError::draco(
+            "__tt_draco_decode shim missing — index.html out of date?",
+        ));
     }
     let func = js_sys::Function::from(func);
 
@@ -48,7 +52,7 @@ pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, St
 
     let get = |obj: &JsValue, key: &str| {
         js_sys::Reflect::get(obj, &JsValue::from_str(key))
-            .map_err(|e| format!("draco result missing {key}: {e:?}"))
+            .map_err(|e| DecodeError::draco(format!("draco result missing {key}: {e:?}")))
     };
     let indices = js_sys::Uint32Array::new(&get(&result, "indices")?).to_vec();
     let attrs_js = js_sys::Array::from(&get(&result, "attributes")?);
@@ -56,10 +60,11 @@ pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, St
     for entry in attrs_js.iter() {
         let id = get(&entry, "id")?
             .as_f64()
-            .ok_or("draco attribute id not a number")? as u32;
+            .ok_or_else(|| DecodeError::draco("draco attribute id not a number"))? as u32;
         let components = get(&entry, "components")?
             .as_f64()
-            .ok_or("draco attribute components not a number")? as usize;
+            .ok_or_else(|| DecodeError::draco("draco attribute components not a number"))?
+            as usize;
         let data = js_sys::Float32Array::new(&get(&entry, "data")?).to_vec();
         attributes.push((id, components, data));
     }
@@ -67,8 +72,9 @@ pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, St
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub async fn decode(_compressed: &[u8], _attr_ids: &[u32]) -> Result<DracoMesh, String> {
-    Err("Draco-compressed tile content needs the browser decoder — \
-         render this tileset in the wasm viewer (native P3DT decode is not supported)"
-        .into())
+pub async fn decode(_compressed: &[u8], _attr_ids: &[u32]) -> Result<DracoMesh, DecodeError> {
+    Err(DecodeError::draco(
+        "Draco-compressed tile content needs the browser decoder — \
+         render this tileset in the wasm viewer (native P3DT decode is not supported)",
+    ))
 }

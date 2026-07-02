@@ -68,11 +68,73 @@ fn supported_formats() -> CompressedImageFormats {
     SUPPORTED_FORMATS.get().copied().unwrap_or(CompressedImageFormats::NONE)
 }
 
+/// Typed failure surface of tile-content decoding — the error of
+/// [`decode_tile`] / [`decode_glb`] and the draco/ktx2 shim modules.
+///
+/// [`DecodeStage`] carries the one distinction a caller can act on:
+/// [`DecodeStage::Content`] is a permanent parse/structure failure for these
+/// bytes (retrying cannot succeed), while the shim stages (`Draco`/`Ktx2`/
+/// `Meshopt`) are transcoder paths whose availability is environmental
+/// (missing JS shim, no GPU block format). Internal helpers keep plain
+/// `String` messages; the type is applied at the public boundaries — via
+/// `From<String>`/`From<&str>` (stage = `Content`) or the per-stage
+/// constructors.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{stage:?} decode: {message}")]
+pub struct DecodeError {
+    pub stage: DecodeStage,
+    pub message: String,
+}
+
+/// Which decode stage a [`DecodeError`] came from. See [`DecodeError`] for the
+/// permanent-vs-environmental reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStage {
+    /// GLB/glTF/JSON structure or unsupported content — permanent for these bytes.
+    Content,
+    /// The Draco decoder shim (`__tt_draco_decode`) or its output shape.
+    Draco,
+    /// KTX2/Basis transcode (JS shim on wasm; bevy's transcoder on native).
+    Ktx2,
+    /// `EXT_meshopt_compression` CPU decode.
+    Meshopt,
+}
+
+impl DecodeError {
+    pub fn new(stage: DecodeStage, message: impl Into<String>) -> Self {
+        Self { stage, message: message.into() }
+    }
+
+    pub(crate) fn draco(message: impl Into<String>) -> Self {
+        Self::new(DecodeStage::Draco, message)
+    }
+
+    pub(crate) fn ktx2(message: impl Into<String>) -> Self {
+        Self::new(DecodeStage::Ktx2, message)
+    }
+
+    pub(crate) fn meshopt(message: impl Into<String>) -> Self {
+        Self::new(DecodeStage::Meshopt, message)
+    }
+}
+
+impl From<String> for DecodeError {
+    fn from(message: String) -> Self {
+        Self::new(DecodeStage::Content, message)
+    }
+}
+
+impl From<&str> for DecodeError {
+    fn from(message: &str) -> Self {
+        Self::new(DecodeStage::Content, message)
+    }
+}
+
 /// Resolve deferred KTX2 base-color textures (T7): transcode each pending
 /// `image/ktx2` payload to a GPU `Image`. Async because the transcoder is a JS
 /// shim on wasm; on native it's bevy's basis transcoder. A failed transcode
 /// degrades cleanly to the base-color factor (untextured) — never fatal.
-async fn resolve_pending_textures(items: &mut [DecodedItem]) -> Result<(), String> {
+async fn resolve_pending_textures(items: &mut [DecodedItem]) {
     for item in items.iter_mut() {
         let DecodedItem::Mesh(p) = item else { continue };
         let Some(bytes) = p.material.base_color_ktx2.take() else { continue };
@@ -83,16 +145,15 @@ async fn resolve_pending_textures(items: &mut [DecodedItem]) -> Result<(), Strin
                 img.sampler = ImageSampler::Descriptor(p.material.base_color_sampler.clone());
                 p.material.base_color_image = Some(img);
             }
-            Err(e) => warn_ktx2_once(&e),
+            Err(e) => warn_ktx2_once(&e.to_string()),
         }
     }
-    Ok(())
 }
 
 /// wasm: transcode via the `__tt_ktx2_transcode` shim (KTX-Software libktx),
 /// targeting BC7 when the adapter supports it, else RGBA8.
 #[cfg(target_arch = "wasm32")]
-async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, String> {
+async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, DecodeError> {
     let want_bc = supported_formats().contains(CompressedImageFormats::BC);
     super::ktx2::transcode(bytes, want_bc).await
 }
@@ -101,9 +162,9 @@ async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, String> {
 /// native adapter has a block format (llvmpipe included); bevy 0.18's UASTC →
 /// uncompressed-RGBA path is broken, so require one rather than hit it.
 #[cfg(not(target_arch = "wasm32"))]
-async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, String> {
+async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, DecodeError> {
     if supported_formats() == CompressedImageFormats::NONE {
-        return Err("no GPU block format for KTX2 transcode".into());
+        return Err(DecodeError::ktx2("no GPU block format for KTX2 transcode"));
     }
     Image::from_buffer(
         bytes,
@@ -113,7 +174,7 @@ async fn transcode_ktx2(bytes: &[u8]) -> Result<Image, String> {
         ImageSampler::Default,
         RenderAssetUsages::RENDER_WORLD,
     )
-    .map_err(|e| format!("ktx2 native decode: {e}"))
+    .map_err(|e| DecodeError::ktx2(format!("ktx2 native decode: {e}")))
 }
 
 /// One-time warning when a KTX2 tile texture can't be transcoded; per-tile spam
@@ -221,14 +282,14 @@ pub struct DecodedTile {
 /// path. Async only for the Draco decoder round-trip; plain tiles never
 /// yield. `georeferenced` forces the JSON scan — ECEF-tree content can carry
 /// planetary node transforms with no marker string to cheaply detect.
-pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTile, String> {
+pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTile, DecodeError> {
     let (json, bin) = split_glb(bytes)?;
     let has_splat = memmem(json, b"KHR_gaussian_splatting");
     let has_draco = memmem(json, b"KHR_draco_mesh_compression");
     let has_rtc = memmem(json, b"CESIUM_RTC");
     if !(georeferenced || has_splat || has_draco || has_rtc || memmem(json, b"copyright")) {
         let mut items = decode_glb(bytes)?;
-        resolve_pending_textures(&mut items).await?;
+        resolve_pending_textures(&mut items).await;
         return Ok(DecodedTile { items, rtc_center: None, copyright: None });
     }
 
@@ -264,7 +325,7 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
     } else {
         decode_glb(bytes)?
     };
-    resolve_pending_textures(&mut items).await?;
+    resolve_pending_textures(&mut items).await;
     Ok(DecodedTile { items, rtc_center, copyright })
 }
 
@@ -331,7 +392,7 @@ fn extract_planetary_root_offset(json: &mut serde_json::Value) -> Option<DVec3> 
 }
 
 /// Decode a GLB (or self-contained glTF JSON) tile into renderable items.
-pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
+pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, DecodeError> {
     let (json, bin) = split_glb(bytes)?;
 
     // EXT_meshopt_compression (T6/D12 — what our mesh tiler emits, and POINTS
@@ -343,7 +404,7 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
     if memmem(json, b"EXT_meshopt_compression") {
         let mut value: serde_json::Value =
             serde_json::from_slice(json).map_err(|e| format!("meshopt tile json: {e}"))?;
-        let vanilla = preprocess_meshopt(&mut value, bin)?;
+        let vanilla = preprocess_meshopt(&mut value, bin).map_err(DecodeError::meshopt)?;
         return decode_glb(&vanilla);
     }
 
@@ -371,7 +432,7 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, String> {
     if memmem(json, b"KHR_gaussian_splatting") {
         let value: serde_json::Value =
             serde_json::from_slice(json).map_err(|e| format!("splat tile json: {e}"))?;
-        return decode_splat_gltf(&value, bin);
+        return decode_splat_gltf(&value, bin).map_err(DecodeError::from);
     }
 
     let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| {
@@ -602,7 +663,7 @@ fn buffer_view_slice<'b>(
 async fn preprocess_glb(
     json: &mut serde_json::Value,
     bin: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, DecodeError> {
     let prims = find_draco_prims(json);
     let mut decoded = Vec::with_capacity(prims.len());
     for prim in &prims {
@@ -610,7 +671,7 @@ async fn preprocess_glb(
         let ids: Vec<u32> = prim.attributes.iter().map(|(_, id)| *id).collect();
         decoded.push(draco::decode(compressed, &ids).await?);
     }
-    splice_glb(json, bin, &prims, decoded)
+    Ok(splice_glb(json, bin, &prims, decoded)?)
 }
 
 /// The synchronous splice half of [`preprocess_glb`] (testable without a
