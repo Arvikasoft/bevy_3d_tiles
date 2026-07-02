@@ -9,6 +9,10 @@ Extracted from [TurboTwin](https://turbotwin.cloud)'s production digital-twin
 viewer, where it streams multi-hundred-MB site meshes, LiDAR point clouds,
 and gaussian-splat captures in the browser.
 
+**Community:** [Discord — #bevy-3d-tiles](https://discord.gg/SPqnj4pdAE) for
+questions and dev chat · [GitHub issues](https://github.com/Arvikasoft/bevy_3d_tiles/issues)
+for bugs and feature requests.
+
 ## What it does
 
 - **3D Tiles 1.1 traversal** — per-tile `geometricError` screen-space-error
