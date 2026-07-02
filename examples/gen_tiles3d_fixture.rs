@@ -66,7 +66,10 @@ fn main() {
         let lon: f64 = args[at + 1].parse().expect("--geo <lon> <lat> <h>");
         let lat: f64 = args[at + 2].parse().expect("--geo <lon> <lat> <h>");
         let h: f64 = args[at + 3].parse().expect("--geo <lon> <lat> <h>");
-        let out = args.get(at + 4).cloned().unwrap_or_else(|| "/tmp/tiles3d-demo-geo".into());
+        let out = args
+            .get(at + 4)
+            .cloned()
+            .unwrap_or_else(|| "/tmp/tiles3d-demo-geo".into());
         return gen_geo_fixture(lon, lat, h, &out);
     }
 
@@ -81,8 +84,12 @@ fn main() {
     entries.push(("content/root.glb".into(), root_glb));
 
     // Quadrants in fixed order: sw, se, nw, ne.
-    let quads: [(&str, f64, f64); 4] =
-        [("sw", -10.0, -10.0), ("se", 10.0, -10.0), ("nw", -10.0, 10.0), ("ne", 10.0, 10.0)];
+    let quads: [(&str, f64, f64); 4] = [
+        ("sw", -10.0, -10.0),
+        ("se", 10.0, -10.0),
+        ("nw", -10.0, 10.0),
+        ("ne", 10.0, 10.0),
+    ];
     let mut children_json = Vec::new();
     for (qi, (qname, ce, cn)) in quads.iter().enumerate() {
         // The NE subtree is authored in a +3 m-shifted local frame; its tile
@@ -90,17 +97,32 @@ fn main() {
         let is_ne = *qname == "ne";
         let z_off = if is_ne { 3.0 } else { 0.0 };
 
-        let child_glb =
-            tile_glb(ce - 10.0, ce + 10.0, cn - 10.0, cn + 10.0, 8, z_off, LEVEL_COLORS[1]);
+        let child_glb = tile_glb(
+            ce - 10.0,
+            ce + 10.0,
+            cn - 10.0,
+            cn + 10.0,
+            8,
+            z_off,
+            LEVEL_COLORS[1],
+        );
         entries.push((format!("content/c_{qname}.glb"), child_glb));
 
         let mut leaves_json = Vec::new();
-        for (li, (le, ln)) in
-            [(-5.0, -5.0), (5.0, -5.0), (-5.0, 5.0), (5.0, 5.0)].iter().enumerate()
+        for (li, (le, ln)) in [(-5.0, -5.0), (5.0, -5.0), (-5.0, 5.0), (5.0, 5.0)]
+            .iter()
+            .enumerate()
         {
             let (lce, lcn) = (ce + le, cn + ln);
-            let leaf_glb =
-                tile_glb(lce - 5.0, lce + 5.0, lcn - 5.0, lcn + 5.0, 16, z_off, LEVEL_COLORS[2]);
+            let leaf_glb = tile_glb(
+                lce - 5.0,
+                lce + 5.0,
+                lcn - 5.0,
+                lcn + 5.0,
+                16,
+                z_off,
+                LEVEL_COLORS[2],
+            );
             let uri = format!("content/l_{qname}{li}.glb");
             entries.push((uri.clone(), leaf_glb));
 
@@ -126,10 +148,7 @@ fn main() {
         });
         if is_ne {
             child["transform"] = serde_json::json!([
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 3.0, 1.0
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 3.0, 1.0
             ]);
         }
         children_json.push(child);
@@ -185,20 +204,39 @@ fn gen_geo_fixture(lon: f64, lat: f64, h: f64, out: &str) {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let root_glb = tile_glb(-20.0, 20.0, -20.0, 20.0, 4, 0.0, LEVEL_COLORS[0]);
     entries.push(("content/root.glb".into(), root_glb));
-    let quads: [(&str, f64, f64); 4] =
-        [("sw", -10.0, -10.0), ("se", 10.0, -10.0), ("nw", -10.0, 10.0), ("ne", 10.0, 10.0)];
+    let quads: [(&str, f64, f64); 4] = [
+        ("sw", -10.0, -10.0),
+        ("se", 10.0, -10.0),
+        ("nw", -10.0, 10.0),
+        ("ne", 10.0, 10.0),
+    ];
     let mut children_json = Vec::new();
     for (qname, ce, cn) in quads.iter() {
-        let child_glb =
-            tile_glb(ce - 10.0, ce + 10.0, cn - 10.0, cn + 10.0, 8, 0.0, LEVEL_COLORS[1]);
+        let child_glb = tile_glb(
+            ce - 10.0,
+            ce + 10.0,
+            cn - 10.0,
+            cn + 10.0,
+            8,
+            0.0,
+            LEVEL_COLORS[1],
+        );
         entries.push((format!("content/c_{qname}.glb"), child_glb));
         let mut leaves_json = Vec::new();
-        for (li, (le, ln)) in
-            [(-5.0, -5.0), (5.0, -5.0), (-5.0, 5.0), (5.0, 5.0)].iter().enumerate()
+        for (li, (le, ln)) in [(-5.0, -5.0), (5.0, -5.0), (-5.0, 5.0), (5.0, 5.0)]
+            .iter()
+            .enumerate()
         {
             let (lce, lcn) = (ce + le, cn + ln);
-            let leaf_glb =
-                tile_glb(lce - 5.0, lce + 5.0, lcn - 5.0, lcn + 5.0, 16, 0.0, LEVEL_COLORS[2]);
+            let leaf_glb = tile_glb(
+                lce - 5.0,
+                lce + 5.0,
+                lcn - 5.0,
+                lcn + 5.0,
+                16,
+                0.0,
+                LEVEL_COLORS[2],
+            );
             let uri = format!("content/l_{qname}{li}.glb");
             entries.push((uri.clone(), leaf_glb));
             leaves_json.push(serde_json::json!({
@@ -224,10 +262,8 @@ fn gen_geo_fixture(lon: f64, lat: f64, h: f64, out: &str) {
     let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
     let (x0, y0, z0) = geodetic_to_ecef(lat, lon, h);
     let enu_to_ecef = [
-        east[0], east[1], east[2], 0.0,
-        north[0], north[1], north[2], 0.0,
-        up[0], up[1], up[2], 0.0,
-        x0, y0, z0, 1.0,
+        east[0], east[1], east[2], 0.0, north[0], north[1], north[2], 0.0, up[0], up[1], up[2],
+        0.0, x0, y0, z0, 1.0,
     ];
 
     let sub_tileset = serde_json::json!({
@@ -286,7 +322,15 @@ fn gen_geo_fixture(lon: f64, lat: f64, h: f64, out: &str) {
 /// authored in glTF Y-up (`x = east, y = up − z_off, z = −north`), with flat
 /// per-level vertex colors. No normals (the runtime computes them — that path
 /// is part of what the fixture tests).
-fn tile_glb(e0: f64, e1: f64, n0: f64, n1: f64, div: usize, z_off: f64, color: [f32; 4]) -> Vec<u8> {
+fn tile_glb(
+    e0: f64,
+    e1: f64,
+    n0: f64,
+    n1: f64,
+    div: usize,
+    z_off: f64,
+    color: [f32; 4],
+) -> Vec<u8> {
     let stride = div + 1;
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(stride * stride);
     for j in 0..=div {

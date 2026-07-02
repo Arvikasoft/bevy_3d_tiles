@@ -43,7 +43,10 @@ fn setup(
         Tiles3dCamera,
     ));
     commands.spawn((
-        DirectionalLight { illuminance: 8_000.0, ..default() },
+        DirectionalLight {
+            illuminance: 8_000.0,
+            ..default()
+        },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.4, 0.0)),
     ));
 

@@ -43,7 +43,9 @@ pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, DecodeError>
         .call2(&JsValue::NULL, &bytes, &JsValue::from_bool(want_bc))
         .map_err(err("ktx2 shim call"))?
         .into();
-    let result = JsFuture::from(promise).await.map_err(err("ktx2 transcode"))?;
+    let result = JsFuture::from(promise)
+        .await
+        .map_err(err("ktx2 transcode"))?;
 
     let get = |key: &str| {
         js_sys::Reflect::get(&result, &JsValue::from_str(key))
@@ -60,18 +62,30 @@ pub async fn transcode(ktx2: &[u8], want_bc: bool) -> Result<Image, DecodeError>
         .ok_or_else(|| DecodeError::ktx2("ktx2 height not a number"))? as u32;
     // `levels` is the mip count; `data` is every level concatenated (base → 1×1)
     // in GPU-upload order. Older shims omit it ⇒ single level.
-    let levels = get("levels").ok().and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0) as u32;
+    let levels = get("levels")
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+        .max(1.0) as u32;
     let data = js_sys::Uint8Array::new(&get("data")?).to_vec();
 
     let tex_format = match format.as_str() {
         "bc7" => TextureFormat::Bc7RgbaUnormSrgb,
         "rgba8" => TextureFormat::Rgba8UnormSrgb,
-        other => return Err(DecodeError::ktx2(format!("ktx2 shim returned unknown format {other}"))),
+        other => {
+            return Err(DecodeError::ktx2(format!(
+                "ktx2 shim returned unknown format {other}"
+            )));
+        }
     };
     // `new_uninit` + manual data avoids `Image::new`'s single-mip length
     // debug-assert (and its `pixel_size()` call, which panics on block formats).
     let mut image = Image::new_uninit(
-        Extent3d { width, height, depth_or_array_layers: 1 },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         tex_format,
         RenderAssetUsages::RENDER_WORLD,

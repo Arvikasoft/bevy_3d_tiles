@@ -43,8 +43,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use bevy::camera::primitives::{Frustum, Sphere};
 use bevy::camera::Projection;
+use bevy::camera::primitives::{Frustum, Sphere};
 use bevy::math::{DMat4, DVec3, Vec3A};
 use bevy::prelude::*;
 use bevy::window::RequestRedraw;
@@ -63,9 +63,9 @@ pub mod meshopt;
 pub mod schema;
 pub mod traversal;
 
-pub use api::{EcefOrigin, TileFeatureResolver, TileOwner, Tiles3dCamera};
 #[cfg(feature = "points")]
 pub use api::PointTileMaterial;
+pub use api::{EcefOrigin, TileFeatureResolver, TileOwner, Tiles3dCamera};
 
 use archive::Archive3tz;
 use content::{DecodedItem, DecodedPrimitive, DecodedTile};
@@ -77,12 +77,12 @@ use geodesy::WGS84_EQUATORIAL_RADIUS_M;
 // Heavy tile-content renderer types — point clouds (`points`) and Gaussian
 // splats (`splats`). The host supplies the `Assets` stores (its own render
 // plugins register them) and, for points, the shared [`PointTileMaterial`].
+#[cfg(feature = "splats")]
+use bevy_gaussian_splatting::{CloudSettings, PlanarGaussian3d, PlanarGaussian3dHandle};
 #[cfg(feature = "points")]
 use bevy_pointcloud::point_cloud::{PointCloud, PointCloud3d};
 #[cfg(feature = "points")]
 use bevy_pointcloud::point_cloud_material::PointCloudMaterial3d;
-#[cfg(feature = "splats")]
-use bevy_gaussian_splatting::{CloudSettings, PlanarGaussian3d, PlanarGaussian3dHandle};
 
 /// The Google Photorealistic 3D Tiles root tileset (D7). The org's API key
 /// is appended per request, never stored in the row.
@@ -216,9 +216,13 @@ enum TileSlot {
     /// Fetch+decode task running; results carry the generation so a
     /// cancelled-then-reissued tile drops the stale payload. The generation
     /// also keys the abort registry (`fetch::trigger_abort`).
-    InFlight { generation: u64 },
+    InFlight {
+        generation: u64,
+    },
     /// Content spawned (hidden until selected by the render cut).
-    Ready { entity: Entity },
+    Ready {
+        entity: Entity,
+    },
     /// Terminal fetch/decode failure — never re-queued this session.
     Failed,
 }
@@ -474,8 +478,14 @@ fn dev_source_spec() -> Option<String> {
 }
 
 fn init_dev_tileset(channel: Res<Tiles3dChannel>) {
-    let Some(spec) = dev_source_spec() else { return };
-    let spec = if spec == "fixture" { FIXTURE_SPEC.to_string() } else { spec };
+    let Some(spec) = dev_source_spec() else {
+        return;
+    };
+    let spec = if spec == "fixture" {
+        FIXTURE_SPEC.to_string()
+    } else {
+        spec
+    };
     info!("tiles3d: dev trigger — opening {spec}");
     spawn_tileset_open(spec, None, None, channel.tx.clone());
 }
@@ -513,7 +523,10 @@ fn apply_attach_detach(
         if sets.has_anchor(msg.anchor) {
             continue;
         }
-        info!("tiles3d: attaching {} ({}) to {:?}", msg.label, msg.url, msg.anchor);
+        info!(
+            "tiles3d: attaching {} ({}) to {:?}",
+            msg.label, msg.url, msg.anchor
+        );
         sets.pending_anchors.insert(msg.anchor);
         spawn_tileset_open(
             msg.url.clone(),
@@ -547,7 +560,11 @@ fn spawn_tileset_open(
 ) {
     fetch::spawn_io(async move {
         let result = open_tileset(&spec, p3dt).await;
-        let _ = tx.send(Tiles3dMsg::TilesetOpened { label: spec, attach, result });
+        let _ = tx.send(Tiles3dMsg::TilesetOpened {
+            label: spec,
+            attach,
+            result,
+        });
     });
 }
 
@@ -570,7 +587,10 @@ fn byte_source_for(spec: &str) -> ByteSource {
 /// Whether a spec names a packed archive. Checked on the URL *path* — a SAS
 /// query string (`…/demo.3tz?se=…&sig=…`) must not hide the extension.
 fn is_archive_spec(spec: &str) -> bool {
-    spec.split(['?', '#']).next().unwrap_or(spec).ends_with(".3tz")
+    spec.split(['?', '#'])
+        .next()
+        .unwrap_or(spec)
+        .ends_with(".3tz")
 }
 
 /// Directory prefix (with trailing `/`) of a tileset-relative URI, for
@@ -631,8 +651,7 @@ async fn open_tileset(
             .read_entry_cached(spec, None)
             .await
             .map_err(|e| format!("fetch P3DT root: {e}"))?;
-        let tileset =
-            schema::parse_tileset(&bytes).map_err(|e| format!("parse P3DT root: {e}"))?;
+        let tileset = schema::parse_tileset(&bytes).map_err(|e| format!("parse P3DT root: {e}"))?;
         adopt_session(&live, &tileset);
         return Ok((source, Box::new(tileset)));
     }
@@ -693,9 +712,15 @@ fn receive_tiles3d(
 ) {
     let mut spawned = 0usize;
     while spawned < config.max_spawns_per_frame {
-        let Ok(msg) = channel.rx.try_recv() else { break };
+        let Ok(msg) = channel.rx.try_recv() else {
+            break;
+        };
         match msg {
-            Tiles3dMsg::TilesetOpened { label, attach, result } => match result {
+            Tiles3dMsg::TilesetOpened {
+                label,
+                attach,
+                result,
+            } => match result {
                 Ok((source, tileset)) => {
                     // An anchored open must still be wanted (not detached
                     // while in flight) and its anchor must still exist (the
@@ -715,7 +740,11 @@ fn receive_tiles3d(
                     let georef = matches!(source, TilesetSource::Live(_))
                         || geo::tileset_is_georeferenced(&tileset);
                     let (frame, world_from_tileset, tree_frame) = if georef {
-                        (SetFrame::Ecef { built: None }, DMat4::IDENTITY, TreeFrame::Ecef)
+                        (
+                            SetFrame::Ecef { built: None },
+                            DMat4::IDENTITY,
+                            TreeFrame::Ecef,
+                        )
                     } else {
                         (SetFrame::Anchored, ZUP_TO_BEVY, TreeFrame::Local)
                     };
@@ -735,9 +764,7 @@ fn receive_tiles3d(
                             if georef {
                                 root.insert(Transform::IDENTITY);
                             } else {
-                                root.insert(
-                                    attach.as_ref().map(|a| a.local).unwrap_or_default(),
-                                );
+                                root.insert(attach.as_ref().map(|a| a.local).unwrap_or_default());
                                 if let Some(a) = &attach {
                                     root.insert(ChildOf(a.anchor));
                                 }
@@ -747,7 +774,11 @@ fn receive_tiles3d(
                             history.resize(n);
                             info!(
                                 "tiles3d: {label}: {n} tiles{}",
-                                if georef { " (georeferenced — ECEF frame)" } else { "" }
+                                if georef {
+                                    " (georeferenced — ECEF frame)"
+                                } else {
+                                    ""
+                                }
                             );
                             sets.sets.push(ActiveTileset {
                                 id,
@@ -786,7 +817,11 @@ fn receive_tiles3d(
                     error!("tiles3d: {label}: {e}");
                 }
             },
-            Tiles3dMsg::TileContent { set_id, generation, result } => {
+            Tiles3dMsg::TileContent {
+                set_id,
+                generation,
+                result,
+            } => {
                 let Some(set) = sets.sets.iter_mut().find(|s| s.id == set_id) else {
                     continue;
                 };
@@ -866,7 +901,11 @@ fn receive_tiles3d(
                     }
                     Ok(TileOutput::Content(decoded)) => {
                         spawned += 1;
-                        let DecodedTile { items, rtc_center, copyright } = *decoded;
+                        let DecodedTile {
+                            items,
+                            rtc_center,
+                            copyright,
+                        } = *decoded;
                         set.rtc_centers[tile] = rtc_center;
                         if let Some(c) = copyright {
                             for frag in c.split(';') {
@@ -879,7 +918,8 @@ fn receive_tiles3d(
                         // ECEF sets compose placement against the CURRENT
                         // origin in f64; tiles landing before the origin
                         // resolves wait (re-requested once it exists).
-                        let Some(transform) = tile_spawn_transform(set, tile, origin.world_from_ecef)
+                        let Some(transform) =
+                            tile_spawn_transform(set, tile, origin.world_from_ecef)
                         else {
                             set.slots[tile] = TileSlot::NotLoaded;
                             continue;
@@ -996,7 +1036,10 @@ fn spawn_tile_content(
 ) -> Entity {
     let tile_root = commands
         .spawn((
-            Tiles3dTile { set_id: set.id, tile },
+            Tiles3dTile {
+                set_id: set.id,
+                tile,
+            },
             transform,
             // Spawned hidden; `drive_tiles3d` flips it visible once the render
             // cut selects this tile (children inherit the root's visibility).
@@ -1019,7 +1062,12 @@ fn spawn_tile_content(
     for item in items {
         match item {
             DecodedItem::Mesh(prim) => {
-                let DecodedPrimitive { transform: ptf, mesh, material, features } = *prim;
+                let DecodedPrimitive {
+                    transform: ptf,
+                    mesh,
+                    material,
+                    features,
+                } = *prim;
                 let prim_transform = Transform::from_matrix(ptf);
                 // One OPAQUE StandardMaterial per primitive, SHARED by all of its
                 // feature submeshes (no per-submesh texture duplication). Opaque:
@@ -1060,8 +1108,14 @@ fn spawn_tile_content(
                         for (tri, &fid) in f.feature_of_triangle.iter().enumerate() {
                             // Out-of-range id (malformed tile) falls back to the
                             // anchor rather than dropping the triangle (a hole).
-                            let owner = owner_of_feature.get(fid as usize).map(String::as_str).unwrap_or(fallback);
-                            tris_by_owner.entry(owner.to_string()).or_default().push(tri);
+                            let owner = owner_of_feature
+                                .get(fid as usize)
+                                .map(String::as_str)
+                                .unwrap_or(fallback);
+                            tris_by_owner
+                                .entry(owner.to_string())
+                                .or_default()
+                                .push(tri);
                         }
                         for (owner, tris) in tris_by_owner {
                             commands.spawn((
@@ -1103,7 +1157,10 @@ fn spawn_tile_content(
                 }
             }
             #[cfg(feature = "splats")]
-            DecodedItem::Splat { transform, gaussians } => {
+            DecodedItem::Splat {
+                transform,
+                gaussians,
+            } => {
                 let handle = renderers.splats.add(PlanarGaussian3d::from(gaussians));
                 let child = commands
                     .spawn((
@@ -1129,11 +1186,19 @@ fn spawn_tile_content(
 /// can read it.
 fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
     use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues as Vav};
-    let mut out = Mesh::new(PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::default());
-    let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).and_then(|a| a.as_float3()) else {
+    let mut out = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    let Some(positions) = mesh
+        .attribute(Mesh::ATTRIBUTE_POSITION)
+        .and_then(|a| a.as_float3())
+    else {
         return out;
     };
-    let normals = mesh.attribute(Mesh::ATTRIBUTE_NORMAL).and_then(|a| a.as_float3());
+    let normals = mesh
+        .attribute(Mesh::ATTRIBUTE_NORMAL)
+        .and_then(|a| a.as_float3());
     let uvs = match mesh.attribute(Mesh::ATTRIBUTE_UV_0) {
         Some(Vav::Float32x2(v)) => Some(v.as_slice()),
         _ => None,
@@ -1157,7 +1222,9 @@ fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
     let mut out_idx: Vec<u32> = Vec::new();
     for &t in tris {
         for k in 0..3 {
-            let Some(v) = vertex_of(t, k).filter(|&v| v < positions.len()) else { continue };
+            let Some(v) = vertex_of(t, k).filter(|&v| v < positions.len()) else {
+                continue;
+            };
             let local = match remap.get(&v) {
                 Some(&l) => l,
                 None => {
@@ -1196,7 +1263,11 @@ fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
 /// Keep the `true`-flagged entries of `v`, preserving order — the index-aligned
 /// twin of [`TileTree::retain`] for the per-tile side arrays.
 fn gather<T: Clone>(v: &[T], keep: &[bool]) -> Vec<T> {
-    v.iter().zip(keep).filter(|&(_, &k)| k).map(|(x, _)| x.clone()).collect()
+    v.iter()
+        .zip(keep)
+        .filter(|&(_, &k)| k)
+        .map(|(x, _)| x.clone())
+        .collect()
 }
 
 /// Reclaim grafted subtrees that have fallen out of view past the grace window,
@@ -1232,7 +1303,10 @@ fn compact_grafted_subtrees(set: &mut ActiveTileset, frame: u64, grace: u64) -> 
         let mut stack = vec![r];
         let mut prunable = true;
         while let Some(x) = stack.pop() {
-            if matches!(set.slots[x], TileSlot::Ready { .. } | TileSlot::InFlight { .. }) {
+            if matches!(
+                set.slots[x],
+                TileSlot::Ready { .. } | TileSlot::InFlight { .. }
+            ) {
                 prunable = false;
                 break;
             }
@@ -1295,7 +1369,12 @@ fn drive_tiles3d(
     mut redraw: MessageWriter<RequestRedraw>,
     mut commands: Commands,
 ) {
-    let Tiles3dSets { sets, frame, next_generation, .. } = &mut *sets;
+    let Tiles3dSets {
+        sets,
+        frame,
+        next_generation,
+        ..
+    } = &mut *sets;
     *frame += 1;
 
     // GC: a set whose root entity died — or whose anchor died (ECEF roots
@@ -1323,7 +1402,9 @@ fn drive_tiles3d(
         }
         return;
     }
-    let Ok((cam, cam_gt, proj, frustum)) = camera.single() else { return };
+    let Ok((cam, cam_gt, proj, frustum)) = camera.single() else {
+        return;
+    };
 
     let fov_y = match proj {
         Projection::Perspective(p) => p.fov as f64,
@@ -1334,7 +1415,10 @@ fn drive_tiles3d(
     // logical = physical / devicePixelRatio, so a logical-pixel k underestimated
     // the error by ~2× and selected one LOD too coarse — the "blurry zoomed out"
     // finding. `sse_threshold_px` is now in physical pixels (texel ≈ device pixel).
-    let viewport_h = cam.physical_viewport_size().map(|v| v.y as f64).unwrap_or(1080.0);
+    let viewport_h = cam
+        .physical_viewport_size()
+        .map(|v| v.y as f64)
+        .unwrap_or(1080.0);
     let k_px = viewport_h / (2.0 * (fov_y * 0.5).tan()).max(1e-6);
     let cam_pos_world = cam_gt.translation().as_dvec3();
     let cam_forward_world = Vec3::from(cam_gt.forward()).as_dvec3();
@@ -1397,7 +1481,9 @@ fn drive_tiles3d(
                     // re-place every resident tile from absolutes in f64.
                     *built = Some(o);
                     for (i, slot) in set.slots.iter_mut().enumerate() {
-                        let TileSlot::Ready { entity } = *slot else { continue };
+                        let TileSlot::Ready { entity } = *slot else {
+                            continue;
+                        };
                         if let Ok(mut t) = tile_transforms.get_mut(entity) {
                             let m = compose_ecef_tile_matrix(
                                 o,
@@ -1408,11 +1494,7 @@ fn drive_tiles3d(
                         }
                     }
                 }
-                (
-                    o,
-                    1.0,
-                    Some(WGS84_EQUATORIAL_RADIUS_M),
-                )
+                (o, 1.0, Some(WGS84_EQUATORIAL_RADIUS_M))
             }
         };
         let set_from_world = world_from_set.inverse();
@@ -1426,8 +1508,11 @@ fn drive_tiles3d(
         // set-frame tile distances in the traversal. NOTE: use the world Y, NOT
         // `cam_pos.length() - equatorial_radius` — that sphere approximation is
         // off by up to ~21 km away from the equator, which would wreck the floor.
-        let cam_height_m =
-            if planet_radius.is_some() { cam_pos_world.y.max(0.0) } else { 0.0 };
+        let cam_height_m = if planet_radius.is_some() {
+            cam_pos_world.y.max(0.0)
+        } else {
+            0.0
+        };
         // The distance falloff is a globe/horizon guard: it bounds the P3DT
         // graft+stream storm toward the horizon on an ECEF set. A local-frame
         // tileset is a BOUNDED model with no horizon hemisphere to stream, and
@@ -1436,8 +1521,11 @@ fn drive_tiles3d(
         // (the "local terrain stays blurry until I'm much closer than I expect"
         // finding). Natural 1/dist SSE already coarsens the far edge on its own;
         // disable the extra relaxation for local sets, keep it for ECEF/globe.
-        let detail_falloff_m =
-            if planet_radius.is_some() { config.detail_falloff_m } else { 0.0 };
+        let detail_falloff_m = if planet_radius.is_some() {
+            config.detail_falloff_m
+        } else {
+            0.0
+        };
         let params = SelectParams {
             cam_pos,
             cam_forward,
@@ -1505,8 +1593,11 @@ fn drive_tiles3d(
             if let TileSlot::Ready { entity } = slot
                 && let Ok(mut vis) = vis_q.get_mut(*entity)
             {
-                let want =
-                    if want_visible[i] { Visibility::Visible } else { Visibility::Hidden };
+                let want = if want_visible[i] {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
                 if *vis != want {
                     *vis = want;
                 }
@@ -1562,8 +1653,11 @@ fn drive_tiles3d(
         };
 
         // Issue new requests in priority order under the concurrency cap.
-        let mut in_flight =
-            set.slots.iter().filter(|s| matches!(s, TileSlot::InFlight { .. })).count();
+        let mut in_flight = set
+            .slots
+            .iter()
+            .filter(|s| matches!(s, TileSlot::InFlight { .. }))
+            .count();
         for req in &sel.loads {
             if budget_exhausted || in_flight >= config.max_concurrent_loads {
                 break;
@@ -1571,7 +1665,9 @@ fn drive_tiles3d(
             if !matches!(set.slots[req.tile], TileSlot::NotLoaded) {
                 continue; // already in flight, ready, or failed
             }
-            let Some(uri) = tree.nodes[req.tile].content_uri.clone() else { continue };
+            let Some(uri) = tree.nodes[req.tile].content_uri.clone() else {
+                continue;
+            };
             let generation = *next_generation;
             *next_generation += 1;
             set.slots[req.tile] = TileSlot::InFlight { generation };
@@ -1601,7 +1697,11 @@ fn drive_tiles3d(
                 };
                 fetch::unregister_abort(generation);
                 // Receiver gone (plugin torn down) is fine — drop silently.
-                let _ = tx.send(Tiles3dMsg::TileContent { set_id, generation, result });
+                let _ = tx.send(Tiles3dMsg::TileContent {
+                    set_id,
+                    generation,
+                    result,
+                });
             });
         }
 
@@ -1657,10 +1757,11 @@ fn drive_tiles3d(
         }
         set.history.absorb(&sel, tree.len());
         google_visible |= set.is_live() && !sel.render.is_empty();
-        ground_covering |=
-            matches!(set.frame, SetFrame::Ecef { .. }) && !sel.render.is_empty();
-        any_in_flight |=
-            set.slots.iter().any(|s| matches!(s, TileSlot::InFlight { .. }));
+        ground_covering |= matches!(set.frame, SetFrame::Ecef { .. }) && !sel.render.is_empty();
+        any_in_flight |= set
+            .slots
+            .iter()
+            .any(|s| matches!(s, TileSlot::InFlight { .. }));
     }
 
     // Attribution side-band (D7/L-D5): aggregated tile copyrights + the
@@ -1747,34 +1848,51 @@ mod tests {
     #[test]
     fn build_submesh_extracts_triangle_subset() {
         use bevy::mesh::{Indices, PrimitiveTopology};
-        let mut mesh =
-            Mesh::new(PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::default());
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::default(),
+        );
         // A quad: 4 verts, 2 triangles [0,1,2] and [0,2,3].
         mesh.insert_attribute(
             Mesh::ATTRIBUTE_POSITION,
-            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
         );
-        mesh.insert_attribute(
-            Mesh::ATTRIBUTE_COLOR,
-            vec![[1.0, 0.0, 0.0, 1.0]; 4],
-        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0, 0.0, 0.0, 1.0]; 4]);
         mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
 
         // Keep only triangle 1 (verts 0,2,3) → 3 verts, 1 triangle, remapped.
         let sub = build_submesh(&mesh, &[1]);
-        let pos = sub.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().as_float3().unwrap();
+        let pos = sub
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap();
         assert_eq!(pos, &[[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
-        assert!(sub.attribute(Mesh::ATTRIBUTE_COLOR).is_some(), "color carried through");
-        let Some(Indices::U32(idx)) = sub.indices() else { panic!("u32 indices") };
+        assert!(
+            sub.attribute(Mesh::ATTRIBUTE_COLOR).is_some(),
+            "color carried through"
+        );
+        let Some(Indices::U32(idx)) = sub.indices() else {
+            panic!("u32 indices")
+        };
         assert_eq!(idx, &[0, 1, 2]);
     }
 
     #[test]
     fn archive_spec_detection_ignores_query_strings() {
         assert!(is_archive_spec("assets/fixtures/tiles3d-demo.3tz"));
-        assert!(is_archive_spec("https://x.blob.core.windows.net/a/demo.3tz?se=2026&sig=abc"));
+        assert!(is_archive_spec(
+            "https://x.blob.core.windows.net/a/demo.3tz?se=2026&sig=abc"
+        ));
         assert!(is_archive_spec("https://x/a/demo.3tz#frag"));
-        assert!(!is_archive_spec("assets/fixtures/tiles3d-demo/tileset.json"));
+        assert!(!is_archive_spec(
+            "assets/fixtures/tiles3d-demo/tileset.json"
+        ));
         assert!(!is_archive_spec("https://x/a/tileset.json?sas=1"));
     }
 
@@ -1783,7 +1901,9 @@ mod tests {
         let tileset = br#"{"asset":{"version":"1.1"},"geometricError":1e100,
             "root":{"boundingVolume":{"box":[0,0,0,1,0,0,0,1,0,0,0,1]},"geometricError":0}}"#;
         assert!(looks_like_external_tileset(tileset));
-        assert!(looks_like_external_tileset(b"  \n{\"geometricError\": 1, \"root\": {}}"));
+        assert!(looks_like_external_tileset(
+            b"  \n{\"geometricError\": 1, \"root\": {}}"
+        ));
         // GLB magic → content, regardless of any JSON-chunk strings.
         assert!(!looks_like_external_tileset(b"glTF\x02\x00\x00\x00..."));
         // Bare glTF JSON (no geometricError) → content.
@@ -1795,7 +1915,10 @@ mod tests {
     #[test]
     fn uri_dir_prefix_for_subtree_rebasing() {
         assert_eq!(uri_dir_prefix("sub/tileset.json"), Some("sub/".to_string()));
-        assert_eq!(uri_dir_prefix("a/b/c.json?session=x"), Some("a/b/".to_string()));
+        assert_eq!(
+            uri_dir_prefix("a/b/c.json?session=x"),
+            Some("a/b/".to_string())
+        );
         assert_eq!(uri_dir_prefix("tileset.json"), None);
         // Absolute-path subtrees (P3DT) yield their directory; the rebase
         // loop skips absolute CONTENT uris anyway.
@@ -1812,10 +1935,14 @@ mod tests {
     /// intentional fixture changes.
     #[test]
     fn committed_fixture_parses_and_decodes() {
-        let source = TilesetSource::Exploded(ExplodedBase::Dir("assets/fixtures/tiles3d-demo".into()));
+        let source =
+            TilesetSource::Exploded(ExplodedBase::Dir("assets/fixtures/tiles3d-demo".into()));
         let bytes = block_on(source.read_entry("tileset.json")).expect("fixture tileset.json");
         let tileset = schema::parse_tileset(&bytes).expect("parse");
-        assert!(!geo::tileset_is_georeferenced(&tileset), "fixture is local-metres");
+        assert!(
+            !geo::tileset_is_georeferenced(&tileset),
+            "fixture is local-metres"
+        );
         let tree = TileTree::build(&tileset, ZUP_TO_BEVY, TreeFrame::Local).expect("build");
         assert_eq!(tree.len(), 21, "1 root + 4 children + 16 leaves");
         // Mixed volume kinds present.
@@ -1824,10 +1951,16 @@ mod tests {
             .iter()
             .filter(|n| matches!(n.volume, traversal::WorldVolume::Sphere { .. }))
             .count();
-        assert!(spheres > 0 && spheres < tree.len(), "mixed box/sphere volumes");
+        assert!(
+            spheres > 0 && spheres < tree.len(),
+            "mixed box/sphere volumes"
+        );
         // Every content GLB decodes.
         for node in &tree.nodes {
-            let uri = node.content_uri.as_ref().expect("all fixture tiles carry content");
+            let uri = node
+                .content_uri
+                .as_ref()
+                .expect("all fixture tiles carry content");
             let glb = block_on(source.read_entry(uri)).expect("fixture glb");
             let items = content::decode_glb(&glb).expect("decode");
             assert!(!items.is_empty(), "{uri} has geometry");

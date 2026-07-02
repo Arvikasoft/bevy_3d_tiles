@@ -65,7 +65,10 @@ pub fn set_supported_compressed_formats(formats: CompressedImageFormats) {
 }
 
 fn supported_formats() -> CompressedImageFormats {
-    SUPPORTED_FORMATS.get().copied().unwrap_or(CompressedImageFormats::NONE)
+    SUPPORTED_FORMATS
+        .get()
+        .copied()
+        .unwrap_or(CompressedImageFormats::NONE)
 }
 
 /// Typed failure surface of tile-content decoding — the error of
@@ -102,7 +105,10 @@ pub enum DecodeStage {
 
 impl DecodeError {
     pub fn new(stage: DecodeStage, message: impl Into<String>) -> Self {
-        Self { stage, message: message.into() }
+        Self {
+            stage,
+            message: message.into(),
+        }
     }
 
     pub(crate) fn draco(message: impl Into<String>) -> Self {
@@ -137,7 +143,9 @@ impl From<&str> for DecodeError {
 async fn resolve_pending_textures(items: &mut [DecodedItem]) {
     for item in items.iter_mut() {
         let DecodedItem::Mesh(p) = item else { continue };
-        let Some(bytes) = p.material.base_color_ktx2.take() else { continue };
+        let Some(bytes) = p.material.base_color_ktx2.take() else {
+            continue;
+        };
         match transcode_ktx2(&bytes).await {
             Ok(mut img) => {
                 // Stamp the glTF wrap/filter sampler onto the transcoded image
@@ -183,7 +191,9 @@ fn warn_ktx2_once(detail: &str) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let detail = detail.to_string();
     ONCE.call_once(move || {
-        bevy::log::warn!("tiles3d: KTX2 tile texture transcode failed ({detail}); rendering untextured");
+        bevy::log::warn!(
+            "tiles3d: KTX2 tile texture transcode failed ({detail}); rendering untextured"
+        );
     });
 }
 
@@ -217,12 +227,18 @@ pub enum DecodedItem {
     Mesh(Box<DecodedPrimitive>),
     /// `POINTS`-mode primitive (positions + COLOR_0) → vendored point renderer.
     #[cfg(feature = "points")]
-    Points { transform: Mat4, points: Vec<PointCloudData> },
+    Points {
+        transform: Mat4,
+        points: Vec<PointCloudData>,
+    },
     /// `KHR_gaussian_splatting` primitive → `PlanarGaussian3d` renderer.
     /// Gaussians are in the primitive's local (glTF Y-up) frame; padded to a
     /// multiple of 32 like the crate's own ply path.
     #[cfg(feature = "splats")]
-    Splat { transform: Mat4, gaussians: Vec<Gaussian3d> },
+    Splat {
+        transform: Mat4,
+        gaussians: Vec<Gaussian3d>,
+    },
 }
 
 /// Material inputs resolved at decode time; turned into a `StandardMaterial`
@@ -290,21 +306,31 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
     if !(georeferenced || has_splat || has_draco || has_rtc || memmem(json, b"copyright")) {
         let mut items = decode_glb(bytes)?;
         resolve_pending_textures(&mut items).await;
-        return Ok(DecodedTile { items, rtc_center: None, copyright: None });
+        return Ok(DecodedTile {
+            items,
+            rtc_center: None,
+            copyright: None,
+        });
     }
 
     let mut value: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| format!("tile json: {e}"))?;
     let copyright = value["asset"]["copyright"].as_str().map(str::to_string);
-    let mut rtc_center = value["extensions"]["CESIUM_RTC"]["center"].as_array().and_then(|c| {
-        let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
-        <[f64; 3]>::try_from(v).ok().map(DVec3::from_array)
-    });
+    let mut rtc_center = value["extensions"]["CESIUM_RTC"]["center"]
+        .as_array()
+        .and_then(|c| {
+            let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
+            <[f64; 3]>::try_from(v).ok().map(DVec3::from_array)
+        });
 
     #[cfg(feature = "splats")]
     if has_splat {
         let items = decode_splat_gltf(&value, bin)?;
-        return Ok(DecodedTile { items, rtc_center, copyright });
+        return Ok(DecodedTile {
+            items,
+            rtc_center,
+            copyright,
+        });
     }
 
     // Google P3DT bakes ECEF positions into node MATRICES instead of
@@ -326,7 +352,11 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         decode_glb(bytes)?
     };
     resolve_pending_textures(&mut items).await;
-    Ok(DecodedTile { items, rtc_center, copyright })
+    Ok(DecodedTile {
+        items,
+        rtc_center,
+        copyright,
+    })
 }
 
 /// When any scene-root node sits at planetary magnitude (Google P3DT bakes
@@ -444,7 +474,10 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, DecodeError> {
         let (j, _) = split_glb(bytes).unwrap_or((bytes, None));
         let head = String::from_utf8_lossy(&j[..j.len().min(180)]);
         let tail = String::from_utf8_lossy(&j[j.len().saturating_sub(180)..]);
-        format!("gltf parse: {e} | json_len={} head={head:?} tail={tail:?}", j.len())
+        format!(
+            "gltf parse: {e} | json_len={} head={head:?} tail={tail:?}",
+            j.len()
+        )
     })?;
     let doc = gltf.document;
     let blob = gltf.blob;
@@ -473,7 +506,13 @@ pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, DecodeError> {
         return Ok(out); // empty content tile — legal, renders nothing
     };
     for node in scene.nodes() {
-        decode_node(&node, Mat4::IDENTITY, blob.as_deref(), feat.as_ref(), &mut out)?;
+        decode_node(
+            &node,
+            Mat4::IDENTITY,
+            blob.as_deref(),
+            feat.as_ref(),
+            &mut out,
+        )?;
     }
     Ok(out)
 }
@@ -497,11 +536,15 @@ impl FeatureCtx {
         let mut accessor = HashMap::new();
         if let Some(meshes) = value["meshes"].as_array() {
             for (m, mesh) in meshes.iter().enumerate() {
-                let Some(prims) = mesh["primitives"].as_array() else { continue };
+                let Some(prims) = mesh["primitives"].as_array() else {
+                    continue;
+                };
                 for (p, prim) in prims.iter().enumerate() {
                     let ext = &prim["extensions"]["EXT_mesh_features"];
                     // featureIds[0].attribute = N → the `_FEATURE_ID_N` attribute.
-                    let Some(n) = ext["featureIds"][0]["attribute"].as_u64() else { continue };
+                    let Some(n) = ext["featureIds"][0]["attribute"].as_u64() else {
+                        continue;
+                    };
                     let key = format!("_FEATURE_ID_{n}");
                     if let Some(acc) = prim["attributes"][&key].as_u64() {
                         accessor.insert((m as u64, p as u64), acc as usize);
@@ -509,7 +552,11 @@ impl FeatureCtx {
                 }
             }
         }
-        Ok(Self { json: value, node_of_feature, accessor })
+        Ok(Self {
+            json: value,
+            node_of_feature,
+            accessor,
+        })
     }
 
     /// `feature_of_triangle` for primitive `(mesh_ix, prim_ix)` in `indices`
@@ -529,7 +576,10 @@ impl FeatureCtx {
         let per_vertex = read_accessor::<1>(&self.json, bin, acc)?;
         let feature_of = |v: usize| per_vertex.get(v).map(|f| f[0].round() as u32).unwrap_or(0);
         let feature_of_triangle = match indices {
-            Some(idx) => idx.chunks_exact(3).map(|t| feature_of(t[0] as usize)).collect(),
+            Some(idx) => idx
+                .chunks_exact(3)
+                .map(|t| feature_of(t[0] as usize))
+                .collect(),
             // Non-indexed: triangle t spans vertices 3t..3t+3.
             None => (0..vertex_count / 3).map(|t| feature_of(t * 3)).collect(),
         };
@@ -543,24 +593,31 @@ impl FeatureCtx {
 /// Read the `nodePath` STRING property of `EXT_structural_metadata`'s first
 /// property table → `featureId → node path`. UINT32 string offsets (what our
 /// writer emits); other offset widths are unsupported (we control the writer).
-fn read_node_of_feature(json: &serde_json::Value, bin: Option<&[u8]>) -> Result<Vec<String>, String> {
+fn read_node_of_feature(
+    json: &serde_json::Value,
+    bin: Option<&[u8]>,
+) -> Result<Vec<String>, String> {
     let pt = &json["extensions"]["EXT_structural_metadata"]["propertyTables"][0];
     let count = pt["count"].as_u64().ok_or("property table without count")? as usize;
     if count == 0 {
         return Ok(Vec::new());
     }
     let prop = &pt["properties"]["nodePath"];
-    let values_bv = prop["values"].as_u64().ok_or("nodePath property without values")? as usize;
-    let offsets_bv =
-        prop["stringOffsets"].as_u64().ok_or("nodePath property without stringOffsets")? as usize;
-    let values = buffer_view_slice(json, bin, values_bv)
-        .map_err(|e| format!("nodePath values: {e}"))?;
-    let offsets = buffer_view_slice(json, bin, offsets_bv)
-        .map_err(|e| format!("nodePath offsets: {e}"))?;
+    let values_bv = prop["values"]
+        .as_u64()
+        .ok_or("nodePath property without values")? as usize;
+    let offsets_bv = prop["stringOffsets"]
+        .as_u64()
+        .ok_or("nodePath property without stringOffsets")? as usize;
+    let values =
+        buffer_view_slice(json, bin, values_bv).map_err(|e| format!("nodePath values: {e}"))?;
+    let offsets =
+        buffer_view_slice(json, bin, offsets_bv).map_err(|e| format!("nodePath offsets: {e}"))?;
     if offsets.len() < (count + 1) * 4 {
         return Err("nodePath stringOffsets too short".into());
     }
-    let read_u32 = |i: usize| u32::from_le_bytes(offsets[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+    let read_u32 =
+        |i: usize| u32::from_le_bytes(offsets[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let (lo, hi) = (read_u32(i), read_u32(i + 1));
@@ -618,13 +675,21 @@ struct DracoPrim {
 
 fn find_draco_prims(json: &serde_json::Value) -> Vec<DracoPrim> {
     let mut out = Vec::new();
-    let Some(meshes) = json["meshes"].as_array() else { return out };
+    let Some(meshes) = json["meshes"].as_array() else {
+        return out;
+    };
     for (m, mesh) in meshes.iter().enumerate() {
-        let Some(prims) = mesh["primitives"].as_array() else { continue };
+        let Some(prims) = mesh["primitives"].as_array() else {
+            continue;
+        };
         for (p, prim) in prims.iter().enumerate() {
             let ext = &prim["extensions"]["KHR_draco_mesh_compression"];
-            let Some(view) = ext["bufferView"].as_u64() else { continue };
-            let Some(attrs) = ext["attributes"].as_object() else { continue };
+            let Some(view) = ext["bufferView"].as_u64() else {
+                continue;
+            };
+            let Some(attrs) = ext["attributes"].as_object() else {
+                continue;
+            };
             out.push(DracoPrim {
                 mesh: m,
                 prim: p,
@@ -649,7 +714,9 @@ fn buffer_view_slice<'b>(
         return Err("draco bufferView must reference buffer 0 (BIN chunk)".into());
     }
     let offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let len = bv["byteLength"].as_u64().ok_or("bufferView without byteLength")? as usize;
+    let len = bv["byteLength"]
+        .as_u64()
+        .ok_or("bufferView without byteLength")? as usize;
     bin.ok_or("draco bufferView references the BIN chunk but the GLB has none")?
         .get(offset..offset + len)
         .ok_or_else(|| "draco bufferView out of BIN bounds".into())
@@ -693,9 +760,13 @@ fn splice_glb(
         for i in &dm.indices {
             new_bin.extend_from_slice(&i.to_le_bytes());
         }
-        let idx_view = push_json(json, "bufferViews", serde_json::json!({
-            "buffer": 0, "byteOffset": idx_offset, "byteLength": dm.indices.len() * 4,
-        }));
+        let idx_view = push_json(
+            json,
+            "bufferViews",
+            serde_json::json!({
+                "buffer": 0, "byteOffset": idx_offset, "byteLength": dm.indices.len() * 4,
+            }),
+        );
         let idx_accessor = serde_json::json!({
             "bufferView": idx_view, "componentType": 5125,
             "count": dm.indices.len(), "type": "SCALAR",
@@ -724,9 +795,13 @@ fn splice_glb(
             for v in data {
                 new_bin.extend_from_slice(&v.to_le_bytes());
             }
-            let view = push_json(json, "bufferViews", serde_json::json!({
-                "buffer": 0, "byteOffset": offset, "byteLength": data.len() * 4,
-            }));
+            let view = push_json(
+                json,
+                "bufferViews",
+                serde_json::json!({
+                    "buffer": 0, "byteOffset": offset, "byteLength": data.len() * 4,
+                }),
+            );
             let mut accessor = serde_json::json!({
                 "bufferView": view, "componentType": 5126,
                 "count": count, "type": type_str,
@@ -768,7 +843,10 @@ fn splice_glb(
     for list in ["extensionsUsed", "extensionsRequired"] {
         if let Some(arr) = json.get_mut(list).and_then(|v| v.as_array_mut()) {
             arr.retain(|v| {
-                !matches!(v.as_str(), Some("KHR_draco_mesh_compression" | "CESIUM_RTC"))
+                !matches!(
+                    v.as_str(),
+                    Some("KHR_draco_mesh_compression" | "CESIUM_RTC")
+                )
             });
             if arr.is_empty() {
                 json.as_object_mut().unwrap().remove(list);
@@ -865,10 +943,7 @@ fn assemble_glb(json_bytes: &[u8], bin: &[u8]) -> Vec<u8> {
 /// rebuilt against the freshly decoded BIN. The encoder stores compressed data
 /// in the GLB BIN (`ext.buffer == 0`) while the view's own `buffer` points at
 /// the discarded fallback — so we always read compressed bytes via `ext`.
-fn preprocess_meshopt(
-    json: &mut serde_json::Value,
-    bin: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
+fn preprocess_meshopt(json: &mut serde_json::Value, bin: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let bin = bin.ok_or("meshopt GLB has no BIN chunk")?;
     let view_count = json["bufferViews"].as_array().map(|a| a.len()).unwrap_or(0);
     let mut new_bin: Vec<u8> = Vec::new();
@@ -882,11 +957,17 @@ fn preprocess_meshopt(
                 return Err("meshopt ext references a non-BIN buffer".into());
             }
             let off = ext["byteOffset"].as_u64().unwrap_or(0) as usize;
-            let len = ext["byteLength"].as_u64().ok_or("meshopt ext without byteLength")? as usize;
-            let stride =
-                ext["byteStride"].as_u64().ok_or("meshopt ext without byteStride")? as usize;
+            let len = ext["byteLength"]
+                .as_u64()
+                .ok_or("meshopt ext without byteLength")? as usize;
+            let stride = ext["byteStride"]
+                .as_u64()
+                .ok_or("meshopt ext without byteStride")? as usize;
             let count = ext["count"].as_u64().ok_or("meshopt ext without count")? as usize;
-            let mode = ext["mode"].as_str().ok_or("meshopt ext without mode")?.to_string();
+            let mode = ext["mode"]
+                .as_str()
+                .ok_or("meshopt ext without mode")?
+                .to_string();
             let filter = ext["filter"].as_str().unwrap_or("NONE").to_string();
             let src = bin
                 .get(off..off + len)
@@ -912,7 +993,9 @@ fn preprocess_meshopt(
                 return Err("non-meshopt bufferView references a non-BIN buffer".into());
             }
             let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
-            let len = bv["byteLength"].as_u64().ok_or("bufferView without byteLength")? as usize;
+            let len = bv["byteLength"]
+                .as_u64()
+                .ok_or("bufferView without byteLength")? as usize;
             let bytes = bin
                 .get(off..off + len)
                 .ok_or("bufferView out of BIN bounds")?
@@ -1041,8 +1124,7 @@ fn decode_primitive(
         .collect();
     let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|it| it.collect());
     let uvs: Option<Vec<[f32; 2]>> = reader.read_tex_coords(0).map(|tc| tc.into_f32().collect());
-    let colors: Option<Vec<[f32; 4]>> =
-        reader.read_colors(0).map(|c| c.into_rgba_f32().collect());
+    let colors: Option<Vec<[f32; 4]>> = reader.read_colors(0).map(|c| c.into_rgba_f32().collect());
     let indices: Option<Vec<u32>> = reader.read_indices().map(|ix| ix.into_u32().collect());
 
     // T8: per-feature picking — derive feature_of_triangle from `_FEATURE_ID_0`
@@ -1083,7 +1165,12 @@ fn decode_primitive(
     }
 
     let material = decode_material(&primitive.material(), blob)?;
-    Ok(DecodedPrimitive { transform, mesh, material, features })
+    Ok(DecodedPrimitive {
+        transform,
+        mesh,
+        material,
+        features,
+    })
 }
 
 /// `POINTS`-mode primitive → point-renderer data. Positions stay in the glTF
@@ -1284,7 +1371,11 @@ fn decode_splat_node(
 #[cfg(feature = "splats")]
 fn node_transform(node: &serde_json::Value) -> Mat4 {
     if let Some(m) = node["matrix"].as_array() {
-        let vals: Vec<f32> = m.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
+        let vals: Vec<f32> = m
+            .iter()
+            .filter_map(|v| v.as_f64())
+            .map(|v| v as f32)
+            .collect();
         if vals.len() == 16 {
             return Mat4::from_cols_array(&vals.try_into().unwrap());
         }
@@ -1293,8 +1384,11 @@ fn node_transform(node: &serde_json::Value) -> Mat4 {
         node[key]
             .as_array()
             .and_then(|a| {
-                let v: Vec<f32> =
-                    a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
+                let v: Vec<f32> = a
+                    .iter()
+                    .filter_map(|x| x.as_f64())
+                    .map(|x| x as f32)
+                    .collect();
                 <[f32; 3]>::try_from(v).ok()
             })
             .map(bevy::math::Vec3::from)
@@ -1303,7 +1397,11 @@ fn node_transform(node: &serde_json::Value) -> Mat4 {
     let rotation = node["rotation"]
         .as_array()
         .and_then(|a| {
-            let v: Vec<f32> = a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
+            let v: Vec<f32> = a
+                .iter()
+                .filter_map(|x| x.as_f64())
+                .map(|x| x as f32)
+                .collect();
             <[f32; 4]>::try_from(v).ok()
         })
         .map(bevy::math::Quat::from_array)
@@ -1346,7 +1444,10 @@ fn decode_splat_primitive(
     }
 
     let n = positions.len();
-    if [rotations.len(), scales.len(), opacities.len()].iter().any(|&l| l != n) {
+    if [rotations.len(), scales.len(), opacities.len()]
+        .iter()
+        .any(|&l| l != n)
+    {
         return Err(format!(
             "splat attribute counts disagree: pos={n} rot={} scale={} opacity={}",
             rotations.len(),
@@ -1404,7 +1505,9 @@ fn read_accessor<const N: usize>(
         return Err(format!("accessor {index} out of bounds"));
     }
     let count = acc["count"].as_u64().ok_or("accessor without count")? as usize;
-    let comp_type = acc["componentType"].as_u64().ok_or("accessor without componentType")?;
+    let comp_type = acc["componentType"]
+        .as_u64()
+        .ok_or("accessor without componentType")?;
     let normalized = acc["normalized"].as_bool().unwrap_or(false);
     let type_str = acc["type"].as_str().ok_or("accessor without type")?;
     let comps = match type_str {
@@ -1415,7 +1518,9 @@ fn read_accessor<const N: usize>(
         other => return Err(format!("unsupported accessor type {other}")),
     };
     if comps != N {
-        return Err(format!("accessor {index} is {type_str}, expected {N} components"));
+        return Err(format!(
+            "accessor {index} is {type_str}, expected {N} components"
+        ));
     }
     let comp_size = match comp_type {
         5120 | 5121 => 1, // i8 / u8
@@ -1423,15 +1528,22 @@ fn read_accessor<const N: usize>(
         5125 | 5126 => 4, // u32 / f32
         other => return Err(format!("unsupported componentType {other}")),
     };
-    let bv_ix = acc["bufferView"].as_u64().ok_or("accessor without bufferView")? as usize;
+    let bv_ix = acc["bufferView"]
+        .as_u64()
+        .ok_or("accessor without bufferView")? as usize;
     let bv = &json["bufferViews"][bv_ix];
     if bv["buffer"].as_u64() != Some(0) {
         return Err("accessor bufferView must reference buffer 0 (BIN chunk)".into());
     }
     let bin = bin.ok_or("accessor references the BIN chunk but the GLB has none")?;
     let bv_offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let bv_len = bv["byteLength"].as_u64().ok_or("bufferView without byteLength")? as usize;
-    let stride = bv["byteStride"].as_u64().map(|s| s as usize).unwrap_or(comp_size * N);
+    let bv_len = bv["byteLength"]
+        .as_u64()
+        .ok_or("bufferView without byteLength")? as usize;
+    let stride = bv["byteStride"]
+        .as_u64()
+        .map(|s| s as usize)
+        .unwrap_or(comp_size * N);
     let acc_offset = acc["byteOffset"].as_u64().unwrap_or(0) as usize;
     let view = bin
         .get(bv_offset..bv_offset + bv_len)
@@ -1462,7 +1574,11 @@ fn read_accessor<const N: usize>(
                 }
                 5122 => {
                     let v = i16::from_le_bytes(bytes.try_into().unwrap()) as f32;
-                    if normalized { (v / 32767.0).max(-1.0) } else { v }
+                    if normalized {
+                        (v / 32767.0).max(-1.0)
+                    } else {
+                        v
+                    }
                 }
                 5125 => u32::from_le_bytes(bytes.try_into().unwrap()) as f32,
                 _ => unreachable!(),
@@ -1530,13 +1646,12 @@ mod tests {
     fn decodes_positions_colors_and_node_transform() {
         let items = decode_glb(&tiny_glb()).expect("decode");
         assert_eq!(items.len(), 1);
-        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
+        let DecodedItem::Mesh(p) = &items[0] else {
+            panic!("expected mesh")
+        };
         // Node translation carried into the primitive transform.
         assert_eq!(p.transform.w_axis.y, 2.0);
-        assert_eq!(
-            p.mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len(),
-            3
-        );
+        assert_eq!(p.mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len(), 3);
         // Normals were computed (absent in the GLB).
         assert!(p.mesh.attribute(Mesh::ATTRIBUTE_NORMAL).is_some());
         assert!(p.mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
@@ -1586,7 +1701,11 @@ mod tests {
     fn decode_tile_extracts_planetary_node_matrix() {
         use bevy::tasks::block_on;
 
-        let (cx, cy, cz) = (-2_398_029.177_060_164, 3_361_082.915_181_850_5, 2_398_029.177_060_164_5);
+        let (cx, cy, cz) = (
+            -2_398_029.177_060_164,
+            3_361_082.915_181_850_5,
+            2_398_029.177_060_164_5,
+        );
         let glb_bytes = tiny_glb();
         let (json, bin) = split_glb(&glb_bytes).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(json).unwrap();
@@ -1608,12 +1727,24 @@ mod tests {
 
         let tile = block_on(decode_tile(&glb, true)).expect("decode");
         let rtc = tile.rtc_center.expect("planetary offset extracted");
-        assert!((rtc - DVec3::new(cx, cy, cz)).length() < 1e-6, "rtc = {rtc:?}");
-        let DecodedItem::Mesh(p) = &tile.items[0] else { panic!("expected mesh") };
+        assert!(
+            (rtc - DVec3::new(cx, cy, cz)).length() < 1e-6,
+            "rtc = {rtc:?}"
+        );
+        let DecodedItem::Mesh(p) = &tile.items[0] else {
+            panic!("expected mesh")
+        };
         // The decoded transform keeps the rotation but the translation is
         // tile-local now (zero here — single node).
-        assert!(p.transform.w_axis.truncate().length() < 1e-3, "{:?}", p.transform.w_axis);
-        assert!((p.transform.y_axis.z - (-1.0)).abs() < 1e-6, "rotation preserved");
+        assert!(
+            p.transform.w_axis.truncate().length() < 1e-3,
+            "{:?}",
+            p.transform.w_axis
+        );
+        assert!(
+            (p.transform.y_axis.z - (-1.0)).abs() < 1e-6,
+            "rotation preserved"
+        );
         assert!(p.material.unlit, "KHR_materials_unlit decoded");
         assert_eq!(tile.copyright.as_deref(), Some("Google"));
     }
@@ -1669,7 +1800,9 @@ mod tests {
         // The spliced GLB decodes through the strict gltf-crate path.
         let items = decode_glb(&vanilla).expect("decode spliced");
         assert_eq!(items.len(), 1);
-        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
+        let DecodedItem::Mesh(p) = &items[0] else {
+            panic!("expected mesh")
+        };
         assert_eq!(p.mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len(), 3);
         assert!(p.mesh.indices().is_some());
         // All handled extensions stripped.
@@ -1717,7 +1850,9 @@ mod tests {
         let glb = glb_from_parts(&serde_json::to_vec(&json).unwrap(), &bin);
         let items = decode_glb(&glb).expect("decode");
         assert_eq!(items.len(), 1);
-        let DecodedItem::Points { points, .. } = &items[0] else { panic!("expected points") };
+        let DecodedItem::Points { points, .. } = &items[0] else {
+            panic!("expected points")
+        };
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].position, bevy::math::Vec3::new(0.0, 1.0, 2.0));
         assert_eq!(points[0].point_size, -1.0);
@@ -1787,7 +1922,11 @@ mod tests {
         let glb = glb_from_parts(&serde_json::to_vec(&json).unwrap(), &bin);
         let items = decode_glb(&glb).expect("decode");
         assert_eq!(items.len(), 1);
-        let DecodedItem::Splat { transform, gaussians } = &items[0] else {
+        let DecodedItem::Splat {
+            transform,
+            gaussians,
+        } = &items[0]
+        else {
             panic!("expected splat")
         };
         assert_eq!(transform.w_axis.x, 10.0);
@@ -1815,14 +1954,21 @@ mod tests {
         use base64::Engine;
 
         const GLB_B64: &str = "Z2xURgIAAABMBgAAaAUAAEpTT057ImFzc2V0Ijp7ImdlbmVyYXRvciI6ImdsVEYtVHJhbnNmb3JtIHY0LjMuMCIsInZlcnNpb24iOiIyLjAifSwiYWNjZXNzb3JzIjpbeyJ0eXBlIjoiVkVDMyIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50Ijo2LCJtYXgiOlsyLDMsM10sIm1pbiI6Wy0xLDAsMF0sIm5vcm1hbGl6ZWQiOmZhbHNlLCJieXRlT2Zmc2V0IjowLCJidWZmZXJWaWV3IjowfSx7InR5cGUiOiJWRUM0IiwiY29tcG9uZW50VHlwZSI6NTEyNiwiY291bnQiOjYsIm5vcm1hbGl6ZWQiOmZhbHNlLCJieXRlT2Zmc2V0IjowLCJidWZmZXJWaWV3IjoxfSx7InR5cGUiOiJTQ0FMQVIiLCJjb21wb25lbnRUeXBlIjo1MTI1LCJjb3VudCI6MTIsIm5vcm1hbGl6ZWQiOmZhbHNlLCJieXRlT2Zmc2V0IjowLCJidWZmZXJWaWV3IjoyfV0sImJ1ZmZlclZpZXdzIjpbeyJidWZmZXIiOjEsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjcyLCJ0YXJnZXQiOjM0OTYyLCJieXRlU3RyaWRlIjoxMiwiZXh0ZW5zaW9ucyI6eyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiI6eyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjgwLCJtb2RlIjoiQVRUUklCVVRFUyIsImJ5dGVTdHJpZGUiOjEyLCJjb3VudCI6Nn19fSx7ImJ1ZmZlciI6MSwiYnl0ZU9mZnNldCI6NzIsImJ5dGVMZW5ndGgiOjk2LCJ0YXJnZXQiOjM0OTYyLCJieXRlU3RyaWRlIjoxNiwiZXh0ZW5zaW9ucyI6eyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiI6eyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjgwLCJieXRlTGVuZ3RoIjo5NSwibW9kZSI6IkFUVFJJQlVURVMiLCJieXRlU3RyaWRlIjoxNiwiY291bnQiOjZ9fX0seyJidWZmZXIiOjEsImJ5dGVPZmZzZXQiOjE2OCwiYnl0ZUxlbmd0aCI6NDgsInRhcmdldCI6MzQ5NjMsImV4dGVuc2lvbnMiOnsiRVhUX21lc2hvcHRfY29tcHJlc3Npb24iOnsiYnVmZmVyIjowLCJieXRlT2Zmc2V0IjoxNzYsImJ5dGVMZW5ndGgiOjIyLCJtb2RlIjoiVFJJQU5HTEVTIiwiYnl0ZVN0cmlkZSI6NCwiY291bnQiOjEyfX19XSwiYnVmZmVycyI6W3siYnl0ZUxlbmd0aCI6MjAwfSx7ImJ5dGVMZW5ndGgiOjIxNiwiZXh0ZW5zaW9ucyI6eyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiI6eyJmYWxsYmFjayI6dHJ1ZX19fV0sIm1lc2hlcyI6W3sicHJpbWl0aXZlcyI6W3siYXR0cmlidXRlcyI6eyJQT1NJVElPTiI6MCwiQ09MT1JfMCI6MX0sIm1vZGUiOjQsImluZGljZXMiOjJ9XX1dLCJub2RlcyI6W3sidHJhbnNsYXRpb24iOlsxMCwwLDBdLCJtZXNoIjowfV0sInNjZW5lcyI6W3sibm9kZXMiOlswXX1dLCJleHRlbnNpb25zVXNlZCI6WyJFWFRfbWVzaG9wdF9jb21wcmVzc2lvbiJdLCJleHRlbnNpb25zUmVxdWlyZWQiOlsiRVhUX21lc2hvcHRfY29tcHJlc3Npb24iXX0gyAAAAEJJTgCgAAABAMAAAP8BM/AAAIB/fv8AAAEA8AAA/38BDGAAAIAAAAEA8AAAgIABANAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAAEz8AAA/////wEz8AAAfX59fgAAAT8wAAD/////AT8wAAB+fX59AAABD8AAAP///wEPwAAAfn1+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AOHwAP4FAgB2h1ZneKmGZYlomAFpAAAAAA==";
-        let glb = base64::engine::general_purpose::STANDARD.decode(GLB_B64).unwrap();
+        let glb = base64::engine::general_purpose::STANDARD
+            .decode(GLB_B64)
+            .unwrap();
 
         let items = decode_glb(&glb).expect("meshopt decode");
         assert_eq!(items.len(), 1);
-        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
+        let DecodedItem::Mesh(p) = &items[0] else {
+            panic!("expected mesh")
+        };
 
         // Node translation [10,0,0] carried onto the primitive transform.
-        assert_eq!(p.transform.w_axis.truncate(), bevy::math::Vec3::new(10.0, 0.0, 0.0));
+        assert_eq!(
+            p.transform.w_axis.truncate(),
+            bevy::math::Vec3::new(10.0, 0.0, 0.0)
+        );
 
         // Positions are byte-identical (lossless meshopt vertex codec).
         let pos = p
@@ -1832,15 +1978,21 @@ mod tests {
             .as_float3()
             .unwrap();
         let expect_pos: [[f32; 3]; 6] = [
-            [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 2.0, 0.0],
-            [0.0, 2.0, 0.0], [1.0, 1.0, 3.0], [-1.0, 3.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 1.0, 3.0],
+            [-1.0, 3.0, 1.0],
         ];
         assert_eq!(pos, &expect_pos, "positions must round-trip byte-identical");
         assert!(p.mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
 
         // The triangle SET is preserved (meshopt may cyclically rotate each
         // triangle — winding kept, a rendering no-op).
-        let Some(Indices::U32(idx)) = p.mesh.indices() else { panic!("expected u32 indices") };
+        let Some(Indices::U32(idx)) = p.mesh.indices() else {
+            panic!("expected u32 indices")
+        };
         assert_eq!(idx.len(), 12);
         let as_sorted_tris = |flat: &[u32]| {
             let mut tris: Vec<[u32; 3]> = flat
@@ -1868,8 +2020,12 @@ mod tests {
     fn decodes_feature_metadata() {
         // 6 verts (2 tris). Tri 0 → feature 0, tri 1 → feature 1.
         let positions: [[f32; 3]; 6] = [
-            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
-            [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
         ];
         let feature_ids: [f32; 6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let indices: [u32; 6] = [0, 1, 2, 3, 4, 5];
@@ -1945,7 +2101,9 @@ mod tests {
 
         let items = decode_glb(&glb).expect("decode features");
         assert_eq!(items.len(), 1);
-        let DecodedItem::Mesh(p) = &items[0] else { panic!("expected mesh") };
+        let DecodedItem::Mesh(p) = &items[0] else {
+            panic!("expected mesh")
+        };
         let feats = p.features.as_ref().expect("feature metadata decoded");
         // featureId per triangle, in index-buffer order.
         assert_eq!(feats.feature_of_triangle, vec![0, 1]);
@@ -1974,18 +2132,29 @@ mod tests {
         set_supported_compressed_formats(CompressedImageFormats::BC);
 
         const GLB_B64: &str = "Z2xURgIAAACUBQAAMAQAAEpTT057ImFzc2V0Ijp7ImdlbmVyYXRvciI6ImdsVEYtVHJhbnNmb3JtIHY0LjMuMCIsInZlcnNpb24iOiIyLjAifSwiYWNjZXNzb3JzIjpbeyJ0eXBlIjoiVkVDMyIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJtYXgiOlsxLDEsMF0sIm1pbiI6WzAsMCwwXSwiYnVmZmVyVmlldyI6MSwiYnl0ZU9mZnNldCI6MH0seyJ0eXBlIjoiVkVDMiIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJidWZmZXJWaWV3IjoxLCJieXRlT2Zmc2V0IjoxMn0seyJ0eXBlIjoiU0NBTEFSIiwiY29tcG9uZW50VHlwZSI6NTEyNSwiY291bnQiOjMsImJ1ZmZlclZpZXciOjIsImJ5dGVPZmZzZXQiOjB9XSwiYnVmZmVyVmlld3MiOlt7ImJ1ZmZlciI6MCwiYnl0ZU9mZnNldCI6NzIsImJ5dGVMZW5ndGgiOjI1NH0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjYwLCJieXRlU3RyaWRlIjoyMCwidGFyZ2V0IjozNDk2Mn0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjYwLCJieXRlTGVuZ3RoIjoxMiwidGFyZ2V0IjozNDk2M31dLCJzYW1wbGVycyI6W3sid3JhcFMiOjEwNDk3LCJ3cmFwVCI6MTA0OTd9XSwidGV4dHVyZXMiOlt7InNhbXBsZXIiOjAsImV4dGVuc2lvbnMiOnsiS0hSX3RleHR1cmVfYmFzaXN1Ijp7InNvdXJjZSI6MH19fV0sImltYWdlcyI6W3sibmFtZSI6ImJhc2UiLCJtaW1lVHlwZSI6ImltYWdlL2t0eDIiLCJidWZmZXJWaWV3IjowfV0sImJ1ZmZlcnMiOlt7ImJ5dGVMZW5ndGgiOjMyOH1dLCJtYXRlcmlhbHMiOlt7Im5hbWUiOiJtIiwicGJyTWV0YWxsaWNSb3VnaG5lc3MiOnsiYmFzZUNvbG9yVGV4dHVyZSI6eyJpbmRleCI6MH19fV0sIm1lc2hlcyI6W3sicHJpbWl0aXZlcyI6W3siYXR0cmlidXRlcyI6eyJQT1NJVElPTiI6MCwiVEVYQ09PUkRfMCI6MX0sIm1vZGUiOjQsIm1hdGVyaWFsIjowLCJpbmRpY2VzIjoyfV19XSwibm9kZXMiOlt7Im1lc2giOjB9XSwic2NlbmVzIjpbeyJub2RlcyI6WzBdfV0sImV4dGVuc2lvbnNVc2VkIjpbIktIUl90ZXh0dXJlX2Jhc2lzdSJdLCJleHRlbnNpb25zUmVxdWlyZWQiOlsiS0hSX3RleHR1cmVfYmFzaXN1Il19SAEAAEJJTgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAQAAAAIAAACrS1RYIDIwuw0KGgoAAAAAAQAAAAgAAAAIAAAAAAAAAAAAAAABAAAAAQAAAAIAAABoAAAALAAAAJQAAABQAAAAAAAAAAAAAAAAAAAAAAAAAOQAAAAAAAAAGgAAAAAAAABAAAAAAAAAACwAAAAAAAAAAgAoAKYBAgADAwAAEAAAAAAAAAAAAH8AAAAAAAAAAAD/////LAAAAEtUWHdyaXRlcgBrdHggY3JlYXRlIHY0LjQuMiAvIGxpYmt0eCB2NC40LjIAHAAAAEtUWHdyaXRlclNjUGFyYW1zAC0tenN0ZCAxOAAotS/9IECNAABIVwGZ5/87vgEAAgDNjCADRwAA";
-        let glb = base64::engine::general_purpose::STANDARD.decode(GLB_B64).unwrap();
+        let glb = base64::engine::general_purpose::STANDARD
+            .decode(GLB_B64)
+            .unwrap();
 
         let tile = block_on(decode_tile(&glb, false)).expect("ktx2 decode");
         assert_eq!(tile.items.len(), 1);
-        let DecodedItem::Mesh(p) = &tile.items[0] else { panic!("expected mesh") };
+        let DecodedItem::Mesh(p) = &tile.items[0] else {
+            panic!("expected mesh")
+        };
         // Resolved to a real image; the pending KTX2 bytes were consumed.
-        assert!(p.material.base_color_ktx2.is_none(), "pending KTX2 must be taken");
+        assert!(
+            p.material.base_color_ktx2.is_none(),
+            "pending KTX2 must be taken"
+        );
         let img = p
             .material
             .base_color_image
             .as_ref()
             .expect("KTX2 base color transcoded");
-        assert_eq!((img.width(), img.height()), (8, 8), "8x8 source dimensions kept");
+        assert_eq!(
+            (img.width(), img.height()),
+            (8, 8),
+            "8x8 source dimensions kept"
+        );
     }
 }

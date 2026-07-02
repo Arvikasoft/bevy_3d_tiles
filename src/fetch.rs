@@ -63,11 +63,15 @@ impl AbortHandle {
             // AbortController::new only fails in pathological environments;
             // degrade to a dummy that can never be constructed — unwrap is the
             // pragmatic choice (the basemap fetch layer makes the same call).
-            Self { controller: web_sys::AbortController::new().expect("AbortController") }
+            Self {
+                controller: web_sys::AbortController::new().expect("AbortController"),
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            Self { flag: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+            Self {
+                flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
         }
     }
 
@@ -120,9 +124,8 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 #[cfg(not(target_arch = "wasm32"))]
-static ABORTS: std::sync::Mutex<
-    Option<std::collections::HashMap<u64, AbortHandle>>,
-> = std::sync::Mutex::new(None);
+static ABORTS: std::sync::Mutex<Option<std::collections::HashMap<u64, AbortHandle>>> =
+    std::sync::Mutex::new(None);
 
 /// Create + register the abort handle for a request generation.
 pub fn register_abort(generation: u64) -> AbortHandle {
@@ -206,9 +209,10 @@ impl ByteSource {
         match self {
             ByteSource::Mem(buf) => {
                 let size = buf.len() as u64;
-                let end = start.checked_add(len).filter(|&e| e <= size).ok_or(
-                    FetchError::OutOfRange { start, len, size },
-                )?;
+                let end = start
+                    .checked_add(len)
+                    .filter(|&e| e <= size)
+                    .ok_or(FetchError::OutOfRange { start, len, size })?;
                 Ok(buf[start as usize..end as usize].to_vec())
             }
             ByteSource::File(path) => {
@@ -218,9 +222,8 @@ impl ByteSource {
                 f.seek(SeekFrom::Start(start))
                     .map_err(|e| FetchError::Io(e.to_string()))?;
                 let mut out = vec![0u8; len as usize];
-                f.read_exact(&mut out).map_err(|e| {
-                    FetchError::Io(format!("short read at {start}+{len}: {e}"))
-                })?;
+                f.read_exact(&mut out)
+                    .map_err(|e| FetchError::Io(format!("short read at {start}+{len}: {e}")))?;
                 Ok(out)
             }
             ByteSource::Http(url) => http_range(url, start, len, abort).await,
@@ -251,8 +254,9 @@ impl ByteSource {
         check_abort(abort)?;
         match self {
             ByteSource::Mem(buf) => Ok(buf.as_ref().clone()),
-            ByteSource::File(path) => std::fs::read(path)
-                .map_err(|e| FetchError::Io(format!("{}: {e}", path.display()))),
+            ByteSource::File(path) => {
+                std::fs::read(path).map_err(|e| FetchError::Io(format!("{}: {e}", path.display())))
+            }
             ByteSource::Http(url) => http_get_all(url, abort).await,
         }
     }
@@ -276,8 +280,15 @@ pub struct BudgetCounter {
 impl BudgetCounter {
     pub fn new(cap: u32, persist_label: Option<&str>) -> Self {
         let persist_key = persist_label.map(|l| format!("tt-p3dt-budget:{l}:{}", utc_date()));
-        let used = persist_key.as_deref().and_then(local_storage_get_u32).unwrap_or(0);
-        Self { used: std::sync::atomic::AtomicU32::new(used), cap, persist_key }
+        let used = persist_key
+            .as_deref()
+            .and_then(local_storage_get_u32)
+            .unwrap_or(0);
+        Self {
+            used: std::sync::atomic::AtomicU32::new(used),
+            cap,
+            persist_key,
+        }
     }
 
     /// Count one request. `Err(cap)` when the budget is exhausted — the
@@ -380,10 +391,19 @@ impl LiveSession {
     pub fn new(root_url: &str, key: String, budget: BudgetCounter) -> Self {
         let base = root_url
             .find("://")
-            .and_then(|at| root_url[at + 3..].find('/').map(|slash| &root_url[..at + 3 + slash]))
+            .and_then(|at| {
+                root_url[at + 3..]
+                    .find('/')
+                    .map(|slash| &root_url[..at + 3 + slash])
+            })
             .unwrap_or(root_url)
             .to_string();
-        Self { base, key, session: std::sync::Mutex::new(None), budget }
+        Self {
+            base,
+            key,
+            session: std::sync::Mutex::new(None),
+            budget,
+        }
     }
 
     pub fn budget(&self) -> &BudgetCounter {
@@ -487,16 +507,22 @@ impl TilesetSource {
         match self {
             TilesetSource::Exploded(base) => base.join(uri).read_all_abortable(abort).await,
             TilesetSource::Archive(ar) => {
-                ar.read_entry_abortable(uri, abort).await.map_err(|e| match e {
-                    super::archive::ArchiveError::Fetch(FetchError::Aborted) => {
-                        FetchError::Aborted
-                    }
-                    e => FetchError::Io(format!("3tz entry {uri}: {e}")),
-                })
+                ar.read_entry_abortable(uri, abort)
+                    .await
+                    .map_err(|e| match e {
+                        super::archive::ArchiveError::Fetch(FetchError::Aborted) => {
+                            FetchError::Aborted
+                        }
+                        e => FetchError::Io(format!("3tz entry {uri}: {e}")),
+                    })
             }
             TilesetSource::Live(live) => {
-                live.budget.try_acquire().map_err(FetchError::BudgetExhausted)?;
-                ByteSource::Http(live.entry_url(uri)).read_all_abortable(abort).await
+                live.budget
+                    .try_acquire()
+                    .map_err(FetchError::BudgetExhausted)?;
+                ByteSource::Http(live.entry_url(uri))
+                    .read_all_abortable(abort)
+                    .await
             }
         }
     }
@@ -570,8 +596,11 @@ async fn cache_get(key: &str) -> Option<Vec<u8>> {
     use wasm_bindgen_futures::JsFuture;
 
     let caches = web_sys::window()?.caches().ok()?;
-    let cache: web_sys::Cache =
-        JsFuture::from(caches.open(CONTENT_CACHE)).await.ok()?.dyn_into().ok()?;
+    let cache: web_sys::Cache = JsFuture::from(caches.open(CONTENT_CACHE))
+        .await
+        .ok()?
+        .dyn_into()
+        .ok()?;
     let matched = JsFuture::from(cache.match_with_str(key)).await.ok()?;
     if matched.is_undefined() {
         return None;
@@ -586,7 +615,7 @@ async fn cache_get(key: &str) -> Option<Vec<u8>> {
 #[cfg(target_arch = "wasm32")]
 fn cache_store_bytes(key: String, bytes: &[u8]) {
     use wasm_bindgen::JsCast;
-    use wasm_bindgen_futures::{spawn_local, JsFuture};
+    use wasm_bindgen_futures::{JsFuture, spawn_local};
 
     let mut owned = bytes.to_vec();
     spawn_local(async move {
@@ -604,7 +633,10 @@ fn cache_store_bytes(key: String, bytes: &[u8]) {
         else {
             return;
         };
-        if JsFuture::from(cache.put_with_str(&key, &response)).await.is_err() {
+        if JsFuture::from(cache.put_with_str(&key, &response))
+            .await
+            .is_err()
+        {
             bevy::log::debug!("tiles3d: cache store failed for {key} (non-fatal)");
         }
     });
@@ -628,7 +660,15 @@ pub fn spawn_io<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) {
 
 /// Parse the total from a `Content-Range: bytes <start>-<end>/<total>` header.
 fn parse_content_range_total(value: &str) -> Option<u64> {
-    value.trim().strip_prefix("bytes")?.trim().rsplit_once('/')?.1.trim().parse().ok()
+    value
+        .trim()
+        .strip_prefix("bytes")?
+        .trim()
+        .rsplit_once('/')?
+        .1
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -664,15 +704,22 @@ async fn http_range(
         .await
         .map_err(|e| map_gloo_error(e, abort))?;
     match resp.status() {
-        206 => resp.binary().await.map_err(|e| FetchError::Http(e.to_string())),
+        206 => resp
+            .binary()
+            .await
+            .map_err(|e| FetchError::Http(e.to_string())),
         // Server ignored the Range header (no range support): take the whole
         // body and slice. Degraded but correct — matters only for dev servers.
         200 => {
-            let body = resp.binary().await.map_err(|e| FetchError::Http(e.to_string()))?;
+            let body = resp
+                .binary()
+                .await
+                .map_err(|e| FetchError::Http(e.to_string()))?;
             let size = body.len() as u64;
-            let end = start.checked_add(len).filter(|&e| e <= size).ok_or(
-                FetchError::OutOfRange { start, len, size },
-            )?;
+            let end = start
+                .checked_add(len)
+                .filter(|&e| e <= size)
+                .ok_or(FetchError::OutOfRange { start, len, size })?;
             Ok(body[start as usize..end as usize].to_vec())
         }
         s => Err(FetchError::Http(format!("status {s} for ranged GET {url}"))),
@@ -705,7 +752,10 @@ async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
                          is Content-Range in the CORS ExposedHeaders?"
                     ))
                 })?;
-            let bytes = resp.binary().await.map_err(|e| FetchError::Http(e.to_string()))?;
+            let bytes = resp
+                .binary()
+                .await
+                .map_err(|e| FetchError::Http(e.to_string()))?;
             Ok((bytes, total))
         }
         200 => {
@@ -725,8 +775,10 @@ async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
                     Ok((bytes, total))
                 }
                 _ => {
-                    let body =
-                        resp.binary().await.map_err(|e| FetchError::Http(e.to_string()))?;
+                    let body = resp
+                        .binary()
+                        .await
+                        .map_err(|e| FetchError::Http(e.to_string()))?;
                     let total = body.len() as u64;
                     let n = n.min(total) as usize;
                     Ok((body[body.len() - n..].to_vec(), total))
@@ -745,7 +797,10 @@ async fn http_get_all(url: &str, abort: Option<&AbortHandle>) -> Result<Vec<u8>,
         .await
         .map_err(|e| map_gloo_error(e, abort))?;
     if !resp.ok() {
-        return Err(FetchError::Http(format!("status {} for GET {url}", resp.status())));
+        return Err(FetchError::Http(format!(
+            "status {} for GET {url}",
+            resp.status()
+        )));
     }
     resp.binary().await.map_err(|e| map_gloo_error(e, abort))
 }
@@ -778,9 +833,10 @@ async fn http_range(
         206 => Ok(body.to_vec()),
         200 => {
             let size = body.len() as u64;
-            let end = start.checked_add(len).filter(|&e| e <= size).ok_or(
-                FetchError::OutOfRange { start, len, size },
-            )?;
+            let end = start
+                .checked_add(len)
+                .filter(|&e| e <= size)
+                .ok_or(FetchError::OutOfRange { start, len, size })?;
             Ok(body[start as usize..end as usize].to_vec())
         }
         s => Err(FetchError::Http(format!("status {s} for ranged GET {url}"))),
@@ -835,7 +891,10 @@ async fn http_get_all(url: &str, abort: Option<&AbortHandle>) -> Result<Vec<u8>,
     check_abort(abort)?;
     let resp = reqwest::blocking::get(url).map_err(|e| FetchError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(FetchError::Http(format!("status {} for GET {url}", resp.status())));
+        return Err(FetchError::Http(format!(
+            "status {} for GET {url}",
+            resp.status()
+        )));
     }
     resp.bytes()
         .map(|b| b.to_vec())
@@ -927,7 +986,10 @@ mod tests {
         assert!(source.entry_cache_key("anything.glb").is_none());
         live.budget().try_acquire().unwrap(); // burn the budget
         let res = bevy::tasks::block_on(source.read_entry("x.glb"));
-        assert!(matches!(res, Err(FetchError::BudgetExhausted(1))), "{res:?}");
+        assert!(
+            matches!(res, Err(FetchError::BudgetExhausted(1))),
+            "{res:?}"
+        );
     }
 
     #[test]

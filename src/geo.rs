@@ -11,7 +11,7 @@
 
 use bevy::math::DVec3;
 
-use super::geodesy::{geodetic_to_ecef, WGS84_EQUATORIAL_RADIUS_M};
+use super::geodesy::{WGS84_EQUATORIAL_RADIUS_M, geodetic_to_ecef};
 
 use super::schema::{self, VolumeKind};
 use super::traversal::WorldVolume;
@@ -101,10 +101,16 @@ pub fn tileset_is_georeferenced(ts: &schema::Tileset) -> bool {
     match ts.root.bounding_volume.kind() {
         Some(VolumeKind::Region(_)) => true,
         Some(VolumeKind::Sphere([cx, cy, cz, _])) => {
-            root_transform.transform_point3(DVec3::new(cx, cy, cz)).length() > PLANETARY_M
+            root_transform
+                .transform_point3(DVec3::new(cx, cy, cz))
+                .length()
+                > PLANETARY_M
         }
         Some(VolumeKind::Box(b)) => {
-            root_transform.transform_point3(DVec3::new(b[0], b[1], b[2])).length() > PLANETARY_M
+            root_transform
+                .transform_point3(DVec3::new(b[0], b[1], b[2]))
+                .length()
+                > PLANETARY_M
         }
         None => false,
     }
@@ -115,13 +121,14 @@ mod tests {
     use super::*;
 
     /// Eugene, OR-ish region (the autzen neighbourhood): ~0.01 rad across.
-    const SMALL_REGION: [f64; 6] =
-        [-2.1496, 0.7686, -2.1478, 0.7696, 0.0, 120.0];
+    const SMALL_REGION: [f64; 6] = [-2.1496, 0.7686, -2.1478, 0.7696, 0.0, 120.0];
 
     #[test]
     fn small_region_obb_contains_its_corners_and_centre() {
         let vol = region_to_ecef_volume(&SMALL_REGION);
-        let WorldVolume::Obb { .. } = vol else { panic!("expected OBB") };
+        let WorldVolume::Obb { .. } = vol else {
+            panic!("expected OBB")
+        };
         let [west, south, east, north, min_h, max_h] = SMALL_REGION;
         for (lat, lon) in [
             (south, west),
@@ -166,7 +173,9 @@ mod tests {
             0.0,
             9000.0,
         ]);
-        let WorldVolume::Sphere { center, radius } = vol else { panic!("expected sphere") };
+        let WorldVolume::Sphere { center, radius } = vol else {
+            panic!("expected sphere")
+        };
         assert_eq!(center, DVec3::ZERO);
         assert!(radius >= WGS84_EQUATORIAL_RADIUS_M);
         // A camera on the surface is INSIDE → distance 0 → always refines.

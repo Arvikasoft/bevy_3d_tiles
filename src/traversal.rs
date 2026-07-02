@@ -46,9 +46,15 @@ const INSIDE_EPS: f64 = 1e-9;
 /// planetary-magnitude before f32 conversion at render time).
 #[derive(Debug, Clone, Copy)]
 pub enum WorldVolume {
-    Sphere { center: DVec3, radius: f64 },
+    Sphere {
+        center: DVec3,
+        radius: f64,
+    },
     /// Center + three half-axis vectors (orientation × half-extent).
-    Obb { center: DVec3, half_axes: [DVec3; 3] },
+    Obb {
+        center: DVec3,
+        half_axes: [DVec3; 3],
+    },
 }
 
 impl WorldVolume {
@@ -298,9 +304,11 @@ fn build_node(
     let world = parent_world * local;
 
     let volume = match tile.bounding_volume.kind() {
-        Some(VolumeKind::Sphere([cx, cy, cz, r])) => {
-            WorldVolume::Sphere { center: DVec3::new(cx, cy, cz), radius: r }.transformed(&world)
+        Some(VolumeKind::Sphere([cx, cy, cz, r])) => WorldVolume::Sphere {
+            center: DVec3::new(cx, cy, cz),
+            radius: r,
         }
+        .transformed(&world),
         Some(VolumeKind::Box(b)) => WorldVolume::Obb {
             center: DVec3::new(b[0], b[1], b[2]),
             half_axes: [
@@ -312,9 +320,7 @@ fn build_node(
         .transformed(&world),
         // Regions are EPSG:4979 absolutes — per spec they are NOT affected
         // by tile transforms, so the conversion ignores `world`.
-        Some(VolumeKind::Region(r)) if frame == TreeFrame::Ecef => {
-            geo::region_to_ecef_volume(&r)
-        }
+        Some(VolumeKind::Region(r)) if frame == TreeFrame::Ecef => geo::region_to_ecef_volume(&r),
         Some(VolumeKind::Region(_)) | None => {
             // A region volume in a LOCAL tree has no defined placement (our
             // tilers never emit them); it (or a missing volume) degrades to
@@ -528,7 +534,13 @@ pub fn select<F: Fn(usize) -> bool>(
     if n == 0 {
         return sel;
     }
-    let ctx = Ctx { tree, content, history, culled, params };
+    let ctx = Ctx {
+        tree,
+        content,
+        history,
+        culled,
+        params,
+    };
     sel.covered = visit(&ctx, 0, &mut sel).covered;
 
     // Preload tier: ancestors of the rendered cut that have unloaded content.
@@ -582,8 +594,16 @@ fn load_key<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, tile: usize, dist: f64) -> f
 
 fn push_load<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, sel: &mut Selection, tile: usize, dist: f64) {
     if ctx.content[tile].loadable() {
-        let priority = if dist <= INSIDE_EPS { Priority::Urgent } else { Priority::Normal };
-        sel.loads.push(LoadRequest { tile, priority, key: load_key(ctx, tile, dist) });
+        let priority = if dist <= INSIDE_EPS {
+            Priority::Urgent
+        } else {
+            Priority::Normal
+        };
+        sel.loads.push(LoadRequest {
+            tile,
+            priority,
+            key: load_key(ctx, tile, dist),
+        });
     }
 }
 
@@ -602,7 +622,10 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     // flooring there caps the nadir at an altitude-appropriate LOD that IS
     // loaded, so it renders instead of holing. `cam_height_m == 0` for non-globe
     // sets ⇒ no change (genuine camera-inside still gives infinite SSE).
-    let dist = node.volume.distance_to(ctx.params.cam_pos).max(ctx.params.cam_height_m);
+    let dist = node
+        .volume
+        .distance_to(ctx.params.cam_pos)
+        .max(ctx.params.cam_height_m);
     let sse = screen_space_error(node.geometric_error, dist, ctx.params.k_px);
 
     // Distance-relaxed refine threshold: detail falls off with distance so a
@@ -683,7 +706,10 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
             }
             any_last |= visit(ctx, c, sel).any_rendered_last;
         }
-        return VisitOut { covered: ctx.content[i].settled(), any_rendered_last: any_last };
+        return VisitOut {
+            covered: ctx.content[i].settled(),
+            any_rendered_last: any_last,
+        };
     }
 
     // REPLACE refinement.
@@ -699,7 +725,10 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
         any_last |= v.any_rendered_last;
     }
     if all_covered {
-        return VisitOut { covered: true, any_rendered_last: any_last };
+        return VisitOut {
+            covered: true,
+            any_rendered_last: any_last,
+        };
     }
     // Some selected descendant isn't paintable yet. Resolution ORDER is
     // load-bearing (each clause earned by a live-P3DT regression):
@@ -716,7 +745,10 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     //    before the atomic swap, or a Ready ancestor wins and wipes the cut.
     if any_last {
         push_load(ctx, sel, i, dist);
-        return VisitOut { covered: true, any_rendered_last: true };
+        return VisitOut {
+            covered: true,
+            any_rendered_last: true,
+        };
     }
     // 2. Nothing finer has ever shown here (initial load, or zoom-in from this
     //    coarse tile) and it's renderable → ATOMIC SWAP: paint this tile's own
@@ -725,7 +757,10 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     if ctx.content[i] == TileContent::Ready {
         sel.render.truncate(checkpoint);
         sel.render.push(i);
-        return VisitOut { covered: true, any_rendered_last: ctx.history.rendered[i] };
+        return VisitOut {
+            covered: true,
+            any_rendered_last: ctx.history.rendered[i],
+        };
     }
     // 3. Nothing finer shown AND nothing to swap to (contentless/pending):
     //    drop the partial selections and report uncovered so the nearest READY
@@ -746,7 +781,10 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
             key: load_key(ctx, i, dist),
         });
     }
-    VisitOut { covered: false, any_rendered_last: false }
+    VisitOut {
+        covered: false,
+        any_rendered_last: false,
+    }
 }
 
 #[cfg(test)]
@@ -852,19 +890,28 @@ mod tests {
     fn distance_falloff_stops_far_refinement() {
         let tree = fixture_tree();
         let content = all(TileContent::Ready, tree.len());
-        let history =
-            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         // ~970 m out: root SSE ≈ 21 px > the 16 px base threshold.
         let cam = DVec3::new(0.0, 0.0, 1000.0);
 
         // No falloff → the root refines into its children (pre-fix behaviour).
         let near = select(&tree, &content, &history, &no_cull, params(cam));
-        assert_eq!(near.render, vec![1, 2, 3, 4], "without falloff the root refines");
+        assert_eq!(
+            near.render,
+            vec![1, 2, 3, 4],
+            "without falloff the root refines"
+        );
 
         // 500 m falloff → the root's threshold relaxes to ≈47 px (> its 21 px
         // SSE), so it renders coarse and its far subtree is never descended —
         // no graft/stream storm toward the horizon.
-        let relaxed = SelectParams { detail_falloff_m: 500.0, ..params(cam) };
+        let relaxed = SelectParams {
+            detail_falloff_m: 500.0,
+            ..params(cam)
+        };
         let far = select(&tree, &content, &history, &no_cull, relaxed);
         assert_eq!(far.render, vec![0], "falloff keeps the distant tile coarse");
     }
@@ -879,8 +926,10 @@ mod tests {
         // the nadir demands street-level tiles that aren't loaded from altitude.
         let tree = fixture_tree();
         let content = all(TileContent::Ready, tree.len());
-        let history =
-            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         let cam = DVec3::ZERO; // inside the root volume
 
         // No height floor (the bug): infinite SSE forces refinement to the leaves.
@@ -893,9 +942,16 @@ mod tests {
 
         // 2 km height floor: root SSE ≈ 10 px < the 16 px threshold, so the
         // coarse root renders — altitude-appropriate, no over-refine, no hole.
-        let floored = SelectParams { cam_height_m: 2000.0, ..params(cam) };
+        let floored = SelectParams {
+            cam_height_m: 2000.0,
+            ..params(cam)
+        };
         let sel = select(&tree, &content, &history, &no_cull, floored);
-        assert_eq!(sel.render, vec![0], "the height floor renders the coarse tile, not a hole");
+        assert_eq!(
+            sel.render,
+            vec![0],
+            "the height floor renders the coarse tile, not a hole"
+        );
     }
 
     #[test]
@@ -916,9 +972,18 @@ mod tests {
             world_from_tile: DMat4::IDENTITY,
         });
         let content = vec![TileContent::Pending];
-        let history = History { rendered: vec![false; 1], refined: vec![false; 1] };
+        let history = History {
+            rendered: vec![false; 1],
+            refined: vec![false; 1],
+        };
         // 10 m off the surface: SSE ≫ threshold, but the camera is NOT inside.
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 0.0, 40.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 0.0, 40.0)),
+        );
         let req = sel.loads.iter().find(|r| r.tile == 0).expect("queued");
         assert_eq!(req.priority, Priority::Descend);
         // And Descend outranks Normal / Preload in the sort.
@@ -929,9 +994,18 @@ mod tests {
     fn far_camera_renders_root_only() {
         let tree = fixture_tree();
         let content = all(TileContent::Ready, tree.len());
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         // Root sse = 16·k/d; d ≈ 3000−30 → sse ≈ 7 px < 16 → no refine.
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 0.0, 3000.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 0.0, 3000.0)),
+        );
         assert_eq!(sel.render, vec![0]);
         assert!(sel.loads.is_empty());
     }
@@ -940,11 +1014,24 @@ mod tests {
     fn near_camera_selects_leaves() {
         let tree = fixture_tree();
         let content = all(TileContent::Ready, tree.len());
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         // Inside the root sphere → refine; children near → refine; leaves render.
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         assert_eq!(sel.render.len(), 16);
-        assert!(sel.render.iter().all(|&t| t >= 5), "only leaves: {:?}", sel.render);
+        assert!(
+            sel.render.iter().all(|&t| t >= 5),
+            "only leaves: {:?}",
+            sel.render
+        );
         assert!(sel.refined[0]);
         assert!((1..=4).all(|c| sel.refined[c]));
     }
@@ -956,13 +1043,26 @@ mod tests {
         for slot in content.iter_mut().skip(5) {
             *slot = TileContent::Pending;
         }
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         // Children render in place of their unloaded leaves…
         assert_eq!(sel.render, vec![1, 2, 3, 4]);
         // …and every leaf stays in the load queue at Normal/Urgent priority.
-        let leaf_loads: Vec<usize> =
-            sel.loads.iter().filter(|r| r.tile >= 5).map(|r| r.tile).collect();
+        let leaf_loads: Vec<usize> = sel
+            .loads
+            .iter()
+            .filter(|r| r.tile >= 5)
+            .map(|r| r.tile)
+            .collect();
         assert_eq!(leaf_loads.len(), 16);
         assert!(
             sel.loads.iter().all(|r| r.priority != Priority::Preload),
@@ -975,8 +1075,17 @@ mod tests {
         let tree = fixture_tree();
         let mut content = all(TileContent::Pending, tree.len());
         content[0] = TileContent::Ready;
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         // Nothing below the root can paint → the kick cascades to the root.
         assert_eq!(sel.render, vec![0]);
         // Children + leaves all queued.
@@ -991,17 +1100,28 @@ mod tests {
         let kids = tree.nodes[1].children.clone();
         content[kids[2]] = TileContent::Pending;
         content[kids[3]] = TileContent::Pending;
-        let mut history =
-            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let mut history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         history.rendered[kids[0]] = true;
         history.rendered[kids[1]] = true;
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         // The on-screen fine leaves KEEP rendering — a streaming sibling must
         // never collapse them back to the coarse parent…
         assert!(sel.render.contains(&kids[0]) && sel.render.contains(&kids[1]));
         // …and the parent does NOT render (no coarse-over-fine overlap); the
         // two pending footprints are a transient gap, not a coarse swap.
-        assert!(!sel.render.contains(&1), "no coarse collapse over visible fine");
+        assert!(
+            !sel.render.contains(&1),
+            "no coarse collapse over visible fine"
+        );
         // The pending two stay queued so the gap fills with full detail.
         let queued: Vec<usize> = sel.loads.iter().map(|r| r.tile).collect();
         assert!(queued.contains(&kids[2]) && queued.contains(&kids[3]));
@@ -1021,12 +1141,20 @@ mod tests {
         content[1] = TileContent::None;
         let kids = tree.nodes[1].children.clone();
         content[kids[3]] = TileContent::Pending; // one new sibling streaming
-        let mut history =
-            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let mut history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         for &k in &kids[0..3] {
             history.rendered[k] = true;
         }
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         // The three on-screen leaves keep rendering; no ancestor swap.
         for &k in &kids[0..3] {
             assert!(sel.render.contains(&k), "rendered sibling {k} kept");
@@ -1044,8 +1172,17 @@ mod tests {
     fn cut_ancestors_stay_touched_for_residency() {
         let tree = fixture_tree();
         let content = all(TileContent::Ready, tree.len());
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         assert_eq!(sel.render.len(), 16, "leaves render");
         for anc in 0..=4 {
             assert!(sel.touched[anc], "ancestor {anc} kept resident");
@@ -1057,21 +1194,35 @@ mod tests {
         let tree = fixture_tree();
         let mut content = all(TileContent::Ready, tree.len());
         content[0] = TileContent::Pending; // the coarse target isn't in yet
-        let mut history =
-            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let mut history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         history.refined[0] = true; // we were refined through the root last frame
         for c in 1..=4 {
             history.rendered[c] = true;
         }
         // Far camera → SSE wants the root alone, but it has no content yet.
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 0.0, 3000.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 0.0, 3000.0)),
+        );
         assert_eq!(sel.render, vec![1, 2, 3, 4], "children stay visible");
         assert!(sel.loads.iter().any(|r| r.tile == 0), "root load queued");
         // Once the root lands, the very next pass collapses to it.
         content[0] = TileContent::Ready;
         let mut h2 = History::default();
         h2.absorb(&sel, tree.len());
-        let sel2 = select(&tree, &content, &h2, &no_cull, params(DVec3::new(0.0, 0.0, 3000.0)));
+        let sel2 = select(
+            &tree,
+            &content,
+            &h2,
+            &no_cull,
+            params(DVec3::new(0.0, 0.0, 3000.0)),
+        );
         assert_eq!(sel2.render, vec![0]);
     }
 
@@ -1081,11 +1232,18 @@ mod tests {
         let mut content = all(TileContent::Ready, tree.len());
         let leaf = 5;
         content[leaf] = TileContent::Pending;
-        let history = History { rendered: vec![true; tree.len()], refined: vec![false; tree.len()] };
+        let history = History {
+            rendered: vec![true; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         // Camera inside leaf 5's sphere (center (-10.25,0,-10.25), r 4).
         let cam = DVec3::new(-10.0, 0.0, -10.0);
         let sel = select(&tree, &content, &history, &no_cull, params(cam));
-        let req = sel.loads.iter().find(|r| r.tile == leaf).expect("leaf queued");
+        let req = sel
+            .loads
+            .iter()
+            .find(|r| r.tile == leaf)
+            .expect("leaf queued");
         assert_eq!(req.priority, Priority::Urgent);
         // Urgent sorts first.
         assert_eq!(sel.loads.first().unwrap().priority, Priority::Urgent);
@@ -1099,16 +1257,28 @@ mod tests {
             *slot = TileContent::Pending;
         }
         // History: leaves rendered last frame so no kicking interferes.
-        let mut history =
-            History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let mut history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         for leaf in 5..tree.len() {
             history.rendered[leaf] = true;
         }
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         assert_eq!(sel.render.len(), 16);
         // Root + children queued as Preload (they're not in the cut).
         for anc in 0..=4 {
-            let req = sel.loads.iter().find(|r| r.tile == anc).expect("ancestor queued");
+            let req = sel
+                .loads
+                .iter()
+                .find(|r| r.tile == anc)
+                .expect("ancestor queued");
             assert_eq!(req.priority, Priority::Preload, "tile {anc}");
         }
         // …and Preload sorts after the cut's own (empty here) tier.
@@ -1119,11 +1289,20 @@ mod tests {
     fn culled_children_are_skipped() {
         let tree = fixture_tree();
         let content = all(TileContent::Ready, tree.len());
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
         // Cull child 1 and its subtree (the traversal only tests children at
         // their parent, so culling node 1 prunes nodes 5–8 implicitly).
         let culled = |i: usize| i == 1;
-        let sel = select(&tree, &content, &history, &culled, params(DVec3::new(0.0, 5.0, 0.0)));
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &culled,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         assert_eq!(sel.render.len(), 12, "3 visible children × 4 leaves");
         assert!(sel.render.iter().all(|&t| !(5..=8).contains(&t) && t != 1));
         // Culled subtrees request nothing.
@@ -1137,8 +1316,17 @@ mod tests {
             node.refine = Refine::Add;
         }
         let content = all(TileContent::Ready, tree.len());
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         // ADD: every level renders together.
         assert!(sel.render.contains(&0));
         assert!((1..=4).all(|c| sel.render.contains(&c)));
@@ -1174,10 +1362,18 @@ mod tests {
                 world_from_tile: DMat4::IDENTITY,
             });
         }
-        let content =
-            vec![TileContent::None, TileContent::Ready, TileContent::Ready];
-        let history = History { rendered: vec![false; 3], refined: vec![false; 3] };
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 1.0, 0.0)));
+        let content = vec![TileContent::None, TileContent::Ready, TileContent::Ready];
+        let history = History {
+            rendered: vec![false; 3],
+            refined: vec![false; 3],
+        };
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 1.0, 0.0)),
+        );
         assert_eq!(sel.render, vec![1, 2]);
         assert!(sel.loads.is_empty());
 
@@ -1185,8 +1381,13 @@ mod tests {
         // a hole — empty tiles must refine through to their children (the
         // grafted-subtree shape: the consumed tile keeps its volume but has
         // nothing to draw).
-        let sel_far =
-            select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 0.0, 5000.0)));
+        let sel_far = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 0.0, 5000.0)),
+        );
         assert_eq!(sel_far.render, vec![1, 2], "refines through the empty root");
     }
 
@@ -1203,8 +1404,17 @@ mod tests {
         for &leaf in tree.nodes[1].children.clone().iter() {
             content[leaf] = TileContent::Pending;
         }
-        let history = History { rendered: vec![false; tree.len()], refined: vec![false; tree.len()] };
-        let sel = select(&tree, &content, &history, &no_cull, params(DVec3::new(0.0, 5.0, 0.0)));
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
+        let sel = select(
+            &tree,
+            &content,
+            &history,
+            &no_cull,
+            params(DVec3::new(0.0, 5.0, 0.0)),
+        );
         // Child 1's subtree is unpainted → the ROOT kicks and renders itself.
         assert_eq!(sel.render, vec![0], "root backfills the unpainted quadrant");
         // The pending leaves stay queued.
@@ -1218,7 +1428,11 @@ mod tests {
     fn obb_distance_and_sphere() {
         let obb = WorldVolume::Obb {
             center: DVec3::ZERO,
-            half_axes: [DVec3::new(2.0, 0.0, 0.0), DVec3::new(0.0, 3.0, 0.0), DVec3::new(0.0, 0.0, 4.0)],
+            half_axes: [
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(0.0, 3.0, 0.0),
+                DVec3::new(0.0, 0.0, 4.0),
+            ],
         };
         assert_eq!(obb.distance_to(DVec3::new(1.0, 1.0, 1.0)), 0.0); // inside
         assert!((obb.distance_to(DVec3::new(5.0, 0.0, 0.0)) - 3.0).abs() < 1e-9);
@@ -1263,7 +1477,9 @@ mod tests {
         assert_eq!(tree.nodes[2].refine, Refine::Replace);
         // Content placement: world_from_content = zup→bevy × T × yup→zup; a
         // glTF point at origin lands at the tile's translation in Bevy space.
-        let p = tree.nodes[1].world_from_content.transform_point3(DVec3::ZERO);
+        let p = tree.nodes[1]
+            .world_from_content
+            .transform_point3(DVec3::ZERO);
         assert!((p - DVec3::new(10.0, 3.0, 0.0)).length() < 1e-9);
     }
 
@@ -1339,12 +1555,23 @@ mod tests {
         // The host tile's +100 X (zup) transform composes into the grafted
         // volumes: zup (100,0,0) → bevy (100,0,0).
         let (c2, _) = tree.nodes[2].volume.bounding_sphere();
-        assert!((c2 - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9, "c2 = {c2:?}");
+        assert!(
+            (c2 - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9,
+            "c2 = {c2:?}"
+        );
         let (c3, _) = tree.nodes[3].volume.bounding_sphere();
-        assert!((c3 - DVec3::new(105.0, 0.0, 0.0)).length() < 1e-9, "c3 = {c3:?}");
+        assert!(
+            (c3 - DVec3::new(105.0, 0.0, 0.0)).length() < 1e-9,
+            "c3 = {c3:?}"
+        );
         // Content placement composes the same chain.
-        let p = tree.nodes[3].world_from_content.transform_point3(DVec3::ZERO);
-        assert!((p - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9, "p = {p:?}");
+        let p = tree.nodes[3]
+            .world_from_content
+            .transform_point3(DVec3::ZERO);
+        assert!(
+            (p - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9,
+            "p = {p:?}"
+        );
     }
 
     /// A bare node for the structural `retain` tests (geometry irrelevant).

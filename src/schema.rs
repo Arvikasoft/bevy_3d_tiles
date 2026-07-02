@@ -150,12 +150,17 @@ mod tests {
         assert_eq!(ts.asset.version, "1.1");
         assert_eq!(ts.geometric_error, 64.0);
         assert_eq!(ts.root.refine, Some(Refine::Replace));
-        assert!(matches!(ts.root.bounding_volume.kind(), Some(VolumeKind::Sphere(s)) if s[3] == 30.0));
+        assert!(
+            matches!(ts.root.bounding_volume.kind(), Some(VolumeKind::Sphere(s)) if s[3] == 30.0)
+        );
         assert_eq!(ts.root.content.as_ref().unwrap().uri, "content/root.glb");
         assert_eq!(ts.root.children.len(), 2);
 
         let ne = &ts.root.children[0];
-        assert!(matches!(ne.bounding_volume.kind(), Some(VolumeKind::Box(_))));
+        assert!(matches!(
+            ne.bounding_volume.kind(),
+            Some(VolumeKind::Box(_))
+        ));
         let t = ne.transform.expect("transform");
         assert_eq!(t[14], 3.0); // column-major translation z
         // refine absent on the child — inherited at tree build, None here.
@@ -167,7 +172,10 @@ mod tests {
         let ts = parse_tileset(FIXTURE.as_bytes()).expect("parse");
         let legacy = &ts.root.children[1];
         assert_eq!(legacy.content.as_ref().unwrap().uri, "content/legacy.glb");
-        assert!(matches!(legacy.bounding_volume.kind(), Some(VolumeKind::Region(_))));
+        assert!(matches!(
+            legacy.bounding_volume.kind(),
+            Some(VolumeKind::Region(_))
+        ));
     }
 
     #[test]

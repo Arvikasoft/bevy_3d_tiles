@@ -20,7 +20,7 @@
 
 use bevy::prelude::*;
 use bevy_3d_tiles::{
-    geodesy, EcefOrigin, P3dtParams, Tiles3dAttach, Tiles3dCamera, Tiles3dPlugin, TilesetCredits,
+    EcefOrigin, P3dtParams, Tiles3dAttach, Tiles3dCamera, Tiles3dPlugin, TilesetCredits, geodesy,
 };
 
 #[derive(Resource)]
@@ -81,6 +81,9 @@ fn setup(mut commands: Commands, site: Res<Site>, mut attach: MessageWriter<Tile
 
 fn log_credits(credits: Res<TilesetCredits>) {
     if credits.is_changed() && !credits.lines.is_empty() {
-        info!("attribution (display in your UI!): {}", credits.lines.join(" · "));
+        info!(
+            "attribution (display in your UI!): {}",
+            credits.lines.join(" · ")
+        );
     }
 }

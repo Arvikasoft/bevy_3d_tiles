@@ -129,7 +129,9 @@ impl Index3tz {
     pub fn lookup(&self, normalized_path: &str) -> Vec<u64> {
         let hash = md5_of_path(normalized_path);
         let key = hash_sort_key(&hash);
-        let start = self.records.partition_point(|r| hash_sort_key(&r.hash) < key);
+        let start = self
+            .records
+            .partition_point(|r| hash_sort_key(&r.hash) < key);
         self.records[start..]
             .iter()
             .take_while(|r| r.hash == hash)
@@ -177,7 +179,7 @@ fn find_eocd(tail: &[u8], tail_abs: u64) -> Result<Eocd, ArchiveError> {
             if pos + 22 + comment_len == tail.len() {
                 let zip64_record_abs = (pos >= 20
                     && tail[pos - 20..pos - 16] == [0x50, 0x4B, 0x06, 0x07])
-                    .then(|| le64(tail, pos - 12));
+                .then(|| le64(tail, pos - 12));
                 return Ok(Eocd {
                     abs: tail_abs + pos as u64,
                     cd_offset: le32(tail, pos + 16),
@@ -299,7 +301,9 @@ struct LocalHeader {
 
 fn parse_local_header(buf: &[u8]) -> Result<LocalHeader, ArchiveError> {
     if buf.len() < 30 || buf[0..4] != [0x50, 0x4B, 0x03, 0x04] {
-        return Err(ArchiveError::Corrupt("bad local file header signature".into()));
+        return Err(ArchiveError::Corrupt(
+            "bad local file header signature".into(),
+        ));
     }
     let flags = le16(buf, 6);
     let method = le16(buf, 8);
@@ -335,13 +339,14 @@ fn parse_local_header(buf: &[u8]) -> Result<LocalHeader, ArchiveError> {
 fn decode_entry(method: u16, data: Vec<u8>) -> Result<Vec<u8>, ArchiveError> {
     match method {
         0 => Ok(data),
-        8 => miniz_oxide::inflate::decompress_to_vec(&data).map_err(|e| {
-            ArchiveError::Corrupt(format!("deflate decode failed: {e}"))
-        }),
+        8 => miniz_oxide::inflate::decompress_to_vec(&data)
+            .map_err(|e| ArchiveError::Corrupt(format!("deflate decode failed: {e}"))),
         93 => Err(ArchiveError::Unsupported(
             "zstandard-compressed 3tz entries (method 93)".into(),
         )),
-        m => Err(ArchiveError::Unsupported(format!("zip compression method {m}"))),
+        m => Err(ArchiveError::Unsupported(format!(
+            "zip compression method {m}"
+        ))),
     }
 }
 
@@ -409,7 +414,11 @@ impl Archive3tz {
             )));
         }
         let index = Index3tz::parse(&raw.data)?;
-        Ok(Self { source, size, index })
+        Ok(Self {
+            source,
+            size,
+            index,
+        })
     }
 
     pub fn index(&self) -> &Index3tz {
@@ -437,9 +446,14 @@ impl Archive3tz {
         let normalized = normalize_path(path);
         let candidates = self.index.lookup(&normalized);
         for offset in &candidates {
-            if let Some(raw) =
-                read_entry_at(&self.source, self.size, *offset, normalized.as_bytes(), abort)
-                    .await?
+            if let Some(raw) = read_entry_at(
+                &self.source,
+                self.size,
+                *offset,
+                normalized.as_bytes(),
+                abort,
+            )
+            .await?
             {
                 return decode_entry(raw.method, raw.data);
             }
@@ -507,7 +521,10 @@ async fn read_entry_at(
             data.len()
         )));
     }
-    Ok(Some(RawEntry { method: header.method, data }))
+    Ok(Some(RawEntry {
+        method: header.method,
+        data,
+    }))
 }
 
 // ── Test support: a minimal deterministic 3tz writer ────────────────────────
@@ -523,33 +540,37 @@ pub fn write_3tz(files: &[(&str, &[u8], bool)], comment: &[u8]) -> Vec<u8> {
     let mut central: Vec<(Vec<u8>, u64, u64, u16)> = Vec::new(); // (name, offset, comp_size, method)
     let mut records: Vec<IndexRecord> = Vec::new();
 
-    let write_entry = |out: &mut Vec<u8>, name: &[u8], data: &[u8], deflate: bool| -> (u64, u64, u16) {
-        let offset = out.len() as u64;
-        let (payload, method) = if deflate {
-            (miniz_oxide::deflate::compress_to_vec(data, 6), 8u16)
-        } else {
-            (data.to_vec(), 0u16)
+    let write_entry =
+        |out: &mut Vec<u8>, name: &[u8], data: &[u8], deflate: bool| -> (u64, u64, u16) {
+            let offset = out.len() as u64;
+            let (payload, method) = if deflate {
+                (miniz_oxide::deflate::compress_to_vec(data, 6), 8u16)
+            } else {
+                (data.to_vec(), 0u16)
+            };
+            out.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]); // LFH signature
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&method.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod time (fixed)
+            out.extend_from_slice(&0x2199u16.to_le_bytes()); // mod date (fixed)
+            out.extend_from_slice(&0u32.to_le_bytes()); // crc32 (unvalidated)
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name);
+            out.extend_from_slice(&payload);
+            (offset, payload.len() as u64, method)
         };
-        out.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]); // LFH signature
-        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
-        out.extend_from_slice(&method.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // mod time (fixed)
-        out.extend_from_slice(&0x2199u16.to_le_bytes()); // mod date (fixed)
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc32 (unvalidated)
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
-        out.extend_from_slice(name);
-        out.extend_from_slice(&payload);
-        (offset, payload.len() as u64, method)
-    };
 
     for (path, data, deflate) in files {
         let name = normalize_path(path);
         let (offset, comp_size, method) = write_entry(&mut out, name.as_bytes(), data, *deflate);
-        records.push(IndexRecord { hash: md5_of_path(&name), offset });
+        records.push(IndexRecord {
+            hash: md5_of_path(&name),
+            offset,
+        });
         central.push((name.into_bytes(), offset, comp_size, method));
     }
 
@@ -635,9 +656,18 @@ mod tests {
         other[0] = 1;
         let mut payload = Vec::new();
         let mut recs = vec![
-            IndexRecord { hash: twin, offset: 100 },
-            IndexRecord { hash: twin, offset: 200 },
-            IndexRecord { hash: other, offset: 300 },
+            IndexRecord {
+                hash: twin,
+                offset: 100,
+            },
+            IndexRecord {
+                hash: twin,
+                offset: 200,
+            },
+            IndexRecord {
+                hash: other,
+                offset: 300,
+            },
         ];
         recs.sort_by_key(|r| hash_sort_key(&r.hash));
         for r in &recs {
@@ -648,7 +678,9 @@ mod tests {
         // No path maps to [7;16] — drive the search by hash directly via a
         // record-level scan equivalence: both twin offsets are adjacent.
         let key = hash_sort_key(&twin);
-        let start = index.records.partition_point(|r| hash_sort_key(&r.hash) < key);
+        let start = index
+            .records
+            .partition_point(|r| hash_sort_key(&r.hash) < key);
         let hits: Vec<u64> = index.records[start..]
             .iter()
             .take_while(|r| r.hash == twin)
@@ -674,7 +706,10 @@ mod tests {
         assert_eq!(block_on(ar.read_entry("tileset.json")).unwrap(), tileset);
         assert_eq!(block_on(ar.read_entry("content/0/a.glb")).unwrap(), glb);
         // Path normalization on lookup: backslashes + leading slash.
-        assert_eq!(block_on(ar.read_entry("\\content\\0\\b.glb")).unwrap(), b"tiny");
+        assert_eq!(
+            block_on(ar.read_entry("\\content\\0\\b.glb")).unwrap(),
+            b"tiny"
+        );
         assert!(matches!(
             block_on(ar.read_entry("missing.glb")),
             Err(ArchiveError::EntryNotFound(_))
@@ -691,10 +726,17 @@ mod tests {
     #[test]
     fn many_entries_binary_search() {
         let blobs: Vec<(String, Vec<u8>)> = (0..200)
-            .map(|i| (format!("content/{}/{}.glb", i % 7, i), format!("payload-{i}").into_bytes()))
+            .map(|i| {
+                (
+                    format!("content/{}/{}.glb", i % 7, i),
+                    format!("payload-{i}").into_bytes(),
+                )
+            })
             .collect();
-        let files: Vec<(&str, &[u8], bool)> =
-            blobs.iter().map(|(p, d)| (p.as_str(), d.as_slice(), false)).collect();
+        let files: Vec<(&str, &[u8], bool)> = blobs
+            .iter()
+            .map(|(p, d)| (p.as_str(), d.as_slice(), false))
+            .collect();
         let archive = write_3tz(&files, b"");
         let ar = block_on(Archive3tz::open(mem(archive))).expect("open");
         assert_eq!(ar.index().len(), 200);

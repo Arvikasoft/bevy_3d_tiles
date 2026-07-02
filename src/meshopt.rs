@@ -79,7 +79,9 @@ pub fn decode_vertex_buffer(
     source: &[u8],
 ) -> Result<(), String> {
     if byte_stride == 0 || !byte_stride.is_multiple_of(4) {
-        return Err(format!("meshopt vertex: byte_stride {byte_stride} not a multiple of 4"));
+        return Err(format!(
+            "meshopt vertex: byte_stride {byte_stride} not a multiple of 4"
+        ));
     }
     let header = *source.first().ok_or("meshopt vertex: empty source")?;
     if header != 0xa0 && header != 0xa1 {
@@ -96,7 +98,11 @@ pub fn decode_vertex_buffer(
     // harmlessly (they are never read back).
     let mut deltas = vec![0u8; max_block_elements * byte_stride + 16];
 
-    let tail_size = if version == 0 { byte_stride } else { byte_stride + byte_stride / 4 };
+    let tail_size = if version == 0 {
+        byte_stride
+    } else {
+        byte_stride + byte_stride / 4
+    };
     if source.len() < 1 + tail_size {
         return Err("meshopt vertex: source too short for tail".into());
     }
@@ -153,7 +159,11 @@ pub fn decode_vertex_buffer(
             for group in 0..group_count {
                 let mode = ((source[header_bits_offs + (group >> 2)] >> ((group & 0x03) << 1))
                     & 0x03) as usize;
-                let table = if version == 0 { 0 } else { (control_mode + 1) as usize };
+                let table = if version == 0 {
+                    0
+                } else {
+                    (control_mode + 1) as usize
+                };
                 let mode_bits = HEADER_MODES[table][mode];
                 let delta_offs = delta_base + (group << 4);
 
@@ -213,8 +223,11 @@ pub fn decode_vertex_buffer(
             let dst_elem = dst_elem_base + elem;
             let mut byte_group = 0usize;
             while byte_group < byte_stride {
-                let channel_mode =
-                    if version == 0 { 0u32 } else { (channels[byte_group >> 2] & 0x03) as u32 };
+                let channel_mode = if version == 0 {
+                    0u32
+                } else {
+                    (channels[byte_group >> 2] & 0x03) as u32
+                };
                 if channel_mode == 3 {
                     return Err("meshopt vertex: reserved channel mode 3".into());
                 }
@@ -562,7 +575,11 @@ fn filter_octahedral(target: &mut [u8], count: usize, byte_stride: usize) -> Res
                 write_i16(target, base + 2, js_round(z * h) as i32);
             }
         }
-        other => return Err(format!("meshopt OCTAHEDRAL: byte_stride {other} (need 4 or 8)")),
+        other => {
+            return Err(format!(
+                "meshopt OCTAHEDRAL: byte_stride {other} (need 4 or 8)"
+            ));
+        }
     }
     Ok(())
 }
@@ -571,7 +588,9 @@ fn filter_octahedral(target: &mut [u8], count: usize, byte_stride: usize) -> Res
 /// reconstructed from the other three; its slot is carried in the low 2 bits.
 fn filter_quaternion(target: &mut [u8], count: usize, byte_stride: usize) -> Result<(), String> {
     if byte_stride != 8 {
-        return Err(format!("meshopt QUATERNION: byte_stride {byte_stride} (need 8)"));
+        return Err(format!(
+            "meshopt QUATERNION: byte_stride {byte_stride} (need 8)"
+        ));
     }
     const SQRT1_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
     for e in 0..count {
@@ -583,10 +602,26 @@ fn filter_quaternion(target: &mut [u8], count: usize, byte_stride: usize) -> Res
         let y = read_i16(target, base + 1) as f64 * s;
         let z = read_i16(target, base + 2) as f64 * s;
         let w = (1.0 - x * x - y * y - z * z).max(0.0).sqrt();
-        write_i16(target, base + (max_component + 1) % 4, js_round(x * 32767.0) as i32);
-        write_i16(target, base + (max_component + 2) % 4, js_round(y * 32767.0) as i32);
-        write_i16(target, base + (max_component + 3) % 4, js_round(z * 32767.0) as i32);
-        write_i16(target, base + max_component % 4, js_round(w * 32767.0) as i32);
+        write_i16(
+            target,
+            base + (max_component + 1) % 4,
+            js_round(x * 32767.0) as i32,
+        );
+        write_i16(
+            target,
+            base + (max_component + 2) % 4,
+            js_round(y * 32767.0) as i32,
+        );
+        write_i16(
+            target,
+            base + (max_component + 3) % 4,
+            js_round(z * 32767.0) as i32,
+        );
+        write_i16(
+            target,
+            base + max_component % 4,
+            js_round(w * 32767.0) as i32,
+        );
     }
     Ok(())
 }
@@ -595,7 +630,9 @@ fn filter_quaternion(target: &mut [u8], count: usize, byte_stride: usize) -> Res
 /// → `2^exp * mantissa` as f32.
 fn filter_exponential(target: &mut [u8], count: usize, byte_stride: usize) -> Result<(), String> {
     if !byte_stride.is_multiple_of(4) {
-        return Err(format!("meshopt EXPONENTIAL: byte_stride {byte_stride} not /4"));
+        return Err(format!(
+            "meshopt EXPONENTIAL: byte_stride {byte_stride} not /4"
+        ));
     }
     let n = byte_stride * count / 4;
     for i in 0..n {
@@ -625,7 +662,11 @@ fn filter_color(target: &mut [u8], count: usize, byte_stride: usize) -> Result<(
                 let co = (target[base + 1] as i8) as f64;
                 let cg = (target[base + 2] as i8) as f64;
                 let alpha_input = target[base + 3] as u32;
-                let alpha_bit = if alpha_input == 0 { -1i32 } else { 31 - alpha_input.leading_zeros() as i32 };
+                let alpha_bit = if alpha_input == 0 {
+                    -1i32
+                } else {
+                    31 - alpha_input.leading_zeros() as i32
+                };
                 let as_ = ((1i64 << (alpha_bit + 1)) - 1) as f64;
                 let r = y + co - cg;
                 let g = y + cg;
@@ -647,7 +688,11 @@ fn filter_color(target: &mut [u8], count: usize, byte_stride: usize) -> Result<(
                 let cg = read_i16(target, base + 2) as f64;
                 let alpha_input =
                     u16::from_le_bytes([target[(base + 3) * 2], target[(base + 3) * 2 + 1]]) as u32;
-                let alpha_bit = if alpha_input == 0 { -1i32 } else { 31 - alpha_input.leading_zeros() as i32 };
+                let alpha_bit = if alpha_input == 0 {
+                    -1i32
+                } else {
+                    31 - alpha_input.leading_zeros() as i32
+                };
                 let as_ = ((1i64 << (alpha_bit + 1)) - 1) as f64;
                 let r = y + co - cg;
                 let g = y + cg;
@@ -692,8 +737,12 @@ mod tests {
     fn vertex_buffer_round_trips_byte_identical() {
         // 8 × VEC3 f32 positions, ATTRIBUTES/NONE — the lossless path our
         // writer uses (QUANTIZE method, no quantization).
-        let enc = hex("a00000013fcf0000ffffffffffbf013fff00007e7d7e7d80fefb0000010cff0000ffff807fbf010cff00007e7d80fffd00000100cf0000ff7f9f0100ef00007efffd0000000000000000000000000000000000000000000000000000000000000000");
-        let expect = hex("0000000000000000000000000000803f0000000000000000000000000000803f000000000000803f0000803f0000000000000000000000000000803f000000400000404000008040000080bf000000c0000040c0000020410000a0410000f041");
+        let enc = hex(
+            "a00000013fcf0000ffffffffffbf013fff00007e7d7e7d80fefb0000010cff0000ffff807fbf010cff00007e7d80fffd00000100cf0000ff7f9f0100ef00007efffd0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let expect = hex(
+            "0000000000000000000000000000803f0000000000000000000000000000803f000000000000803f0000803f0000000000000000000000000000803f000000400000404000008040000080bf000000c0000040c0000020410000a0410000f041",
+        );
         let out = decode_buffer_view("ATTRIBUTES", "NONE", 8, 12, &enc).unwrap();
         assert_eq!(out, expect, "vertex codec must be byte-lossless");
     }
@@ -718,7 +767,9 @@ mod tests {
 
     #[test]
     fn octahedral_filter_matches_reference() {
-        let enc = hex("a0013f000000fefda9010f000000fe5800000000000000000000000000000000000000000000000000000000000000007f00");
+        let enc = hex(
+            "a0013f000000fefda9010f000000fe5800000000000000000000000000000000000000000000000000000000000000007f00",
+        );
         let expect = hex("00007f007f000000007f0000b7b7b600");
         let out = decode_buffer_view("ATTRIBUTES", "OCTAHEDRAL", 4, 4, &enc).unwrap();
         assert_eq!(out, expect);
@@ -726,7 +777,9 @@ mod tests {
 
     #[test]
     fn quaternion_filter_matches_reference() {
-        let enc = hex("a00107000000af010f0000000e030103000000b101030000000a011b000000b1013f0000000e0d0a01390000000500000000000000000000000000000000000000000000000000000000000000ff07");
+        let enc = hex(
+            "a00107000000af010f0000000e030103000000b101030000000a011b000000b1013f0000000e0d0a01390000000500000000000000000000000000000000000000000000000000000000000000ff07",
+        );
         let expect = hex("000000000000ff7f825a00000000825a0000825a825a00000f40fa3ffa3ffa3f");
         let out = decode_buffer_view("ATTRIBUTES", "QUATERNION", 4, 8, &enc).unwrap();
         assert_eq!(out, expect);
@@ -734,8 +787,11 @@ mod tests {
 
     #[test]
     fn exponential_filter_matches_reference() {
-        let enc = hex("a0013c0000006e87013c000000640f00013c0000000908013000000080013c00000004540120000000013c0000000908013c0000000708013c00000065560118000000013c000000090800000000000000000000000000000000000000000d0000f9c0fefff9003200f9");
-        let expect = hex("0000d03d000020c00000c8420010494000000000000080ba000028420000284200002842");
+        let enc = hex(
+            "a0013c0000006e87013c000000640f00013c0000000908013000000080013c00000004540120000000013c0000000908013c0000000708013c00000065560118000000013c000000090800000000000000000000000000000000000000000d0000f9c0fefff9003200f9",
+        );
+        let expect =
+            hex("0000d03d000020c00000c8420010494000000000000080ba000028420000284200002842");
         let out = decode_buffer_view("ATTRIBUTES", "EXPONENTIAL", 3, 12, &enc).unwrap();
         assert_eq!(out, expect);
     }

@@ -60,7 +60,8 @@ pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, De
     for entry in attrs_js.iter() {
         let id = get(&entry, "id")?
             .as_f64()
-            .ok_or_else(|| DecodeError::draco("draco attribute id not a number"))? as u32;
+            .ok_or_else(|| DecodeError::draco("draco attribute id not a number"))?
+            as u32;
         let components = get(&entry, "components")?
             .as_f64()
             .ok_or_else(|| DecodeError::draco("draco attribute components not a number"))?
@@ -68,7 +69,10 @@ pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, De
         let data = js_sys::Float32Array::new(&get(&entry, "data")?).to_vec();
         attributes.push((id, components, data));
     }
-    Ok(DracoMesh { indices, attributes })
+    Ok(DracoMesh {
+        indices,
+        attributes,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
