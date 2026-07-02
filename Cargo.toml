@@ -3,48 +3,46 @@ name = "bevy_3d_tiles"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
-description = "OGC 3D Tiles 1.1 streaming renderer for Bevy — .3tz ranged reader, SSE traversal, glb/b3dm content, KTX2 + meshopt (+ Draco read), ECEF georeferencing. Backend-agnostic (WebGPU + native)."
+description = "OGC 3D Tiles 1.1 streaming renderer for Bevy — packed .3tz ranged reader, per-tile SSE traversal, glTF tile content, KTX2 + meshopt (+ Draco read), EXT_mesh_features picking, ECEF georeferencing, Google Photorealistic 3D Tiles. Native + WebGPU/wasm."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Arvikasoft/TurboTwin"
+repository = "https://github.com/Arvikasoft/bevy_3d_tiles"
+readme = "README.md"
 keywords = ["bevy", "3d-tiles", "geospatial", "gis", "cesium"]
 categories = ["rendering", "game-development"]
 # NOTE: standalone crate (not a workspace member) for the same reason as
 # bevy-client — the wasm feature surface would break native sibling builds under
-# Cargo feature unification. publish = false until the crates.io step (PR C).
+# Cargo feature unification. publish = false until the crates.io step (PR C);
+# `cargo package` is kept green in the meantime.
 publish = false
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
-# Point-cloud tile content (glb POINTS) via the vendored bevy_pointcloud.
-# Heavy renderer — opt-in (the plan's "feature-gate heavy renderers" rule).
+# Point-cloud tile content (glb POINTS) via bevy_pointcloud_x (our published
+# fork of rlamarche/bevy_pointcloud). Heavy renderer — opt-in (the plan's
+# "feature-gate heavy renderers" rule).
 points = ["dep:bevy_pointcloud"]
 # Gaussian-splat tile content (KHR_gaussian_splatting) via bevy_gaussian_splatting.
 splats = ["dep:bevy_gaussian_splatting"]
 
 [dependencies]
-# Bevy 0.18 pinned EXACTLY — mirrors bevy-client's feature list verbatim to
-# guarantee tiles3d compiles unchanged. TODO(follow-up): trim to a minimal
-# render subset (drop default_app / winit / window / picking / x11 — a plugin
-# library doesn't need the app/windowing stack).
-bevy = { version = "=0.18.1", default-features = false, features = [
+# Caret, not exact-pin: the published lib must unify with consumers on any
+# 0.18.x (bevy-client keeps its own app-side `=0.18.1` pin). Minimal render
+# subset — the app/windowing stack (default_app, winit, x11, webgpu backend
+# selection, tonemapping LUTs) belongs to the consuming app; examples add it
+# back via [dev-dependencies].
+bevy = { version = "0.18", default-features = false, features = [
     "std",
     "multi_threaded",
     "async_executor",
-    "default_app",
-    "default_font",
     "3d_bevy_render",
-    "bevy_scene",
-    "bevy_state",
-    "bevy_winit",
     "bevy_window",
-    "bevy_picking",
     "bevy_log",
     "ktx2",
     "jpeg",
     "zstd_rust",
-    "tonemapping_luts",
-    "webgpu",
-    "x11",
 ] }
 
 # Tile GLB decode. Default features OFF; KHR_materials_unlit is REQUIRED for
@@ -64,22 +62,17 @@ crossbeam-channel = "0.5"
 thiserror = "2"
 
 # Heavy tile-content renderers — optional, gated by the `points` / `splats`
-# features. `bevy_gaussian_splatting` (below) is a crates.io dep, so the
-# `splats` feature is already publish-ready.
-#
-# `bevy_pointcloud` is the ONE thing blocking `cargo publish` (verified:
-# `cargo package` fails with "dependency bevy_pointcloud does not specify a
-# version"). It's a vendored fork (`bevy-client/vendor/`, rev 4c16ead of
-# github.com/rlamarche/bevy_pointcloud, MIT) — and crates.io forbids BOTH path
-# AND git deps in published crates, so PR C must EITHER (a) publish the fork to
-# crates.io and switch this to `{ version = "…", optional = true }`, OR (b) drop
-# the `points` feature from the published crate (mesh + splats only; points stays
-# monorepo-internal). Note: whichever source the published crate uses,
-# bevy-client must use the SAME one (it currently uses the `vendor/` path) or
-# Cargo sees two distinct `bevy_pointcloud` crates and the `PointTileMaterial` /
-# `Assets<PointCloud>` wiring fails to typecheck — use `[patch]` if needed.
-bevy_pointcloud = { path = "../bevy-client/vendor/bevy_pointcloud", optional = true }
-bevy_gaussian_splatting = { version = "=7.0.2", default-features = false, features = [
+# features. Both are crates.io deps, so every feature combination is
+# publish-ready. `bevy_pointcloud_x` is our published fork of
+# rlamarche/bevy_pointcloud (upstream is git-only — its potree/copc features
+# carry git deps crates.io forbids); the dep is ALIASED to `bevy_pointcloud`
+# so source imports stay upstream-compatible. The `path` builds the monorepo
+# against the vendored copy (`bevy-client/vendor/`) and is stripped on
+# publish, where the `version` takes over. bevy-client MUST reference the
+# same package+path or Cargo sees two distinct crates and the
+# `PointTileMaterial` / `Assets<PointCloud>` wiring fails to typecheck.
+bevy_pointcloud = { package = "bevy_pointcloud_x", version = "0.1.0", path = "../bevy-client/vendor/bevy_pointcloud", optional = true }
+bevy_gaussian_splatting = { version = "7", default-features = false, features = [
     "buffer_storage",
     "planar",
     "sh0",
@@ -111,9 +104,18 @@ web-sys = { version = "0.3", features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # bevy's basis transcoder is C++ (native only; won't build for wasm) — KTX2/UASTC
 # tile textures transcode via it on native, and via a JS shim on wasm.
-bevy = { version = "=0.18.1", default-features = false, features = ["basis-universal"] }
+bevy = { version = "0.18", default-features = false, features = ["basis-universal"] }
 # Native byte-range source (runs on a worker thread, never inside an async runtime).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 
 [dev-dependencies]
 base64 = "0.22"
+# Examples need the app/window/render stack the library itself doesn't pull.
+bevy = { version = "0.18", default-features = false, features = [
+    "default_app",
+    "default_font",
+    "bevy_winit",
+    "x11",
+    "webgpu",
+    "tonemapping_luts",
+] }

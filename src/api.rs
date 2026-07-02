@@ -52,9 +52,11 @@ pub struct TileOwner {
 /// reuse it across the tile's many features, instead of rebuilding it per
 /// feature.
 #[derive(Resource, Default, Clone)]
-pub struct TileFeatureResolver(
-    pub Option<Arc<dyn Fn(&str, &[&str]) -> Vec<String> + Send + Sync>>,
-);
+pub struct TileFeatureResolver(pub Option<Arc<FeatureResolverFn>>);
+
+/// The resolver signature: `(anchor id, all node paths of one tile)` → one
+/// sub-owner id per path.
+pub type FeatureResolverFn = dyn Fn(&str, &[&str]) -> Vec<String> + Send + Sync;
 
 impl TileFeatureResolver {
     /// Resolve every feature path of one tile, or fall back to the anchor id
