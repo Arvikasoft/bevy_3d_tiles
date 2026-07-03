@@ -997,7 +997,12 @@ mod tests {
         assert!(!FetchError::Io("corrupt".into()).is_transient());
         assert!(!FetchError::BudgetExhausted(5).is_transient());
         assert!(
-            !FetchError::OutOfRange { start: 0, len: 1, size: 0 }.is_transient()
+            !FetchError::OutOfRange {
+                start: 0,
+                len: 1,
+                size: 0
+            }
+            .is_transient()
         );
     }
 
