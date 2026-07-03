@@ -44,6 +44,48 @@ pub enum FetchError {
     BudgetExhausted(u32),
 }
 
+impl FetchError {
+    /// Whether a bounded retry is worth attempting: transport-level failures
+    /// (connection reset, DNS, CDN hiccup — an `Http` error with no HTTP
+    /// status) and 5xx / 408 / 429 responses. A 404 (or any other 4xx) is a
+    /// real answer from the server and stays terminal — the scheduler marks
+    /// the tile `Failed` for the tileset's lifetime, which is correct for
+    /// content that genuinely isn't there and disastrous for a one-frame
+    /// origin blip (the BASEMAP-TILING "any failed fetch is terminal" risk).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // Both HTTP backends format status failures as "status {n} …"
+            // (this file owns every construction site), so classify off that;
+            // no status marker means the request never got an HTTP answer.
+            FetchError::Http(msg) => match parse_status_code(msg) {
+                Some(code) => matches!(code, 500..=599 | 408 | 429),
+                None => true,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Extract `NNN` from this file's own `"status NNN …"` error strings.
+fn parse_status_code(msg: &str) -> Option<u16> {
+    let rest = msg.split("status ").nth(1)?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()
+        .filter(|s| !s.is_empty())?
+        .parse()
+        .ok()
+}
+
+/// Async backoff between retry attempts. wasm must yield to the event loop
+/// (`TimeoutFuture`); native fetch tasks each own a `spawn_io` worker thread
+/// where blocking is already the platform idiom (blocking reqwest).
+async fn backoff_sleep(ms: u32) {
+    #[cfg(target_arch = "wasm32")]
+    gloo_timers::future::TimeoutFuture::new(ms).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+}
+
 // ── Cancellation ─────────────────────────────────────────────────────────────
 
 /// Cross-platform cancellation token for one tile request. Cheap to clone —
@@ -551,7 +593,37 @@ impl TilesetSource {
         {
             return Ok(bytes);
         }
-        let bytes = self.read_entry_raw(uri, abort).await?;
+        // Bounded transient-fault retry. Every runtime tile fetch (root open,
+        // external-tileset graft, content) funnels through here, and a failure
+        // that escapes marks the tile terminally `Failed` — so a CDN 502 or a
+        // dropped connection must get a second chance before that verdict.
+        // Terminal-by-design stays terminal: non-transient errors (404 …),
+        // aborts, and Live sources (each attempt would double-count the
+        // daily budget; Google's infra isn't the flaky origin this guards).
+        const BACKOFF_MS: [u32; 2] = [300, 1200];
+        let mut attempt = 0;
+        let bytes = loop {
+            match self.read_entry_raw(uri, abort).await {
+                Ok(bytes) => break bytes,
+                Err(e) => {
+                    let retry = !matches!(self, TilesetSource::Live(_))
+                        && e.is_transient()
+                        && attempt < BACKOFF_MS.len();
+                    if !retry {
+                        return Err(e);
+                    }
+                    bevy::log::warn!(
+                        "tiles3d: transient fetch failure for {uri} \
+                         (attempt {}/{}): {e} — retrying",
+                        attempt + 1,
+                        BACKOFF_MS.len() + 1,
+                    );
+                    backoff_sleep(BACKOFF_MS[attempt]).await;
+                    check_abort(abort)?;
+                    attempt += 1;
+                }
+            }
+        };
         #[cfg(target_arch = "wasm32")]
         if let Some(key) = key {
             cache_store_bytes(key, &bytes);
@@ -904,6 +976,38 @@ async fn http_get_all(url: &str, abort: Option<&AbortHandle>) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retry classification: transport + 5xx/408/429 retry; 4xx (a real
+    /// server answer) and every non-HTTP variant stay terminal.
+    #[test]
+    fn transient_classification() {
+        let http = |m: &str| FetchError::Http(m.to_string());
+        // This file's own error formats:
+        assert!(http("status 502 for GET https://x/t.glb").is_transient());
+        assert!(http("status 503 for ranged GET https://x").is_transient());
+        assert!(http("status 429 for GET x").is_transient());
+        assert!(http("status 408 for suffix GET x").is_transient());
+        assert!(!http("status 404 for GET https://x/t.glb").is_transient());
+        assert!(!http("status 403 for GET x").is_transient());
+        // No status marker = the request never got an HTTP answer (DNS,
+        // connection reset, gloo transport error) = transient.
+        assert!(http("error sending request for url (https://x)").is_transient());
+        // Non-HTTP variants never retry.
+        assert!(!FetchError::Aborted.is_transient());
+        assert!(!FetchError::Io("corrupt".into()).is_transient());
+        assert!(!FetchError::BudgetExhausted(5).is_transient());
+        assert!(
+            !FetchError::OutOfRange { start: 0, len: 1, size: 0 }.is_transient()
+        );
+    }
+
+    #[test]
+    fn status_code_parsing() {
+        assert_eq!(parse_status_code("status 502 for GET x"), Some(502));
+        assert_eq!(parse_status_code("prefix: status 200"), Some(200));
+        assert_eq!(parse_status_code("no code here"), None);
+        assert_eq!(parse_status_code("status "), None);
+    }
 
     #[test]
     fn content_range_total_parses() {
