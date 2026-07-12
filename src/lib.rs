@@ -65,7 +65,7 @@ pub mod traversal;
 
 #[cfg(feature = "points")]
 pub use api::PointTileMaterial;
-pub use api::{EcefOrigin, TileFeatureResolver, TileOwner, Tiles3dCamera};
+pub use api::{EcefOrigin, TileFeatureResolver, TileGeometry, TileOwner, Tiles3dCamera};
 
 use archive::Archive3tz;
 use content::{DecodedItem, DecodedPrimitive, DecodedTile};
@@ -367,6 +367,27 @@ impl Tiles3dSets {
     pub fn root_entity_for_anchor(&self, anchor: Entity) -> Option<Entity> {
         let set = self.sets.iter().find(|s| s.anchor == Some(anchor))?;
         matches!(set.frame, SetFrame::Anchored).then_some(set.root_entity)
+    }
+
+    /// Id of the tileset attached to `anchor`, in **any** frame (anchored or
+    /// ECEF/world-layer). It is the same id the crate stamps onto every piece of
+    /// that set's geometry as [`TileGeometry::set_id`], so a host can key its own
+    /// per-tileset state — materials, clip layers, styling, render layers — off
+    /// the anchor it attached and then apply it to the spawned content.
+    ///
+    /// `None` while the tileset's open is still in flight, or after a detach.
+    ///
+    /// Deliberately does **not** filter on [`SetFrame::Anchored`] the way
+    /// `root_entity_for_anchor` above does. That one is about the editable
+    /// rendition correction, which only anchored sets carry. This one is about
+    /// identifying a tileset at all — and ECEF world-layer sets (basemaps,
+    /// terrain, P3DT) are precisely the ones a host most wants to key state off.
+    /// Adding a frame filter here would silently blind hosts to them.
+    pub fn set_id_for_anchor(&self, anchor: Entity) -> Option<u64> {
+        self.sets
+            .iter()
+            .find(|s| s.anchor == Some(anchor))
+            .map(|s| s.id)
     }
 }
 
@@ -1050,6 +1071,11 @@ fn spawn_tile_content(
         .id();
     let anchor = set.owner_id.as_deref();
     let anchor_group = anchor.map(|id| TileOwner { id: id.to_string() });
+    // Goes on EVERY content entity, owned or not, so a host can post-process
+    // tile geometry per tileset (custom materials, clipping, styling). Unlike
+    // `TileOwner` this is unconditional — world-layer sets have no owner but
+    // are exactly the ones a host most wants to treat specially.
+    let content_tag = TileGeometry { set_id: set.id };
     // T8 highlight: a feature tile under an owner splits into per-feature
     // submeshes, each tagged with its resolved owner id via the host
     // [`TileFeatureResolver`] — the host's click/hover/outline machinery then
@@ -1124,6 +1150,7 @@ fn spawn_tile_content(
                                 prim_transform,
                                 ChildOf(tile_root),
                                 TileOwner { id: owner },
+                                content_tag,
                             ));
                         }
                     }
@@ -1134,6 +1161,7 @@ fn spawn_tile_content(
                             MeshMaterial3d(mat_handle),
                             prim_transform,
                             ChildOf(tile_root),
+                            content_tag,
                         ));
                         if let Some(group) = &anchor_group {
                             e.insert(group.clone());
@@ -1150,6 +1178,7 @@ fn spawn_tile_content(
                         PointCloudMaterial3d(renderers.point_material.0.clone()),
                         Transform::from_matrix(transform),
                         ChildOf(tile_root),
+                        content_tag,
                     ))
                     .id();
                 if let Some(group) = &anchor_group {
@@ -1168,6 +1197,7 @@ fn spawn_tile_content(
                         CloudSettings::default(),
                         Transform::from_matrix(transform),
                         ChildOf(tile_root),
+                        content_tag,
                     ))
                     .id();
                 if let Some(group) = &anchor_group {

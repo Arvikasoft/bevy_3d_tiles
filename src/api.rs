@@ -1,7 +1,11 @@
 //! Public, backend-agnostic API surface for `bevy_3d_tiles`.
 //!
-//! These four types are the seam that keeps the crate free of any application
-//! (or SpacetimeDB) coupling. The host app supplies them; the crate reads them.
+//! These types are the seam that keeps the crate free of any application (or
+//! SpacetimeDB) coupling. Most are supplied by the host and read by the crate
+//! ([`EcefOrigin`], [`TileFeatureResolver`], [`Tiles3dCamera`],
+//! [`PointTileMaterial`]); [`TileOwner`] and [`TileGeometry`] run the other way —
+//! the crate stamps them onto spawned geometry for the host to react to.
+//!
 //! In the TurboTwin reference app (`bevy-client`) thin adapter systems map these
 //! to the twin-specific machinery (`ProjectOrigin`, `TwinMeshGroup`, the section
 //! map, the orbit camera) — but a standalone viewer can ignore all of them and
@@ -36,6 +40,55 @@ pub struct EcefOrigin {
 #[derive(Component, Clone, Debug)]
 pub struct TileOwner {
     pub id: String,
+}
+
+/// Marker the crate inserts on **every** entity it spawns for tile content —
+/// mesh primitives (and each per-feature submesh), point clouds, splats —
+/// carrying the id of the tileset the geometry streamed from.
+///
+/// The crate never reads it. It exists so a host can post-process tile geometry
+/// **per tileset**: swap in a custom material, apply clipping planes or a
+/// cross-section, x-ray/ghost a set, tint by classification, move a set to
+/// another render layer. Without it a host cannot even tell which entities are
+/// tile geometry — the spawned meshes are otherwise indistinguishable from any
+/// other child entity, and walking up to [`crate::Tiles3dTile`] to find out is
+/// both awkward and O(depth) per primitive.
+///
+/// Distinct from [`TileOwner`], which answers *"whose is this?"* and exists only
+/// for owner-anchored sets ([`crate::Tiles3dAttach::owner_id`]). `TileGeometry`
+/// answers *"which tileset is this?"* and is present on every set, including
+/// world-layer / basemap tilesets that have no owner.
+///
+/// Pair it with [`crate::Tiles3dSets::set_id_for_anchor`] to key host-side state
+/// off the tileset the host attached. Tile content spawns **hidden** (the render
+/// cut reveals it), so a host system reacting to `Added<TileGeometry>` lands its
+/// changes before the geometry is ever drawn — no first-frame flicker.
+///
+/// ```ignore
+/// // Replace the crate's StandardMaterial with an extended one, per tileset.
+/// fn extend_tile_materials(
+///     mut commands: Commands,
+///     added: Query<(Entity, &MeshMaterial3d<StandardMaterial>, &TileGeometry), Added<TileGeometry>>,
+///     standard: Res<Assets<StandardMaterial>>,
+///     mut extended: ResMut<Assets<ExtendedMaterial<StandardMaterial, MyExt>>>,
+///     my_sets: Res<MyPerTilesetState>,
+/// ) {
+///     for (entity, mat, content) in &added {
+///         let Some(state) = my_sets.get(content.set_id) else { continue };
+///         let Some(base) = standard.get(&mat.0).cloned() else { continue };
+///         let handle = extended.add(ExtendedMaterial { base, extension: state.ext() });
+///         commands
+///             .entity(entity)
+///             .remove::<MeshMaterial3d<StandardMaterial>>()
+///             .insert(MeshMaterial3d(handle));
+///     }
+/// }
+/// ```
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileGeometry {
+    /// Id of the streaming tileset this geometry belongs to. Stable for the
+    /// life of the set; a detached-and-reattached tileset gets a fresh id.
+    pub set_id: u64,
 }
 
 /// Optional per-feature resolver for tiles that carry `EXT_mesh_features`.
