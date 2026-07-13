@@ -25,3 +25,23 @@ jobs:
       - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      # Announce the release in #bevy-3d-tiles on the public TurboTwin Discord
+      # (the channel the crate README points users at). Runs only after a
+      # successful publish, and never fails the release if Discord is down —
+      # a missed announcement is not a broken release.
+      - name: Announce on Discord
+        if: success() && env.WEBHOOK != ''
+        continue-on-error: true
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          jq -n --arg v "$VERSION" '{
+            embeds: [{
+              title: "bevy_3d_tiles \($v)",
+              url: "https://github.com/Arvikasoft/bevy_3d_tiles/releases/tag/\($v)",
+              description: "Published to crates.io — `cargo add bevy_3d_tiles`\n\n[Changelog](https://github.com/Arvikasoft/bevy_3d_tiles/commits/\($v)) · [docs.rs](https://docs.rs/bevy_3d_tiles)",
+              color: 5814783
+            }]
+          }' | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK"
