@@ -17,6 +17,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags + history: the announce step reads the annotated tag message
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -37,11 +39,26 @@ jobs:
           WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
           VERSION: ${{ github.ref_name }}
         run: |
-          jq -n --arg v "$VERSION" '{
+          # No GitHub Release object is created for this crate — crates.io is the
+          # distribution channel and a library has no binaries to attach. Link
+          # there instead. The release note is the ANNOTATED TAG's message, so
+          # it lives with the tag and there is no CHANGELOG file to rot; a
+          # lightweight tag just falls back to the commit range.
+          NOTE=$(git for-each-ref --format='%(contents)' "refs/tags/$VERSION" | head -c 1500)
+          PREV=$(git describe --tags --abbrev=0 "$VERSION^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            RANGE="https://github.com/Arvikasoft/bevy_3d_tiles/compare/$PREV...$VERSION"
+          else
+            RANGE="https://github.com/Arvikasoft/bevy_3d_tiles/commits/$VERSION"
+          fi
+          jq -n --arg v "$VERSION" --arg note "$NOTE" --arg range "$RANGE" '{
             embeds: [{
               title: "bevy_3d_tiles \($v)",
-              url: "https://github.com/Arvikasoft/bevy_3d_tiles/releases/tag/\($v)",
-              description: "Published to crates.io — `cargo add bevy_3d_tiles`\n\n[Changelog](https://github.com/Arvikasoft/bevy_3d_tiles/commits/\($v)) · [docs.rs](https://docs.rs/bevy_3d_tiles)",
+              url: "https://crates.io/crates/bevy_3d_tiles",
+              description: (
+                (if $note == "" then "" else $note + "\n\n" end)
+                + "`cargo add bevy_3d_tiles` · [changes](\($range)) · [docs.rs](https://docs.rs/bevy_3d_tiles)"
+              ),
               color: 5814783
             }]
           }' | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK"
