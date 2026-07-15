@@ -78,6 +78,7 @@ fn main() {
                 owner_id: None,
                 label: "my tileset".into(),
                 p3dt: None,
+                sse_threshold_px: None, // per-set SSE override; None = Tiles3dConfig default
             });
         })
         .run();

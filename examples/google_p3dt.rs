@@ -76,6 +76,8 @@ fn setup(mut commands: Commands, site: Res<Site>, mut attach: MessageWriter<Tile
             // Hard client-side stop — protects a demo key from runaway cost.
             daily_request_cap: 2_000,
         }),
+        // Per-set SSE override; None = the app-global Tiles3dConfig default.
+        sse_threshold_px: None,
     });
 }
 

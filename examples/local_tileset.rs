@@ -62,5 +62,7 @@ fn setup(
         owner_id: None,
         label: "local_tileset example".into(),
         p3dt: None,
+        // Per-set SSE override; None = the app-global Tiles3dConfig default.
+        sse_threshold_px: None,
     });
 }

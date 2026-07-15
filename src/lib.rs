@@ -93,9 +93,23 @@ pub const GOOGLE_P3DT_ROOT_URL: &str = "https://tile.googleapis.com/v1/3dtiles/r
 /// relative file path for native runs from the crate root.
 const FIXTURE_SPEC: &str = "assets/fixtures/tiles3d-demo/tileset.json";
 
+/// App-global streamer tuning, read fresh every traversal.
+///
+/// **Host override contract:** insert a `Tiles3dConfig` resource *before*
+/// `add_plugins(Tiles3dPlugin)` to override any field — [`Tiles3dPlugin::build`]
+/// uses `init_resource`, which never overwrites an already-present resource, so
+/// the host's values win. This is a supported, tested seam
+/// (`host_inserted_config_wins`), not an accident; the TurboTwin host relies on
+/// it to lower `max_concurrent_loads`/`max_spawns_per_frame` on wasm.
+///
+/// These knobs are app-global. For a threshold that differs *per tileset* in one
+/// app — a dense single-asset preview framed close vs. the globe basemap — use
+/// [`Tiles3dAttach::sse_threshold_px`] instead of mutating this at runtime.
 #[derive(Resource, Debug, Clone)]
 pub struct Tiles3dConfig {
-    /// Refine while a tile's screen-space error exceeds this (px).
+    /// Refine while a tile's screen-space error exceeds this (px). App-global
+    /// default; a set attached with [`Tiles3dAttach::sse_threshold_px`] overrides
+    /// it for that set only.
     pub sse_threshold_px: f64,
     /// Distance-relaxed detail falloff (metres) — see
     /// [`SelectParams::detail_falloff_m`]. Caps how far the cut refines toward
@@ -189,6 +203,18 @@ pub struct Tiles3dAttach {
     /// Google P3DT session config: routes the open through a live, keyed,
     /// budget-capped, never-cached source (D7). `None` = a normal tileset.
     pub p3dt: Option<P3dtParams>,
+    /// Per-tileset screen-space-error refine threshold (physical px), overriding
+    /// [`Tiles3dConfig::sse_threshold_px`] for this set only. `None` = use the
+    /// app-global config value.
+    ///
+    /// Set this when one app streams tilesets with very different framings. The
+    /// config default (10 px) is tuned for a globe basemap seen from far off,
+    /// where a low threshold buys crisp texels cheaply. A dense *single-asset*
+    /// preview framed close to its bounding radius is the opposite case: that
+    /// same 10 px over-refines a 500 k-tri root a level or two into millions of
+    /// resident triangles for no visible gain. Raise it (e.g. 24) for such sets
+    /// while the basemap keeps the sharp global default.
+    pub sse_threshold_px: Option<f64>,
 }
 
 /// Tear down any tileset anchored to this entity (rebind / mode switch).
@@ -276,6 +302,10 @@ pub struct ActiveTileset {
     anchor: Option<Entity>,
     /// Owning entity id ([`TileOwner`] tagging + placeholder clearing).
     owner_id: Option<String>,
+    /// Per-set SSE threshold override (physical px) from
+    /// [`Tiles3dAttach::sse_threshold_px`]; `None` falls back to the app-global
+    /// [`Tiles3dConfig::sse_threshold_px`] in the traversal.
+    sse_threshold_px: Option<f64>,
     /// Whether the anchor's placeholder cube has been stripped yet.
     placeholder_cleared: bool,
     /// Last logged render-cut shape `(tiles, min_depth, max_depth)` —
@@ -397,6 +427,7 @@ struct AttachTarget {
     anchor: Entity,
     local: Transform,
     owner_id: Option<String>,
+    sse_threshold_px: Option<f64>,
 }
 
 /// What one tile's content fetch produced.
@@ -438,10 +469,20 @@ impl Default for Tiles3dChannel {
     }
 }
 
+/// The 3D Tiles streaming plugin.
+///
+/// Every resource it owns is registered with `init_resource`, which does **not**
+/// overwrite a resource the host already inserted. That makes pre-insertion the
+/// supported override seam: insert a tuned [`Tiles3dConfig`] (or any host-supplied
+/// seam resource) *before* `add_plugins(Tiles3dPlugin)` and the host's value wins.
+/// Guarded by the `host_inserted_config_wins` test so a future refactor to
+/// `insert_resource` can't silently break it.
 pub struct Tiles3dPlugin;
 
 impl Plugin for Tiles3dPlugin {
     fn build(&self, app: &mut App) {
+        // `init_resource`, NOT `insert_resource`: a host-inserted config survives
+        // (the documented override contract — see the struct + `Tiles3dConfig` docs).
         app.init_resource::<Tiles3dConfig>()
             .init_resource::<Tiles3dSets>()
             .init_resource::<Tiles3dChannel>()
@@ -556,6 +597,7 @@ fn apply_attach_detach(
                 anchor: msg.anchor,
                 local: msg.local,
                 owner_id: msg.owner_id.clone(),
+                sse_threshold_px: msg.sse_threshold_px,
             }),
             channel.tx.clone(),
         );
@@ -813,6 +855,7 @@ fn receive_tiles3d(
                                 compact_high_water: n,
                                 root_entity,
                                 anchor: attach.as_ref().map(|a| a.anchor),
+                                sse_threshold_px: attach.as_ref().and_then(|a| a.sse_threshold_px),
                                 owner_id: attach.and_then(|a| a.owner_id),
                                 placeholder_cleared: false,
                                 last_cut: None,
@@ -1560,7 +1603,9 @@ fn drive_tiles3d(
             cam_pos,
             cam_forward,
             k_px,
-            sse_threshold_px: config.sse_threshold_px,
+            // Per-set override (dense single-asset preview) wins; else the
+            // app-global config default (globe basemap).
+            sse_threshold_px: set.sse_threshold_px.unwrap_or(config.sse_threshold_px),
             detail_falloff_m,
             cam_height_m,
         };
@@ -1872,6 +1917,29 @@ fn set_google_logo_dom(_show: bool) {}
 mod tests {
     use super::*;
     use bevy::tasks::block_on;
+
+    /// The host-override contract (see [`Tiles3dConfig`] + [`Tiles3dPlugin`]
+    /// docs): a config inserted before the plugin survives `add_plugins`, because
+    /// `build` registers it with `init_resource` (never overwrites). The TurboTwin
+    /// wasm host depends on this to lower its load budget; locking it here stops a
+    /// refactor to `insert_resource` from silently reverting every host to the
+    /// defaults.
+    #[test]
+    fn host_inserted_config_wins() {
+        let mut app = App::new();
+        app.insert_resource(Tiles3dConfig {
+            sse_threshold_px: 24.0,
+            max_concurrent_loads: 4,
+            ..Default::default()
+        });
+        app.add_plugins(Tiles3dPlugin);
+        let cfg = app.world().resource::<Tiles3dConfig>();
+        assert_eq!(cfg.sse_threshold_px, 24.0, "host sse_threshold_px kept");
+        assert_eq!(
+            cfg.max_concurrent_loads, 4,
+            "host max_concurrent_loads kept"
+        );
+    }
 
     /// `build_submesh` (T8 highlight) extracts a triangle subset into a compact
     /// mesh, copying the attributes the source has and remapping indices.
