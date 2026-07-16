@@ -65,7 +65,9 @@ pub mod traversal;
 
 #[cfg(feature = "points")]
 pub use api::PointTileMaterial;
-pub use api::{EcefOrigin, TileFeatureResolver, TileGeometry, TileOwner, Tiles3dCamera};
+pub use api::{
+    EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, Tiles3dCamera,
+};
 
 use archive::Archive3tz;
 use content::{DecodedItem, DecodedPrimitive, DecodedTile};
@@ -136,14 +138,11 @@ pub struct Tiles3dConfig {
     /// per-frame O(tree) pass. The compactor drops whole grafted subtrees that
     /// have been out of view past the grace window; revisiting re-grafts them.
     pub tree_compact_min: usize,
-    /// Ceiling on the per-feature submesh split (T8 highlight): a tile whose
-    /// resolved feature owners exceed this spawns as ONE mesh instead. The
-    /// split runs `build_submesh` + a mesh asset + an entity **per owner per
-    /// tile** on the main thread — unbounded, a preview whose "features" are
-    /// hundreds of exporter part names froze the wasm client for whole seconds
-    /// per refine wave (measured: 2 s single tasks, 152 owners × every leaf).
-    /// Per-feature hover degrades to whole-tile on capped tiles; picking
-    /// correctness is unaffected.
+    /// VESTIGIAL since 0.1.6 (kept for struct-literal compatibility): tiles no
+    /// longer split into per-feature submeshes at all — every primitive spawns
+    /// as one mesh and features resolve at pick time via [`TileFeaturePick`]
+    /// (the Cesium model). The split, even capped, cost seconds of
+    /// main-thread hang per refine wave.
     pub max_feature_submeshes: usize,
     /// Memory-pressure valve: when the RAW content bytes of all resident tiles
     /// (summed across tilesets) exceed this budget, the effective SSE
@@ -1049,7 +1048,6 @@ fn receive_tiles3d(
                             tile,
                             transform,
                             items,
-                            config.max_feature_submeshes,
                         );
                         set.slots[tile] = TileSlot::Ready {
                             entity,
@@ -1142,7 +1140,6 @@ fn spawn_tile_content(
     tile: usize,
     transform: Transform,
     items: Vec<DecodedItem>,
-    max_feature_submeshes: usize,
 ) -> Entity {
     let tile_root = commands
         .spawn((
@@ -1207,75 +1204,51 @@ fn spawn_tile_content(
                 };
                 let mat_handle = materials.add(standard);
 
-                match (features, has_resolver) {
-                    // Feature tile under an owner with a resolver: split into
-                    // per-feature submeshes so highlight/hover/select resolve.
+                // ONE mesh per primitive, always — the Cesium model. Features
+                // resolve at PICK time from the hit triangle via
+                // [`TileFeaturePick`]; the old per-owner submesh split
+                // (build_submesh + a mesh asset + a GPU upload PER FEATURE per
+                // tile) was measured at seconds of main-thread hang per refine
+                // wave even capped, while pure-decode tilesets only
+                // micro-stuttered. Per-feature hover highlight moves to
+                // render-state (a feature-id tint — Phase B); selection
+                // correctness is carried entirely by the pick table.
+                let pick = match (features, has_resolver) {
                     (Some(f), true) => {
                         let fallback = anchor.unwrap_or("");
-                        // Resolve ALL of the tile's feature paths in one call so
-                        // the host builds its per-anchor lookup once per tile,
-                        // not once per feature.
+                        // Resolve ALL of the tile's feature paths in one call
+                        // so the host builds its per-anchor lookup once per
+                        // tile, not once per feature.
                         let paths: Vec<&str> =
                             f.node_of_feature.iter().map(String::as_str).collect();
-                        let owner_of_feature = resolver.resolve(fallback, &paths);
-                        let mut tris_by_owner: std::collections::HashMap<String, Vec<usize>> =
-                            std::collections::HashMap::new();
-                        for (tri, &fid) in f.feature_of_triangle.iter().enumerate() {
-                            // Out-of-range id (malformed tile) falls back to the
-                            // anchor rather than dropping the triangle (a hole).
-                            let owner = owner_of_feature
-                                .get(fid as usize)
-                                .map(String::as_str)
-                                .unwrap_or(fallback);
-                            tris_by_owner
-                                .entry(owner.to_string())
-                                .or_default()
-                                .push(tri);
-                        }
-                        // Cap the split (Tiles3dConfig::max_feature_submeshes):
-                        // build_submesh + a mesh asset + an entity PER OWNER is
-                        // main-thread work that scales with owner count — a tile
-                        // whose "features" are hundreds of exporter part names
-                        // froze the wasm client for seconds per refine wave.
-                        // Over the cap, spawn one anchor-owned mesh instead
-                        // (per-feature hover degrades; nothing else changes).
-                        if tris_by_owner.len() > max_feature_submeshes {
-                            let mut e = commands.spawn((
-                                Mesh3d(meshes.add(mesh)),
-                                MeshMaterial3d(mat_handle),
-                                prim_transform,
-                                ChildOf(tile_root),
-                                content_tag,
-                            ));
-                            if let Some(group) = &anchor_group {
-                                e.insert(group.clone());
+                        let mut owner_of_feature = resolver.resolve(fallback, &paths);
+                        // Out-of-range/unresolved ids fall back to the anchor
+                        // rather than dropping picks (matches the old split's
+                        // per-triangle fallback).
+                        for owner in &mut owner_of_feature {
+                            if owner.is_empty() {
+                                *owner = fallback.to_string();
                             }
-                            continue;
                         }
-                        for (owner, tris) in tris_by_owner {
-                            commands.spawn((
-                                Mesh3d(meshes.add(build_submesh(&mesh, &tris))),
-                                MeshMaterial3d(mat_handle.clone()),
-                                prim_transform,
-                                ChildOf(tile_root),
-                                TileOwner { id: owner },
-                                content_tag,
-                            ));
-                        }
+                        Some(TileFeaturePick {
+                            feature_of_triangle: f.feature_of_triangle,
+                            owner_of_feature,
+                        })
                     }
-                    // Plain/scenery/world-layer tile: one mesh, anchor-tagged.
-                    _ => {
-                        let mut e = commands.spawn((
-                            Mesh3d(meshes.add(mesh)),
-                            MeshMaterial3d(mat_handle),
-                            prim_transform,
-                            ChildOf(tile_root),
-                            content_tag,
-                        ));
-                        if let Some(group) = &anchor_group {
-                            e.insert(group.clone());
-                        }
-                    }
+                    _ => None,
+                };
+                let mut e = commands.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(mat_handle),
+                    prim_transform,
+                    ChildOf(tile_root),
+                    content_tag,
+                ));
+                if let Some(group) = &anchor_group {
+                    e.insert(group.clone());
+                }
+                if let Some(pick) = pick {
+                    e.insert(pick);
                 }
             }
             #[cfg(feature = "points")]
@@ -1323,6 +1296,9 @@ fn spawn_tile_content(
 /// twin pieces at spawn (T8 highlight). Copies POSITION plus whatever of
 /// NORMAL/UV0/COLOR the source carries; `MAIN_WORLD` usage so the pick raycast
 /// can read it.
+// Kept for Phase B (lazy per-feature highlight: extract ONE hovered feature's
+// submesh on demand, render-state style) and exercised by its unit test.
+#[allow(dead_code)]
 fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
     use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues as Vav};
     let mut out = Mesh::new(

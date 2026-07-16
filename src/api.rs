@@ -91,6 +91,26 @@ pub struct TileGeometry {
     pub set_id: u64,
 }
 
+/// Pick-time feature resolution for a tile mesh entity (`EXT_mesh_features`,
+/// T8) — the Cesium model: ONE mesh per primitive, feature identity resolved
+/// from the HIT, never by splitting geometry per feature. (Splitting was
+/// measured at seconds of main-thread hang per refine wave: up to
+/// `max_feature_submeshes` mesh builds + GPU uploads per tile. Cesium3DTileFeature
+/// works the same way — batch ids + per-feature render state, one draw.)
+///
+/// The crate never reads it. A host raycaster that knows the hit triangle's
+/// index-buffer ordinal resolves `owner_of_feature[feature_of_triangle[tri]]`
+/// — the same owner string the per-feature submeshes used to carry in their
+/// [`TileOwner`] tags.
+#[derive(Component, Clone, Debug)]
+pub struct TileFeaturePick {
+    /// Index-buffer triangle ordinal → LOCAL feature id.
+    pub feature_of_triangle: Vec<u32>,
+    /// LOCAL feature id → resolved owner id (host domain — twin id, node
+    /// path under an identity resolver, …).
+    pub owner_of_feature: Vec<String>,
+}
+
 /// Optional per-feature resolver for tiles that carry `EXT_mesh_features`.
 ///
 /// Given the owning tile's id (`anchor`) and **all** of a tile's feature node
