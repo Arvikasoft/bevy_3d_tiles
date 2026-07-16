@@ -136,6 +136,15 @@ pub struct Tiles3dConfig {
     /// per-frame O(tree) pass. The compactor drops whole grafted subtrees that
     /// have been out of view past the grace window; revisiting re-grafts them.
     pub tree_compact_min: usize,
+    /// Ceiling on the per-feature submesh split (T8 highlight): a tile whose
+    /// resolved feature owners exceed this spawns as ONE mesh instead. The
+    /// split runs `build_submesh` + a mesh asset + an entity **per owner per
+    /// tile** on the main thread — unbounded, a preview whose "features" are
+    /// hundreds of exporter part names froze the wasm client for whole seconds
+    /// per refine wave (measured: 2 s single tasks, 152 owners × every leaf).
+    /// Per-feature hover degrades to whole-tile on capped tiles; picking
+    /// correctness is unaffected.
+    pub max_feature_submeshes: usize,
 }
 
 impl Default for Tiles3dConfig {
@@ -166,6 +175,10 @@ impl Default for Tiles3dConfig {
             // compacting tiny trees. Re-grafting a reclaimed area is a real
             // re-fetch (P3DT is never CAS-cached), so don't set it too tight.
             tree_compact_min: 16_384,
+            // Generous for real part hierarchies (a valve skid is dozens of
+            // features); far below the pathological hundreds-of-export-parts
+            // case the cap exists for.
+            max_feature_submeshes: 64,
         }
     }
 }
@@ -1008,6 +1021,7 @@ fn receive_tiles3d(
                             tile,
                             transform,
                             items,
+                            config.max_feature_submeshes,
                         );
                         set.slots[tile] = TileSlot::Ready { entity };
                     }
@@ -1097,6 +1111,7 @@ fn spawn_tile_content(
     tile: usize,
     transform: Transform,
     items: Vec<DecodedItem>,
+    max_feature_submeshes: usize,
 ) -> Entity {
     let tile_root = commands
         .spawn((
@@ -1185,6 +1200,26 @@ fn spawn_tile_content(
                                 .entry(owner.to_string())
                                 .or_default()
                                 .push(tri);
+                        }
+                        // Cap the split (Tiles3dConfig::max_feature_submeshes):
+                        // build_submesh + a mesh asset + an entity PER OWNER is
+                        // main-thread work that scales with owner count — a tile
+                        // whose "features" are hundreds of exporter part names
+                        // froze the wasm client for seconds per refine wave.
+                        // Over the cap, spawn one anchor-owned mesh instead
+                        // (per-feature hover degrades; nothing else changes).
+                        if tris_by_owner.len() > max_feature_submeshes {
+                            let mut e = commands.spawn((
+                                Mesh3d(meshes.add(mesh)),
+                                MeshMaterial3d(mat_handle),
+                                prim_transform,
+                                ChildOf(tile_root),
+                                content_tag,
+                            ));
+                            if let Some(group) = &anchor_group {
+                                e.insert(group.clone());
+                            }
+                            continue;
                         }
                         for (owner, tris) in tris_by_owner {
                             commands.spawn((

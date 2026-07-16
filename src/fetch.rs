@@ -219,6 +219,10 @@ pub enum ByteSource {
     Mem(Arc<Vec<u8>>),
     File(PathBuf),
     Http(String),
+    /// Test-only: `Mem` plus a request counter, for asserting round-trip
+    /// budgets (the `.3tz` fast-open contract in `archive.rs`).
+    #[cfg(test)]
+    Counting(Arc<Vec<u8>>, Arc<std::sync::atomic::AtomicUsize>),
 }
 
 impl ByteSource {
@@ -232,6 +236,8 @@ impl ByteSource {
                 .map(|m| m.len())
                 .map_err(|e| FetchError::Io(format!("{}: {e}", path.display()))),
             ByteSource::Http(url) => http_size(url).await,
+            #[cfg(test)]
+            ByteSource::Counting(inner, _) => Ok(inner.len() as u64),
         }
     }
 
@@ -269,6 +275,55 @@ impl ByteSource {
                 Ok(out)
             }
             ByteSource::Http(url) => http_range(url, start, len, abort).await,
+            #[cfg(test)]
+            ByteSource::Counting(inner, hits) => {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let size = inner.len() as u64;
+                let end = start
+                    .checked_add(len)
+                    .filter(|&e| e <= size)
+                    .ok_or(FetchError::OutOfRange { start, len, size })?;
+                Ok(inner[start as usize..end as usize].to_vec())
+            }
+        }
+    }
+
+    /// Read the FIRST `n` bytes, clamped to the source size — the speculative
+    /// half of the two-request `.3tz` open (see [`super::archive::Archive3tz`]).
+    /// One request on HTTP; a short read is expected, not an error, when the
+    /// source is smaller than `n` (Azure/S3 answer an explicit range past EOF
+    /// with `206` + the available bytes).
+    pub async fn read_prefix(&self, n: u64) -> Result<Vec<u8>, FetchError> {
+        match self {
+            ByteSource::Mem(buf) => Ok(buf[..buf.len().min(n as usize)].to_vec()),
+            ByteSource::File(path) => {
+                use std::io::Read;
+                let f = std::fs::File::open(path)
+                    .map_err(|e| FetchError::Io(format!("{}: {e}", path.display())))?;
+                let mut out = Vec::new();
+                f.take(n)
+                    .read_to_end(&mut out)
+                    .map_err(|e| FetchError::Io(e.to_string()))?;
+                Ok(out)
+            }
+            ByteSource::Http(url) => match http_range(url, 0, n, None).await {
+                // A range-less dev server 200s the whole body and the strict
+                // slice in http_range rejects short files — take ≤ n instead.
+                Err(FetchError::OutOfRange { .. }) => {
+                    let mut all = self.read_all_abortable(None).await?;
+                    all.truncate(n as usize);
+                    Ok(all)
+                }
+                other => other.map(|mut b| {
+                    b.truncate(n as usize);
+                    b
+                }),
+            },
+            #[cfg(test)]
+            ByteSource::Counting(inner, hits) => {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(inner[..inner.len().min(n as usize)].to_vec())
+            }
         }
     }
 
@@ -278,6 +333,13 @@ impl ByteSource {
     pub async fn read_suffix(&self, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
         match self {
             ByteSource::Http(url) => http_suffix(url, n).await,
+            #[cfg(test)]
+            ByteSource::Counting(inner, hits) => {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let size = inner.len() as u64;
+                let n = n.min(size) as usize;
+                Ok((inner[inner.len() - n..].to_vec(), size))
+            }
             _ => {
                 let size = self.size().await?;
                 let n = n.min(size);
@@ -295,6 +357,11 @@ impl ByteSource {
     ) -> Result<Vec<u8>, FetchError> {
         check_abort(abort)?;
         match self {
+            #[cfg(test)]
+            ByteSource::Counting(inner, hits) => {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(inner.as_ref().clone())
+            }
             ByteSource::Mem(buf) => Ok(buf.as_ref().clone()),
             ByteSource::File(path) => {
                 std::fs::read(path).map_err(|e| FetchError::Io(format!("{}: {e}", path.display())))
