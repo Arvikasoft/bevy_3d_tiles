@@ -448,8 +448,7 @@ impl Archive3tz {
             let header = parse_local_header(&tail[at..])?;
             let start = at + header.data_rel as usize;
             let end = start + entry.comp_size as usize;
-            (header.name == INDEX_NAME && end <= tail.len())
-                .then(|| tail[start..end].to_vec())
+            (header.name == INDEX_NAME && end <= tail.len()).then(|| tail[start..end].to_vec())
         } else {
             None
         };

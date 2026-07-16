@@ -12,8 +12,13 @@
 use std::time::Instant;
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: decode_bench <glb-dir> [N]");
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(24);
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: decode_bench <glb-dir> [N]");
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
 
     let mut files: Vec<_> = std::fs::read_dir(&dir)
         .expect("read_dir")
@@ -48,12 +53,24 @@ fn main() {
                 tris += m.mesh.indices().map_or(0, |ix| ix.len() / 3);
             }
         }
-        rows.push((p.file_name().unwrap().to_string_lossy().to_string(), bytes.len(), ms, tris, prims));
+        rows.push((
+            p.file_name().unwrap().to_string_lossy().to_string(),
+            bytes.len(),
+            ms,
+            tris,
+            prims,
+        ));
     }
     rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-    println!("{:<18} {:>9} {:>9} {:>9} {:>6}", "tile", "bytes", "ms", "tris", "prims");
+    println!(
+        "{:<18} {:>9} {:>9} {:>9} {:>6}",
+        "tile", "bytes", "ms", "tris", "prims"
+    );
     for (name, len, ms, tris, prims) in &rows {
-        println!("{:<18} {:>9} {:>9.1} {:>9} {:>6}", name, len, ms, tris, prims);
+        println!(
+            "{:<18} {:>9} {:>9.1} {:>9} {:>6}",
+            name, len, ms, tris, prims
+        );
     }
     println!(
         "\n{} tiles, total {:.0}ms, mean {:.1}ms — multiply by ~2-3x for wasm main-thread cost",
