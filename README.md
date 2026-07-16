@@ -20,9 +20,13 @@ for bugs and feature requests.
   kicking (no holes while streaming), Urgent/Normal/Preload request
   priorities recomputed per frame, and cancellation of out-of-cut fetches.
 - **Packed `.3tz` archives streamed over HTTP range requests** — one blob per
-  asset, no unpacking, no server compute: a tail scan finds the
-  `@3dtilesIndex1@`, then ~2 range-GETs per tile. As far as we know no other
-  runtime (including Cesium's) streams `.3tz` from a URL.
+  asset, no unpacking, no server compute. Opening costs a single parallel
+  round-trip pair (suffix: EOCD + central directory + `@3dtilesIndex1@`;
+  speculative head: a front-packed `tileset.json` + root tile render with
+  **zero further requests**), and each other tile is exactly one range-GET —
+  its byte span is derived from the index, so header and data arrive
+  together. As far as we know no other runtime (including Cesium's) streams
+  `.3tz` from a URL.
 - **Exploded `tileset.json` tilesets** too, of course — local paths or URLs,
   including external-tileset grafting (`content.uri` → sub-tileset.json).
 - **glTF tile content**: meshes, `POINTS` point clouds (`points` feature →
@@ -150,6 +154,34 @@ attribution lines whenever tiles are visible, and bring your own API key
 | 0.1 | 0.18 |
 
 Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
+
+## Upgrading
+
+### 0.1.2 → 0.1.3
+
+Two structs gained fields — struct-literal construction sites need a one-line
+addition each:
+
+- **`Tiles3dAttach.sse_threshold_px: Option<f64>`** — per-tileset
+  screen-space-error threshold override; `None` keeps the app-global
+  [`Tiles3dConfig`] value. Add `sse_threshold_px: None` to existing literals.
+  Set it (e.g. `Some(24.0)`) for dense single-asset previews so they stop
+  over-refining past the root while a globe basemap keeps the sharp default.
+- **`Tiles3dConfig.max_feature_submeshes: usize`** (default 64) — ceiling on
+  the per-feature submesh split at tile spawn. Unbounded splitting froze the
+  wasm main thread for seconds on tiles whose "features" were hundreds of
+  exporter part names; over the cap a tile spawns as one mesh (per-feature
+  hover degrades on that tile, picking correctness is unaffected). Config
+  literals built with `..Default::default()` need no change.
+
+Behavioral (no API change): the `.3tz` open now issues its suffix and a 2 MiB
+speculative head request in parallel and serves front-packed entries from the
+head, taking a cold open from ~5–7 serial round trips to one parallel pair;
+per-tile reads collapse to a single range-GET via index-derived spans. Foreign
+archives that are not front-packed lose nothing — unused windows fall back to
+the previous behavior. Pack archives with `tileset.json` first and the root
+tile second (any preorder writer does this) to get the zero-request first
+paint.
 
 ## Battle-tested
 

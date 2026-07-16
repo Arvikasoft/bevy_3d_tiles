@@ -7,15 +7,17 @@
 //! then `[8..16]` (Maxar 3tz spec v1.4). That design makes remote reading
 //! possible without a zip library or a full central-directory download:
 //!
-//! 1. **Open** — one suffix range-GET of the archive tail: locate the ZIP
-//!    End-Of-Central-Directory (+ ZIP64 records when present), find the LAST
-//!    central-directory entry (must be the index, per spec), then read the
-//!    index payload. Usually 2 range requests total.
+//! 1. **Open** — ONE parallel round-trip pair: a suffix range-GET (EOCD +
+//!    ZIP64 + central directory + the index payload, all inside the 512 KiB
+//!    tail for multi-thousand-tile sets) and a speculative head range-GET
+//!    (our tilers front-pack `tileset.json` + the root tile, so the first
+//!    rendered cut is usually already in memory when open returns).
 //! 2. **Per entry** — MD5 the normalized path (backslashes → `/`, leading `/`
-//!    stripped), binary-search the in-memory index, then **two range-GETs**:
-//!    the Local File Header (over-fetched so small entries complete in one),
-//!    and the entry data. Equal-hash collisions are adjacent in the index and
-//!    disambiguated by the filename in the Local File Header.
+//!    stripped), binary-search the in-memory index, then serve from the open
+//!    head (zero requests), else **one range-GET** covering header + data via
+//!    the exact span derived from the next entry's offset, else the legacy
+//!    header-then-data pair. Equal-hash collisions are adjacent in the index
+//!    and disambiguated by the filename in the Local File Header.
 //!
 //! Supported entry compression: stored (0) and DEFLATE (8, via `miniz_oxide`).
 //! Zstandard (93) is rejected with a clear error — our tilers (D3) emit
@@ -31,14 +33,31 @@ use super::fetch::{AbortHandle, ByteSource, FetchError};
 const INDEX_NAME: &[u8] = b"@3dtilesIndex1@";
 
 /// Suffix fetched on open. Covers the EOCD (+comment), ZIP64 records, the
-/// central-directory tail, and usually the whole index payload for tilesets up
-/// to a few thousand tiles.
-const OPEN_TAIL_BYTES: u64 = 64 * 1024;
+/// central-directory, AND the whole index payload for multi-thousand-tile
+/// sets (~24 B/record index + ~66 B/entry CD ≈ 90 KiB per 1000 tiles), so the
+/// open completes with no follow-up requests. Larger sets degrade gracefully
+/// to one extra ranged read.
+const OPEN_TAIL_BYTES: u64 = 512 * 1024;
+
+/// Speculative head fetched IN PARALLEL with the tail on open. Our tilers
+/// front-pack the archive — `tileset.json` is the first entry and the root
+/// tile the second (pack3tz writes preorder) — so this window almost always
+/// contains everything the first rendered cut needs: first paint costs one
+/// parallel round-trip pair instead of five serial round trips (measured 3.2 s
+/// to tileset-parsed + 1.8 s to first cut on a 2074-tile set over Azure Blob).
+const OPEN_HEAD_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Local-File-Header over-fetch: one range-GET grabs the 30-byte header, the
 /// name/extra fields, and — for small entries (tileset.json, coarse tiles) —
-/// often the entire payload, so the second GET is skipped.
+/// often the entire payload, so the second GET is skipped. Fallback path only;
+/// entries with a known span (see `span_of`) fetch header + data in one GET.
 const LFH_OVERFETCH: u64 = 4096;
+
+/// Cap on the single-GET entry span (`next entry offset − this offset`). Spans
+/// are exact for gap-free archives (ours); a foreign archive with padding
+/// between entries would over-read, so bound the damage. Entries larger than
+/// the cap fall back to header-then-data reads.
+const MAX_ENTRY_SPAN: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
@@ -357,13 +376,30 @@ pub struct Archive3tz {
     source: ByteSource,
     size: u64,
     index: Index3tz,
+    /// Speculative first [`OPEN_HEAD_BYTES`] of the archive, fetched in
+    /// parallel with the tail on open. Front-packed entries (tileset.json, the
+    /// root tile) are served straight from this buffer with zero requests.
+    head: Vec<u8>,
+    /// Every Local-File-Header offset in the archive (all index records plus
+    /// the index entry itself), sorted ascending — `span_of` derives each
+    /// entry's exact byte span from its successor, enabling single-GET reads.
+    offsets: Vec<u64>,
 }
 
 impl Archive3tz {
-    /// Open an archive: suffix-read the tail, locate EOCD (+ZIP64), find the
-    /// index's central-directory entry, read + parse the index payload.
+    /// Open an archive with ONE parallel round-trip pair: a suffix read (the
+    /// EOCD, ZIP64 records, central directory and index payload) plus a
+    /// speculative head read (front-packed tileset.json and root tile). Extra
+    /// ranged reads happen only when a section outruns its window.
     pub async fn open(source: ByteSource) -> Result<Self, ArchiveError> {
-        let (tail, size) = source.read_suffix(OPEN_TAIL_BYTES).await?;
+        let (suffix, head) = bevy::tasks::futures_lite::future::zip(
+            source.read_suffix(OPEN_TAIL_BYTES),
+            source.read_prefix(OPEN_HEAD_BYTES),
+        )
+        .await;
+        let (tail, size) = suffix?;
+        // The head is a pure optimization — degrade to ranged reads on error.
+        let head = head.unwrap_or_default();
         let tail_abs = size - tail.len() as u64;
         let eocd = find_eocd(&tail, tail_abs)?;
 
@@ -404,21 +440,58 @@ impl Archive3tz {
             ));
         }
 
-        let raw = read_entry_at(&source, size, entry.local_offset, INDEX_NAME, None).await?;
-        let raw = raw.ok_or(ArchiveError::NoIndex)?;
-        if raw.data.len() as u64 != entry.comp_size {
+        // The tail window usually already contains the index entry whole
+        // (payload sits right before the central directory) — parse in place
+        // and skip the two ranged reads read_entry_at would issue.
+        let data = if entry.local_offset >= tail_abs {
+            let at = (entry.local_offset - tail_abs) as usize;
+            let header = parse_local_header(&tail[at..])?;
+            let start = at + header.data_rel as usize;
+            let end = start + entry.comp_size as usize;
+            (header.name == INDEX_NAME && end <= tail.len())
+                .then(|| tail[start..end].to_vec())
+        } else {
+            None
+        };
+        let data = match data {
+            Some(d) => d,
+            None => {
+                let raw = read_entry_at(&source, size, entry.local_offset, INDEX_NAME, None)
+                    .await?
+                    .ok_or(ArchiveError::NoIndex)?;
+                raw.data
+            }
+        };
+        if data.len() as u64 != entry.comp_size {
             return Err(ArchiveError::Corrupt(format!(
                 "index payload size {} != central directory size {}",
-                raw.data.len(),
+                data.len(),
                 entry.comp_size
             )));
         }
-        let index = Index3tz::parse(&raw.data)?;
+        let index = Index3tz::parse(&data)?;
+        // Sorted LFH offsets (every entry + the index itself as the terminal
+        // bound) — `span_of` turns a lookup hit into an exact single-GET range.
+        let mut offsets: Vec<u64> = index.records.iter().map(|r| r.offset).collect();
+        offsets.push(entry.local_offset);
+        offsets.sort_unstable();
         Ok(Self {
             source,
             size,
             index,
+            head,
+            offsets,
         })
+    }
+
+    /// Exact byte span of the entry whose Local File Header sits at `offset`
+    /// (header + data), derived from the next entry's offset. `None` when the
+    /// offset is unknown or the span exceeds [`MAX_ENTRY_SPAN`].
+    fn span_of(&self, offset: u64) -> Option<u64> {
+        let ix = self.offsets.partition_point(|&o| o <= offset);
+        let next = *self.offsets.get(ix)?;
+        let span = next.checked_sub(offset)?;
+        (span > 0 && span <= MAX_ENTRY_SPAN).then_some(span)
     }
 
     pub fn index(&self) -> &Index3tz {
@@ -446,19 +519,84 @@ impl Archive3tz {
         let normalized = normalize_path(path);
         let candidates = self.index.lookup(&normalized);
         for offset in &candidates {
-            if let Some(raw) = read_entry_at(
-                &self.source,
-                self.size,
-                *offset,
-                normalized.as_bytes(),
-                abort,
-            )
-            .await?
+            if let Some(raw) = self
+                .read_raw_at(*offset, normalized.as_bytes(), abort)
+                .await?
             {
                 return decode_entry(raw.method, raw.data);
             }
         }
         Err(ArchiveError::EntryNotFound(normalized))
+    }
+
+    /// Fetch + parse the entry at a Local-File-Header offset; `None` when the
+    /// header's filename doesn't match (an MD5-collision candidate to skip).
+    ///
+    /// Request budget: **zero** range-GETs when the entry sits inside the
+    /// speculative open head (front-packed tileset.json / root tile), else
+    /// **one** covering header + data via the index-derived exact span, else
+    /// the two-GET header-then-data fallback.
+    async fn read_raw_at(
+        &self,
+        offset: u64,
+        expected_name: &[u8],
+        abort: Option<&AbortHandle>,
+    ) -> Result<Option<RawEntry>, ArchiveError> {
+        // Head fast path — served from the open()'s speculative buffer.
+        if (offset as usize) < self.head.len() {
+            let window = &self.head[offset as usize..];
+            if let Ok(header) = parse_local_header(window) {
+                if header.name != expected_name {
+                    return Ok(None);
+                }
+                if let Some(comp_size) = header.comp_size {
+                    let start = header.data_rel as usize;
+                    let end = start + comp_size as usize;
+                    if end <= window.len() {
+                        return Ok(Some(RawEntry {
+                            method: header.method,
+                            data: window[start..end].to_vec(),
+                        }));
+                    }
+                }
+            }
+        }
+        // Exact-span path: one GET for header + data.
+        if let Some(span) = self.span_of(offset) {
+            let window = self_read_abortable(&self.source, offset, span, self.size, abort).await?;
+            let header = parse_local_header(&window)?;
+            if header.name != expected_name {
+                return Ok(None);
+            }
+            if let Some(comp_size) = header.comp_size {
+                let start = header.data_rel as usize;
+                let end = start + comp_size as usize;
+                if end <= window.len() {
+                    return Ok(Some(RawEntry {
+                        method: header.method,
+                        data: window[start..end].to_vec(),
+                    }));
+                }
+                // Span was capped or the archive has inter-entry gaps that
+                // lied about the size — fetch the remainder of the data.
+                let data = self_read_abortable(
+                    &self.source,
+                    offset + header.data_rel,
+                    comp_size,
+                    self.size,
+                    abort,
+                )
+                .await?;
+                if data.len() as u64 == comp_size {
+                    return Ok(Some(RawEntry {
+                        method: header.method,
+                        data,
+                    }));
+                }
+            }
+        }
+        // Legacy fallback: header over-fetch, then data.
+        read_entry_at(&self.source, self.size, offset, expected_name, abort).await
     }
 }
 
@@ -766,6 +904,57 @@ mod tests {
         // And the pristine empty archive opens with an empty index.
         let ar = block_on(Archive3tz::open(mem(empty))).expect("open empty");
         assert!(ar.index().is_empty());
+    }
+
+    /// The fast-open request-budget contract: open = exactly the parallel
+    /// suffix+prefix pair; front-packed entries (tileset.json, root tile)
+    /// serve from the head with ZERO further requests; an entry outside both
+    /// windows costs exactly ONE span-bounded request.
+    #[test]
+    fn open_and_first_paint_request_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tileset = br#"{"asset":{"version":"1.1"},"root":{}}"#;
+        let root_glb: Vec<u8> = (0u8..=255).cycle().take(300_000).collect();
+        // Fillers push later entries beyond the 2 MiB head AND keep them clear
+        // of the 512 KiB tail (index+CD are tiny here, so the tail reaches
+        // 512 KiB into the archive body — the far entry must sit before that).
+        let filler: Vec<u8> = vec![0xAB; 3_000_000];
+        let far: Vec<u8> = b"far-tile-payload".repeat(100);
+        let tail_guard: Vec<u8> = vec![0xCD; 1_000_000];
+        let archive = write_3tz(
+            &[
+                ("tileset.json", tileset.as_slice(), false),
+                ("content/r.glb", root_glb.as_slice(), false),
+                ("content/filler.bin", filler.as_slice(), false),
+                ("content/far.glb", far.as_slice(), false),
+                ("content/tail_guard.bin", tail_guard.as_slice(), false),
+            ],
+            b"",
+        );
+        let hits = Arc::new(AtomicUsize::new(0));
+        let src = ByteSource::Counting(Arc::new(archive), hits.clone());
+
+        let ar = block_on(Archive3tz::open(src)).expect("open");
+        assert_eq!(hits.load(Ordering::Relaxed), 2, "open = suffix + prefix");
+
+        assert_eq!(
+            block_on(ar.read_entry("tileset.json")).unwrap(),
+            tileset,
+            "tileset content"
+        );
+        assert_eq!(block_on(ar.read_entry("content/r.glb")).unwrap(), root_glb);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "front-packed entries serve from the open head — no new requests"
+        );
+
+        assert_eq!(block_on(ar.read_entry("content/far.glb")).unwrap(), far);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            3,
+            "an entry outside the head costs exactly one span-bounded request"
+        );
     }
 
     #[test]
