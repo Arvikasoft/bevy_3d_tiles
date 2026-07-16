@@ -157,6 +157,25 @@ Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
 
 ## Upgrading
 
+### 0.1.5 → 0.1.6
+
+**Feature tiles no longer split into per-owner submeshes** — every primitive
+spawns as ONE mesh (the Cesium model: batch ids + hit-time resolution, never
+geometry splitting). The split cost seconds of main-thread hang per refine
+wave on wasm even capped; pure-decode tilesets only micro-stutter.
+
+- New component **`TileFeaturePick`** on feature-tile mesh entities:
+  `owner_of_feature[feature_of_triangle[hit_triangle]]` is the same owner
+  string the per-feature submeshes used to carry in `TileOwner`. A host
+  raycaster that knows the hit triangle's index-buffer ordinal keeps
+  per-feature *selection* exactly as before.
+- Per-feature *hover/outline visuals* that keyed off per-owner entities need a
+  render-state replacement (e.g. a feature-id tint in the material — the
+  CesiumJS `Cesium3DTileFeature.color` model). Until then they degrade to
+  whole-tile.
+- `Tiles3dConfig.max_feature_submeshes` is vestigial (kept for struct-literal
+  compatibility).
+
 ### 0.1.4 → 0.1.5
 
 - **`Tiles3dConfig.memory_budget_bytes: u64`** (default `0` = off) — the
