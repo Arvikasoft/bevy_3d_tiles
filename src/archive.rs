@@ -41,11 +41,17 @@ const OPEN_TAIL_BYTES: u64 = 512 * 1024;
 
 /// Speculative head fetched IN PARALLEL with the tail on open. Our tilers
 /// front-pack the archive — `tileset.json` is the first entry and the root
-/// tile the second (pack3tz writes preorder) — so this window almost always
-/// contains everything the first rendered cut needs: first paint costs one
-/// parallel round-trip pair instead of five serial round trips (measured 3.2 s
-/// to tileset-parsed + 1.8 s to first cut on a 2074-tile set over Azure Blob).
-const OPEN_HEAD_BYTES: u64 = 2 * 1024 * 1024;
+/// tile the second (pack3tz writes preorder) — so this window usually holds
+/// the tileset (and on smaller sets the root too): the open costs one parallel
+/// round-trip pair instead of five serial round trips (measured 3.2 s to
+/// tileset-parsed on a 2074-tile set over Azure Blob).
+///
+/// SIZED FOR BANDWIDTH, not just RTTs: speculation is a transfer tax on every
+/// cold open. The first cut of this at 2 MiB made a 13-tile / 4.4 MiB archive
+/// open SLOWER than the old serial reader on a ~15 Mbps path (2.8 s vs 1.6 s —
+/// the bytes cost more than the round trips saved). At 512 KiB small sets keep
+/// the win and a big set's root merely costs one extra span-bounded GET.
+const OPEN_HEAD_BYTES: u64 = 512 * 1024;
 
 /// Local-File-Header over-fetch: one range-GET grabs the 30-byte header, the
 /// name/extra fields, and — for small entries (tileset.json, coarse tiles) —
