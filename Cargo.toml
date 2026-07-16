@@ -1,6 +1,6 @@
 [package]
 name = "bevy_3d_tiles"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.95.0"
 description = "OGC 3D Tiles 1.1 streaming renderer for Bevy — packed .3tz ranged reader, per-tile SSE traversal, glTF tile content, KTX2 + meshopt (+ Draco read), EXT_mesh_features picking, ECEF georeferencing, Google Photorealistic 3D Tiles. Native + WebGPU/wasm."

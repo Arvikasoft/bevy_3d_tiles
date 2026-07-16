@@ -145,6 +145,27 @@ pub struct Tiles3dConfig {
     /// Per-feature hover degrades to whole-tile on capped tiles; picking
     /// correctness is unaffected.
     pub max_feature_submeshes: usize,
+    /// Memory-pressure valve: when the RAW content bytes of all resident tiles
+    /// (summed across tilesets) exceed this budget, the effective SSE
+    /// threshold inflates by the overshoot ratio (clamped ×8) — the cut
+    /// coarsens, `want_visible` shrinks, and eviction can actually reclaim.
+    /// `0` disables. Decoded CPU+GPU cost runs ~2-4× the raw bytes, so budget
+    /// accordingly; a wasm host with a ~4 GiB grows-only heap wants this at a
+    /// few hundred MB. Without a valve, zooming into a large dense tileset
+    /// simply requests more than the address space holds and the client dies
+    /// with "memory access out of bounds" — quality degradation must win over
+    /// a crash.
+    pub memory_budget_bytes: u64,
+}
+
+/// SSE-threshold inflation for the memory-pressure valve: 1.0 under budget,
+/// the overshoot ratio above it, clamped so a pathological set degrades to
+/// visibly-coarse rather than unbounded thrash.
+fn memory_pressure_factor(resident_bytes: u64, budget_bytes: u64) -> f64 {
+    if budget_bytes == 0 || resident_bytes <= budget_bytes {
+        return 1.0;
+    }
+    (resident_bytes as f64 / budget_bytes as f64).min(8.0)
 }
 
 impl Default for Tiles3dConfig {
@@ -179,6 +200,9 @@ impl Default for Tiles3dConfig {
             // features); far below the pathological hundreds-of-export-parts
             // case the cap exists for.
             max_feature_submeshes: 64,
+            // Off by default — native address space is effectively unbounded.
+            // wasm hosts should set a budget (see the field docs).
+            memory_budget_bytes: 0,
         }
     }
 }
@@ -261,6 +285,9 @@ enum TileSlot {
     /// Content spawned (hidden until selected by the render cut).
     Ready {
         entity: Entity,
+        /// Raw content bytes (the memory-pressure proxy — see
+        /// [`Tiles3dConfig::memory_budget_bytes`]).
+        bytes: u64,
     },
     /// Terminal fetch/decode failure — never re-queued this session.
     Failed,
@@ -980,6 +1007,7 @@ fn receive_tiles3d(
                         spawned += 1;
                         let DecodedTile {
                             items,
+                            content_bytes,
                             rtc_center,
                             copyright,
                         } = *decoded;
@@ -1023,7 +1051,10 @@ fn receive_tiles3d(
                             items,
                             config.max_feature_submeshes,
                         );
-                        set.slots[tile] = TileSlot::Ready { entity };
+                        set.slots[tile] = TileSlot::Ready {
+                            entity,
+                            bytes: content_bytes,
+                        };
                     }
                     Err(e) => {
                         warn!(
@@ -1531,6 +1562,29 @@ fn drive_tiles3d(
     let cam_pos_world = cam_gt.translation().as_dvec3();
     let cam_forward_world = Vec3::from(cam_gt.forward()).as_dvec3();
 
+    // Memory-pressure valve: sum resident content bytes across ALL sets once
+    // per traversal (re-summed, never incrementally tracked — zero drift), and
+    // inflate every set's SSE threshold by the overshoot so the wanted cut
+    // coarsens and eviction can actually reclaim. Quality degradation beats
+    // "memory access out of bounds" (see Tiles3dConfig::memory_budget_bytes).
+    let resident_bytes: u64 = sets
+        .iter()
+        .flat_map(|s| s.slots.iter())
+        .map(|slot| match slot {
+            TileSlot::Ready { bytes, .. } => *bytes,
+            _ => 0,
+        })
+        .sum();
+    let pressure = memory_pressure_factor(resident_bytes, config.memory_budget_bytes);
+    if pressure > 1.0 {
+        debug!(
+            "tiles3d: memory pressure {:.2} ({} MB resident / {} MB budget) — SSE threshold inflated",
+            pressure,
+            resident_bytes / 1_048_576,
+            config.memory_budget_bytes / 1_048_576
+        );
+    }
+
     let mut any_in_flight = false;
     let mut google_visible = false;
     let mut ground_covering = false;
@@ -1589,7 +1643,7 @@ fn drive_tiles3d(
                     // re-place every resident tile from absolutes in f64.
                     *built = Some(o);
                     for (i, slot) in set.slots.iter_mut().enumerate() {
-                        let TileSlot::Ready { entity } = *slot else {
+                        let TileSlot::Ready { entity, .. } = *slot else {
                             continue;
                         };
                         if let Ok(mut t) = tile_transforms.get_mut(entity) {
@@ -1639,8 +1693,9 @@ fn drive_tiles3d(
             cam_forward,
             k_px,
             // Per-set override (dense single-asset preview) wins; else the
-            // app-global config default (globe basemap).
-            sse_threshold_px: set.sse_threshold_px.unwrap_or(config.sse_threshold_px),
+            // app-global config default (globe basemap). The memory-pressure
+            // factor scales EITHER — over budget, everything coarsens.
+            sse_threshold_px: set.sse_threshold_px.unwrap_or(config.sse_threshold_px) * pressure,
             detail_falloff_m,
             cam_height_m,
         };
@@ -1700,7 +1755,7 @@ fn drive_tiles3d(
             want_visible[t] = true;
         }
         for (i, slot) in set.slots.iter().enumerate() {
-            if let TileSlot::Ready { entity } = slot
+            if let TileSlot::Ready { entity, .. } = slot
                 && let Ok(mut vis) = vis_q.get_mut(*entity)
             {
                 let want = if want_visible[i] {
@@ -1841,7 +1896,7 @@ fn drive_tiles3d(
             evict.extend(extras.iter().take(over).map(|(i, _)| *i));
         }
         for i in evict {
-            if let TileSlot::Ready { entity } = set.slots[i] {
+            if let TileSlot::Ready { entity, .. } = set.slots[i] {
                 commands.entity(entity).despawn();
                 set.slots[i] = TileSlot::NotLoaded;
             }
@@ -1959,6 +2014,17 @@ mod tests {
     /// wasm host depends on this to lower its load budget; locking it here stops a
     /// refactor to `insert_resource` from silently reverting every host to the
     /// defaults.
+    /// The memory-pressure valve's transfer function: identity under budget
+    /// (and when disabled), overshoot ratio above it, clamped at ×8.
+    #[test]
+    fn memory_pressure_factor_curve() {
+        assert_eq!(memory_pressure_factor(500, 0), 1.0, "0 budget = disabled");
+        assert_eq!(memory_pressure_factor(400, 400), 1.0, "at budget");
+        assert_eq!(memory_pressure_factor(100, 400), 1.0, "under budget");
+        assert_eq!(memory_pressure_factor(800, 400), 2.0, "2x overshoot");
+        assert_eq!(memory_pressure_factor(400_000, 400), 8.0, "clamped at 8x");
+    }
+
     #[test]
     fn host_inserted_config_wins() {
         let mut app = App::new();

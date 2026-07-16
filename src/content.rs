@@ -282,6 +282,9 @@ impl Default for DecodedMaterial {
 /// A fully decoded tile: renderable items plus the side-band data T4 needs.
 pub struct DecodedTile {
     pub items: Vec<DecodedItem>,
+    /// Raw content (GLB) byte length — the memory-pressure proxy the traversal
+    /// sums over resident tiles (decoded CPU+GPU cost is ~2-4x this).
+    pub content_bytes: u64,
     /// `CESIUM_RTC` center (ECEF metres, Google P3DT). Composed into the
     /// tile's placement **in f64 at spawn** — never baked into f32 vertex
     /// data or a f32 transform (planetary magnitudes only cancel in f64).
@@ -308,6 +311,7 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         resolve_pending_textures(&mut items).await;
         return Ok(DecodedTile {
             items,
+            content_bytes: bytes.len() as u64,
             rtc_center: None,
             copyright: None,
         });
@@ -328,6 +332,7 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         let items = decode_splat_gltf(&value, bin)?;
         return Ok(DecodedTile {
             items,
+            content_bytes: bytes.len() as u64,
             rtc_center,
             copyright,
         });
@@ -354,6 +359,7 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
     resolve_pending_textures(&mut items).await;
     Ok(DecodedTile {
         items,
+        content_bytes: bytes.len() as u64,
         rtc_center,
         copyright,
     })
