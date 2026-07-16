@@ -157,6 +157,22 @@ Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
 
 ## Upgrading
 
+### 0.1.4 → 0.1.5
+
+- **`Tiles3dConfig.memory_budget_bytes: u64`** (default `0` = off) — the
+  memory-pressure valve. When the raw content bytes of all resident tiles
+  exceed the budget, the effective SSE threshold inflates by the overshoot
+  (clamped ×8): the cut coarsens instead of the client dying with
+  "memory access out of bounds". wasm hosts should set a few hundred MB
+  (decoded CPU+GPU cost runs ~2-4× raw bytes against a grows-only ~4 GiB
+  address space). Config literals using `..Default::default()` need no
+  change.
+
+### 0.1.3 → 0.1.4
+
+- Behavioral only: the speculative open head is 512 KiB (was 2 MiB) — sized
+  for bandwidth, see `archive.rs`.
+
 ### 0.1.2 → 0.1.3
 
 Two structs gained fields — struct-literal construction sites need a one-line
