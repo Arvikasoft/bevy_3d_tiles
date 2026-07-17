@@ -157,6 +157,22 @@ Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
 
 ## Upgrading
 
+### 0.1.6 → 0.1.7
+
+**Feature tiles carry their feature ids as `ATTRIBUTE_UV_1`** (`[fid, 0]`,
+the raw per-vertex `_FEATURE_ID_0` values), enabling the render-state
+per-feature styling 0.1.6 pointed at: an
+`ExtendedMaterial<StandardMaterial, _>` fragment extension reads
+`in.uv_b.x` through the standard pipeline's `VERTEX_UVS_B` path — no custom
+vertex shader — and tints/hides fragments per feature (the CesiumJS
+`Cesium3DTileFeature.color` model). Swap materials on entities carrying
+[`TileFeaturePick`] (or post-process via [`TileGeometry`]).
+
+- `TileFeatures` gained `feature_of_vertex: Vec<f32>` (affects only code
+  constructing it directly, i.e. tests).
+- Feature tiles never carried a real `TEXCOORD_1` (the decoder always
+  dropped it), so nothing is displaced. Featureless tiles are unchanged.
+
 ### 0.1.5 → 0.1.6
 
 **Feature tiles no longer split into per-owner submeshes** — every primitive

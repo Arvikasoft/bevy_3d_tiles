@@ -203,6 +203,15 @@ pub struct TileFeatures {
     /// featureId per triangle, in the spawned mesh's index-buffer order — so
     /// the pick raycast's triangle ordinal indexes straight into it.
     pub feature_of_triangle: Vec<u32>,
+    /// featureId per VERTEX (raw `_FEATURE_ID_0` values, length == the
+    /// primitive's vertex count). The decode also writes these onto the mesh
+    /// as `ATTRIBUTE_UV_1` (`[fid, 0]`), so a host material can style
+    /// per-feature in the fragment shader (the Cesium
+    /// `Cesium3DTileFeature.color` model) through the standard pipeline's
+    /// `VERTEX_UVS_B` path — no custom vertex shader. Feature tiles never
+    /// carry a real `TEXCOORD_1` (it was already dropped before 0.1.7), so
+    /// nothing is displaced.
+    pub feature_of_vertex: Vec<f32>,
     /// Shared per-tile table: featureId → source-node path (the `/`-joined node
     /// names the sections resolver matches `mesh_section` against). `Arc` so
     /// every primitive of one tile shares one decode.
@@ -589,8 +598,14 @@ impl FeatureCtx {
             // Non-indexed: triangle t spans vertices 3t..3t+3.
             None => (0..vertex_count / 3).map(|t| feature_of(t * 3)).collect(),
         };
+        // Exactly vertex_count entries (pad with feature 0) — a mesh attribute
+        // must match the position count or bevy rejects the mesh.
+        let feature_of_vertex = (0..vertex_count)
+            .map(|v| per_vertex.get(v).map(|f| f[0]).unwrap_or(0.0))
+            .collect();
         Ok(Some(TileFeatures {
             feature_of_triangle,
+            feature_of_vertex,
             node_of_feature: self.node_of_feature.clone(),
         }))
     }
@@ -1156,6 +1171,17 @@ fn decode_primitive(
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     if let Some(uvs) = uvs {
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    }
+    // Feature ids ride UV1 so a host material can tint per feature in the
+    // fragment stage (see `TileFeatures::feature_of_vertex`).
+    if let Some(f) = &features {
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_UV_1,
+            f.feature_of_vertex
+                .iter()
+                .map(|&id| [id, 0.0])
+                .collect::<Vec<[f32; 2]>>(),
+        );
     }
     if let Some(colors) = colors {
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
@@ -2118,6 +2144,14 @@ mod tests {
             &**feats.node_of_feature,
             &["AlphaModule".to_string(), "BetaModule/sub".to_string()]
         );
+        // Per-vertex ids are kept AND written onto the mesh as UV1, so a host
+        // feature-tint material can read them in the fragment stage (0.1.7).
+        assert_eq!(feats.feature_of_vertex, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        let uv1 = p
+            .mesh
+            .attribute(Mesh::ATTRIBUTE_UV_1)
+            .expect("feature ids as UV1");
+        assert_eq!(uv1.len(), 6);
     }
 
     /// T7: a GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,
