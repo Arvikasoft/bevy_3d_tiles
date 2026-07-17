@@ -1296,10 +1296,13 @@ fn spawn_tile_content(
 /// twin pieces at spawn (T8 highlight). Copies POSITION plus whatever of
 /// NORMAL/UV0/COLOR the source carries; `MAIN_WORLD` usage so the pick raycast
 /// can read it.
-// Kept for Phase B (lazy per-feature highlight: extract ONE hovered feature's
-// submesh on demand, render-state style) and exercised by its unit test.
-#[allow(dead_code)]
-fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
+/// Public since 0.1.9: the lazy-extraction seam for hosts. Per-feature render
+/// styling is a material concern ([`TileFeaturePick`] + the UV1 feature ids),
+/// but effects that need REAL per-feature geometry — a selection outline pass,
+/// a physics proxy, an export — extract just the wanted triangles on demand
+/// (e.g. once per click), which is why the eager per-feature split of ≤0.1.5
+/// is gone: this is its surviving, on-demand half.
+pub fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
     use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues as Vav};
     let mut out = Mesh::new(
         PrimitiveTopology::TriangleList,
