@@ -157,6 +157,13 @@ Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
 
 ## Upgrading
 
+### 0.1.8 → 0.1.9
+
+- **`build_submesh(mesh, tris)` is now public** — the on-demand half of the
+  removed eager per-feature split: extract just the triangles you want (e.g.
+  the clicked feature's, via `TileFeaturePick`) into a compact mesh for
+  outline passes, physics proxies, or export. No behavioral change.
+
 ### 0.1.7 → 0.1.8
 
 **Fixes a 0.1.7 regression** (0.1.7 is yanked): feature tiles WITHOUT texture
