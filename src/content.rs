@@ -1147,6 +1147,8 @@ fn decode_primitive(
     let uvs: Option<Vec<[f32; 2]>> = reader.read_tex_coords(0).map(|tc| tc.into_f32().collect());
     let colors: Option<Vec<[f32; 4]>> = reader.read_colors(0).map(|c| c.into_rgba_f32().collect());
     let indices: Option<Vec<u32>> = reader.read_indices().map(|ix| ix.into_u32().collect());
+    let vertex_count = positions.len();
+    let has_uv0 = uvs.is_some();
 
     // T8: per-feature picking — derive feature_of_triangle from `_FEATURE_ID_0`
     // (raw JSON) in the SAME index order as the mesh below.
@@ -1175,6 +1177,15 @@ fn decode_primitive(
     // Feature ids ride UV1 so a host material can tint per feature in the
     // fragment stage (see `TileFeatures::feature_of_vertex`).
     if let Some(f) = &features {
+        // UV1 WITHOUT UV0 is a combination bevy 0.18's pbr shader never
+        // handles: `pbr_fragment.wgsl` declares `var uv` only under
+        // VERTEX_UVS_A but references it in VERTEX_UVS-gated code (defined by
+        // EITHER uv set), so pipeline creation fails and the geometry
+        // silently vanishes — for ANY StandardMaterial-derived material, not
+        // just a host tint. Untextured feature tiles get zero UV0s.
+        if !has_uv0 {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32, 0.0]; vertex_count]);
+        }
         mesh.insert_attribute(
             Mesh::ATTRIBUTE_UV_1,
             f.feature_of_vertex
@@ -2152,6 +2163,14 @@ mod tests {
             .attribute(Mesh::ATTRIBUTE_UV_1)
             .expect("feature ids as UV1");
         assert_eq!(uv1.len(), 6);
+        // This fixture has no TEXCOORD_0 — UV1 without UV0 kills pipeline
+        // creation in bevy's pbr shader (`uv` only declared under
+        // VERTEX_UVS_A), so the decode must backfill zero UV0s (0.1.8).
+        let uv0 = p
+            .mesh
+            .attribute(Mesh::ATTRIBUTE_UV_0)
+            .expect("zero UV0 backfilled alongside feature UV1");
+        assert_eq!(uv0.len(), 6);
     }
 
     /// T7: a GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,

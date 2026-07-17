@@ -157,6 +157,16 @@ Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
 
 ## Upgrading
 
+### 0.1.7 → 0.1.8
+
+**Fixes a 0.1.7 regression** (0.1.7 is yanked): feature tiles WITHOUT texture
+coordinates got `UV1` without `UV0`, a combination bevy 0.18's pbr shader
+never handles (`pbr_fragment.wgsl` declares `uv` only under `VERTEX_UVS_A`
+but references it under `VERTEX_UVS`) — pipeline creation failed and the
+geometry silently vanished, for any `StandardMaterial`-derived material.
+Untextured feature tiles now get zero-filled `UV0` alongside the feature-id
+`UV1`. No API change.
+
 ### 0.1.6 → 0.1.7
 
 **Feature tiles carry their feature ids as `ATTRIBUTE_UV_1`** (`[fid, 0]`,
