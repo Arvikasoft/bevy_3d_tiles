@@ -288,6 +288,41 @@ impl Default for DecodedMaterial {
     }
 }
 
+/// Decoded main-world CPU cost of a tile's items, in bytes: mesh vertex
+/// attributes + indices (kept `MAIN_WORLD` for the host's raycasts), plus
+/// point/splat buffers. Textures are NOT counted — images upload
+/// `RENDER_WORLD`-only, so their CPU copy is transient decode traffic, not
+/// resident cost. This is what `TileSlot::Ready.bytes` stores and the
+/// memory-pressure valve sums. (0.2.0; ≤0.1.x summed the RAW compressed
+/// content bytes, undercounting resident cost by the meshopt/draco expansion
+/// factor of roughly 3–10×.)
+pub fn resident_cost_bytes(items: &[DecodedItem]) -> u64 {
+    let mut total = 0u64;
+    for item in items {
+        match item {
+            DecodedItem::Mesh(prim) => {
+                for (_, values) in prim.mesh.attributes() {
+                    total += values.get_bytes().len() as u64;
+                }
+                total += match prim.mesh.indices() {
+                    Some(Indices::U16(v)) => (v.len() * 2) as u64,
+                    Some(Indices::U32(v)) => (v.len() * 4) as u64,
+                    None => 0,
+                };
+            }
+            #[cfg(feature = "points")]
+            DecodedItem::Points { points, .. } => {
+                total += (points.len() * std::mem::size_of::<PointCloudData>()) as u64;
+            }
+            #[cfg(feature = "splats")]
+            DecodedItem::Splat { gaussians, .. } => {
+                total += (gaussians.len() * std::mem::size_of::<Gaussian3d>()) as u64;
+            }
+        }
+    }
+    total
+}
+
 /// A fully decoded tile: renderable items plus the side-band data T4 needs.
 pub struct DecodedTile {
     pub items: Vec<DecodedItem>,
@@ -2215,5 +2250,27 @@ mod tests {
             (8, 8),
             "8x8 source dimensions kept"
         );
+    }
+
+    #[test]
+    fn resident_cost_counts_decoded_buffers_not_raw_len() {
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        // 3 vertices: position (3×f32) + uv (2×f32) = 36 + 24 bytes.
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![[0.0f32; 3], [1.0; 3], [2.0; 3]],
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2], [0.5; 2], [1.0; 2]]);
+        mesh.insert_indices(Indices::U32(vec![0, 1, 2])); // 12 bytes
+        let items = vec![DecodedItem::Mesh(Box::new(DecodedPrimitive {
+            transform: Mat4::IDENTITY,
+            mesh,
+            material: DecodedMaterial::default(),
+            features: None,
+        }))];
+        assert_eq!(resident_cost_bytes(&items), 36 + 24 + 12);
     }
 }

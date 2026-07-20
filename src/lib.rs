@@ -118,9 +118,12 @@ pub struct Tiles3dConfig {
     /// the horizon so a grazing view doesn't graft+stream the whole visible
     /// hemisphere (the P3DT "tilt → 98 k-tile tree" finding). `0` disables.
     pub detail_falloff_m: f64,
-    /// Max tile fetch+decode tasks in flight per tileset. Basemap's proven
-    /// starting point; retune against CesiumJS's 50/18 once Front Door
-    /// HTTP/2 carries tile traffic (D10).
+    /// Max tile fetch+decode tasks in flight, **GLOBAL across every tileset**
+    /// (0.2.0; ≤0.1.x applied this per set, so a 20-tileset scene streamed
+    /// with 20× the intended concurrency and the decode spikes ratcheted a
+    /// wasm host's grows-only heap). Sets are served in iteration order each
+    /// frame; earlier sets' tiles going in-flight frees slots for later sets
+    /// on the following frames, so everyone converges.
     pub max_concurrent_loads: usize,
     /// Main-thread time box: max decoded tiles turned into entities per frame.
     pub max_spawns_per_frame: usize,
@@ -144,17 +147,31 @@ pub struct Tiles3dConfig {
     /// (the Cesium model). The split, even capped, cost seconds of
     /// main-thread hang per refine wave.
     pub max_feature_submeshes: usize,
-    /// Memory-pressure valve: when the RAW content bytes of all resident tiles
-    /// (summed across tilesets) exceed this budget, the effective SSE
-    /// threshold inflates by the overshoot ratio (clamped ×8) — the cut
+    /// Memory-pressure valve: when the **decoded main-world bytes** of all
+    /// resident tiles (summed across tilesets — mesh attributes + indices,
+    /// see `content::resident_cost_bytes`) exceed this budget, the effective
+    /// SSE threshold inflates by the overshoot ratio (clamped ×8) — the cut
     /// coarsens, `want_visible` shrinks, and eviction can actually reclaim.
-    /// `0` disables. Decoded CPU+GPU cost runs ~2-4× the raw bytes, so budget
-    /// accordingly; a wasm host with a ~4 GiB grows-only heap wants this at a
-    /// few hundred MB. Without a valve, zooming into a large dense tileset
-    /// simply requests more than the address space holds and the client dies
-    /// with "memory access out of bounds" — quality degradation must win over
-    /// a crash.
+    /// Past 1.5× the budget, NEW loads stop starting entirely (the hard
+    /// stop): with many tilesets even the coarsest cut has a byte floor no
+    /// SSE inflation can go below, and bounded degradation must win over a
+    /// wasm host dying with "memory access out of bounds". `0` disables both.
+    ///
+    /// 0.2.0 semantics change: ≤0.1.x compared this against RAW compressed
+    /// content bytes (~3-10× smaller than what actually stays in the heap) —
+    /// re-tune stored budgets upward accordingly.
     pub memory_budget_bytes: u64,
+    /// Extra pressure multiplier supplied by the HOST's global memory ledger
+    /// (its own GLB budgets, wasm heap high-water, …), folded into the SSE
+    /// inflation product each traversal (result still clamped ×8). 1.0 = no
+    /// external pressure. Lets tiles coarsen when memory is eaten by things
+    /// this crate can't see.
+    pub external_pressure: f32,
+    /// Host-controlled emergency brake: while `true` no NEW tile loads start.
+    /// Resident tiles keep rendering, eviction keeps running. For a wasm host
+    /// to latch near the 4 GiB linear-memory wall, where another decode spike
+    /// would trap the module.
+    pub halt_new_loads: bool,
 }
 
 /// SSE-threshold inflation for the memory-pressure valve: 1.0 under budget,
@@ -202,6 +219,8 @@ impl Default for Tiles3dConfig {
             // Off by default — native address space is effectively unbounded.
             // wasm hosts should set a budget (see the field docs).
             memory_budget_bytes: 0,
+            external_pressure: 1.0,
+            halt_new_loads: false,
         }
     }
 }
@@ -284,8 +303,9 @@ enum TileSlot {
     /// Content spawned (hidden until selected by the render cut).
     Ready {
         entity: Entity,
-        /// Raw content bytes (the memory-pressure proxy — see
-        /// [`Tiles3dConfig::memory_budget_bytes`]).
+        /// Decoded main-world CPU bytes (`content::resident_cost_bytes`) —
+        /// what the memory-pressure valve sums; see
+        /// [`Tiles3dConfig::memory_budget_bytes`].
         bytes: u64,
     },
     /// Terminal fetch/decode failure — never re-queued this session.
@@ -412,6 +432,21 @@ impl Tiles3dSets {
         self.pending_anchors.contains(&anchor)
             || self.failed_anchors.contains(&anchor)
             || self.sets.iter().any(|s| s.anchor == Some(anchor))
+    }
+
+    /// Decoded main-world bytes of every resident tile across all sets — the
+    /// same sum the memory-pressure valve uses. For the host's global memory
+    /// ledger (feed the overshoot back as
+    /// [`Tiles3dConfig::external_pressure`]).
+    pub fn resident_content_bytes(&self) -> u64 {
+        self.sets
+            .iter()
+            .flat_map(|s| s.slots.iter())
+            .map(|slot| match slot {
+                TileSlot::Ready { bytes, .. } => *bytes,
+                _ => 0,
+            })
+            .sum()
     }
 
     /// Root-volume bounding sphere of the tileset anchored to `anchor`, in
@@ -1006,7 +1041,7 @@ fn receive_tiles3d(
                         spawned += 1;
                         let DecodedTile {
                             items,
-                            content_bytes,
+                            content_bytes: _,
                             rtc_center,
                             copyright,
                         } = *decoded;
@@ -1037,6 +1072,10 @@ fn receive_tiles3d(
                             splats: &mut splats,
                             _marker: std::marker::PhantomData,
                         };
+                        // Resident cost = decoded main-world bytes, measured
+                        // from the actual buffers (not the raw content len —
+                        // see `content::resident_cost_bytes`).
+                        let resident_cost = content::resident_cost_bytes(&items);
                         let entity = spawn_tile_content(
                             &mut commands,
                             &mut meshes,
@@ -1051,7 +1090,7 @@ fn receive_tiles3d(
                         );
                         set.slots[tile] = TileSlot::Ready {
                             entity,
-                            bytes: content_bytes,
+                            bytes: resident_cost,
                         };
                     }
                     Err(e) => {
@@ -1486,6 +1525,9 @@ fn drive_tiles3d(
     mut tile_transforms: Query<&mut Transform, With<Tiles3dTile>>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut commands: Commands,
+    // Last logged state of the load halt (hard stop / host brake) — log
+    // transitions, not every frame.
+    mut halt_logged: Local<bool>,
 ) {
     let Tiles3dSets {
         sets,
@@ -1541,27 +1583,58 @@ fn drive_tiles3d(
     let cam_pos_world = cam_gt.translation().as_dvec3();
     let cam_forward_world = Vec3::from(cam_gt.forward()).as_dvec3();
 
-    // Memory-pressure valve: sum resident content bytes across ALL sets once
+    // Memory-pressure valve: sum resident decoded bytes across ALL sets once
     // per traversal (re-summed, never incrementally tracked — zero drift), and
     // inflate every set's SSE threshold by the overshoot so the wanted cut
-    // coarsens and eviction can actually reclaim. Quality degradation beats
-    // "memory access out of bounds" (see Tiles3dConfig::memory_budget_bytes).
-    let resident_bytes: u64 = sets
-        .iter()
-        .flat_map(|s| s.slots.iter())
-        .map(|slot| match slot {
-            TileSlot::Ready { bytes, .. } => *bytes,
-            _ => 0,
-        })
-        .sum();
-    let pressure = memory_pressure_factor(resident_bytes, config.memory_budget_bytes);
+    // coarsens and eviction can actually reclaim. The host's external
+    // pressure (its global memory ledger) folds into the same product.
+    // Quality degradation beats "memory access out of bounds"
+    // (see Tiles3dConfig::memory_budget_bytes).
+    let mut resident_bytes: u64 = 0;
+    let mut in_flight_total: usize = 0;
+    for slot in sets.iter().flat_map(|s| s.slots.iter()) {
+        match slot {
+            TileSlot::Ready { bytes, .. } => resident_bytes += *bytes,
+            TileSlot::InFlight { .. } => in_flight_total += 1,
+            _ => {}
+        }
+    }
+    let pressure = (memory_pressure_factor(resident_bytes, config.memory_budget_bytes)
+        * f64::from(config.external_pressure.max(1.0)))
+    .min(8.0);
     if pressure > 1.0 {
         debug!(
-            "tiles3d: memory pressure {:.2} ({} MB resident / {} MB budget) — SSE threshold inflated",
+            "tiles3d: memory pressure {:.2} ({} MB resident / {} MB budget, external {:.2}) — \
+             SSE threshold inflated",
             pressure,
             resident_bytes / 1_048_576,
-            config.memory_budget_bytes / 1_048_576
+            config.memory_budget_bytes / 1_048_576,
+            config.external_pressure,
         );
+    }
+    // The load-slot pool is GLOBAL (0.2.0): per-set caps multiplied by the
+    // set count and let a many-tileset scene spike the decode working set.
+    let mut load_slots = config.max_concurrent_loads.saturating_sub(in_flight_total);
+    // Hard stop: past 1.5× budget the SSE valve has demonstrably not held the
+    // line (a many-tileset coarse cut has a byte floor) — stop STARTING loads
+    // until eviction brings residency back down. The host brake latches the
+    // same lever.
+    let hard_stopped = config.memory_budget_bytes > 0
+        && resident_bytes > config.memory_budget_bytes.saturating_mul(3) / 2;
+    let halt_loads = hard_stopped || config.halt_new_loads;
+    if halt_loads != *halt_logged {
+        *halt_logged = halt_loads;
+        if halt_loads {
+            warn!(
+                "tiles3d: NEW TILE LOADS HALTED ({} MB resident / {} MB budget, host brake: {}) \
+                 — rendering the resident cut until eviction reclaims",
+                resident_bytes / 1_048_576,
+                config.memory_budget_bytes / 1_048_576,
+                config.halt_new_loads,
+            );
+        } else {
+            info!("tiles3d: tile loads resumed");
+        }
     }
 
     let mut any_in_flight = false;
@@ -1796,14 +1869,11 @@ fn drive_tiles3d(
             _ => false,
         };
 
-        // Issue new requests in priority order under the concurrency cap.
-        let mut in_flight = set
-            .slots
-            .iter()
-            .filter(|s| matches!(s, TileSlot::InFlight { .. }))
-            .count();
+        // Issue new requests in priority order under the GLOBAL concurrency
+        // pool (`load_slots`) — and not at all while loads are halted (hard
+        // stop / host brake).
         for req in &sel.loads {
-            if budget_exhausted || in_flight >= config.max_concurrent_loads {
+            if budget_exhausted || halt_loads || load_slots == 0 {
                 break;
             }
             if !matches!(set.slots[req.tile], TileSlot::NotLoaded) {
@@ -1815,7 +1885,7 @@ fn drive_tiles3d(
             let generation = *next_generation;
             *next_generation += 1;
             set.slots[req.tile] = TileSlot::InFlight { generation };
-            in_flight += 1;
+            load_slots -= 1;
             let abort = fetch::register_abort(generation);
             let source = set.source.clone();
             let tx = channel.tx.clone();
