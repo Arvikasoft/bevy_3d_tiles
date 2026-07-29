@@ -1,0 +1,18 @@
+[package]
+name = "bevy_3d_tiles_prepare"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "CPU-side tile preparation for bevy_3d_tiles: 3D Tiles GLB → plain glTF bytes (meshopt decode, basisu/CESIUM_RTC rewrites, feature-metadata extraction) with no bevy dependency — runnable inside a Web Worker's own wasm module."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Arvikasoft/bevy_3d_tiles"
+keywords = ["3d-tiles", "gltf", "meshopt", "geospatial"]
+categories = ["rendering", "game-development"]
+
+# Version-lockstep with bevy_3d_tiles (offthread-decode plan §6): iterate via
+# [patch.crates-io], publish both crates in one go — a half-published pair
+# leaves consumers unable to build from crates.io.
+
+[dependencies]
+serde_json = "1"
+thiserror = "2"

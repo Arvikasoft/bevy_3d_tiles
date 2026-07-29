@@ -24,6 +24,31 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
+      # Lockstep pair (offthread-decode plan §6): the prepare crate must land
+      # FIRST or the root publish cannot resolve its path+version dependency.
+      # Idempotent across re-runs: skip if this exact version already exists.
+      #
+      # ONE-TIME SETUP, AND IT MUST HAPPEN BEFORE THE FIRST TAG: crates.io
+      # attaches Trusted Publishing to an EXISTING crate, so it cannot be
+      # authorized for a name that has never been published. Publish
+      # `bevy_3d_tiles_prepare` 0.1.0 by hand with a personal token, THEN
+      # authorize Trusted Publishing for it. Tagging first fails this step
+      # with a 403 before the root publish runs, leaving the tag pushed —
+      # recover by doing the manual publish + authorization and re-running.
+      - name: publish bevy_3d_tiles_prepare
+        run: |
+          PREP_VERSION=$(cargo metadata --no-deps --format-version 1 --manifest-path prepare/Cargo.toml \
+            | jq -r '.packages[] | select(.name == "bevy_3d_tiles_prepare") | .version')
+          # Sparse index, NOT `cargo info` — run in-repo, cargo info resolves
+          # the local path dep and reports unpublished versions as present.
+          if curl -fsSL "https://index.crates.io/be/vy/bevy_3d_tiles_prepare" 2>/dev/null \
+            | grep -q "\"vers\":\"$PREP_VERSION\""; then
+            echo "bevy_3d_tiles_prepare $PREP_VERSION already on crates.io — skipping"
+          else
+            cargo publish --manifest-path prepare/Cargo.toml
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

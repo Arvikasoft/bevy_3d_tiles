@@ -1,6 +1,6 @@
 [package]
 name = "bevy_3d_tiles"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.95.0"
 description = "OGC 3D Tiles 1.1 streaming renderer for Bevy — packed .3tz ranged reader, per-tile SSE traversal, glTF tile content, KTX2 + meshopt (+ Draco read), EXT_mesh_features picking, ECEF georeferencing, Google Photorealistic 3D Tiles. Native + WebGPU/wasm."
@@ -9,8 +9,9 @@ repository = "https://github.com/Arvikasoft/bevy_3d_tiles"
 readme = "README.md"
 keywords = ["bevy", "3d-tiles", "geospatial", "gis", "cesium"]
 categories = ["rendering", "game-development"]
-# wasm/ (browser shims + libktx) and CI ship in the repo, not the package.
-exclude = ["wasm/", ".github/"]
+# wasm/ (browser shims + libktx), CI, and the sibling prepare crate (published
+# separately as bevy_3d_tiles_prepare) ship in the repo, not the package.
+exclude = ["wasm/", ".github/", "prepare/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -25,6 +26,12 @@ points = ["dep:bevy_pointcloud"]
 splats = ["dep:bevy_gaussian_splatting"]
 
 [dependencies]
+# The bevy-free CPU half of tile decode (offthread-decode plan S4): container
+# split/rebuild, meshopt codec, basisu/RTC rewrites, feature extraction,
+# `prepare_tile`. Everything is re-exported here so downstream never notices
+# the split; a host's Web Worker links the prepare crate ALONE (no bevy).
+# Version-lockstep: publish both crates together (see prepare/Cargo.toml).
+bevy_3d_tiles_prepare = { version = "0.1.0", path = "prepare" }
 # Caret, not exact-pin: the published lib must unify with consumers on any
 # 0.18.x (bevy-client keeps its own app-side `=0.18.1` pin). Minimal render
 # subset — the app/windowing stack (default_app, winit, x11, webgpu backend

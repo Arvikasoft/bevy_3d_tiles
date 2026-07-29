@@ -59,15 +59,21 @@ pub mod geodesy;
 // wasm-only KTX2 transcode shim binding (T7); native uses bevy basis-universal.
 #[cfg(target_arch = "wasm32")]
 pub mod ktx2;
-pub mod meshopt;
 pub mod schema;
 pub mod traversal;
+
+// The bevy-free CPU half of tile decode (offthread-decode plan S4) — split
+// into the sibling `bevy_3d_tiles_prepare` crate so a host worker can link it
+// without bevy. Re-exported wholesale (and `meshopt` at its old path) so
+// nothing downstream breaks.
+pub use bevy_3d_tiles_prepare as prepare;
+pub use bevy_3d_tiles_prepare::meshopt;
 
 #[cfg(feature = "points")]
 pub use api::PointTileMaterial;
 pub use api::{
-    EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, TilePriorityClass,
-    Tiles3dCamera,
+    EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, TilePrepareFn,
+    TilePrepareHook, TilePriorityClass, Tiles3dCamera, Tiles3dSet,
 };
 
 use archive::Archive3tz;
@@ -599,23 +605,29 @@ impl Plugin for Tiles3dPlugin {
             .init_resource::<Tiles3dChannel>()
             .init_resource::<TilesetCredits>()
             .init_resource::<Tiles3dDecodeStats>()
-            // Host-supplied seams (defaults are inert: no origin, no resolver).
-            // The host overwrites these via its own adapter systems; a
-            // standalone viewer leaves them and streams local/relative sets.
+            // Host-supplied seams (defaults are inert: no origin, no resolver,
+            // no prepare hook). The host overwrites these via its own adapter
+            // systems (or pre-inserts them); a standalone viewer leaves them
+            // and streams local/relative sets.
             .init_resource::<EcefOrigin>()
             .init_resource::<TileFeatureResolver>()
+            .init_resource::<TilePrepareHook>()
             .add_message::<Tiles3dAttach>()
             .add_message::<Tiles3dDetach>()
             .add_systems(Startup, (latch_compressed_formats, init_dev_tileset))
+            // The public ordering seam: hosts order against `Tiles3dSet`
+            // (Receive → Drive), e.g. a memory ledger between the two.
+            .configure_sets(Update, (Tiles3dSet::Receive, Tiles3dSet::Drive).chain())
             .add_systems(
                 Update,
                 (
-                    apply_attach_detach,
-                    receive_tiles3d,
-                    drive_tiles3d,
-                    update_google_logo,
-                )
-                    .chain(),
+                    (apply_attach_detach, receive_tiles3d)
+                        .chain()
+                        .in_set(Tiles3dSet::Receive),
+                    (drive_tiles3d, update_google_logo)
+                        .chain()
+                        .in_set(Tiles3dSet::Drive),
+                ),
             );
         // The shared point material the host sets before any POINTS tile spawns.
         #[cfg(feature = "points")]
@@ -1629,7 +1641,11 @@ fn drive_tiles3d(
     // under a saturated pool, and is keyed by set id (not position) so it
     // stays sane when sets detach.
     mut rr_cursors: Local<std::collections::HashMap<u8, u64>>,
+    // Host off-thread prepare hook (S4). Cloned out of the Res BEFORE
+    // `fetch::spawn_io` — the task must not capture the Res.
+    prepare_hook: Res<TilePrepareHook>,
 ) {
+    let prepare_hook = prepare_hook.0.clone();
     let Tiles3dSets {
         sets,
         frame,
@@ -2097,6 +2113,7 @@ fn drive_tiles3d(
         let tx = channel.tx.clone();
         let set_id = set.id;
         let georeferenced = matches!(set.frame, SetFrame::Ecef { .. });
+        let hook = prepare_hook.clone();
         fetch::spawn_io(async move {
             // Fetch + decode entirely inside the task (wasm: every IO step
             // awaits a JS future and yields; decode is small-tile CPU).
@@ -2107,7 +2124,7 @@ fn drive_tiles3d(
                 Ok(bytes) if looks_like_external_tileset(&bytes) => schema::parse_tileset(&bytes)
                     .map(|ts| TileOutput::Subtree(Box::new(ts)))
                     .map_err(|e| format!("parse external tileset: {e}")),
-                Ok(bytes) => content::decode_tile(&bytes, georeferenced)
+                Ok(bytes) => content::decode_tile_with(&bytes, georeferenced, hook.as_ref())
                     .await
                     .map(|tile| TileOutput::Content(Box::new(tile)))
                     .map_err(|e| e.to_string()),
