@@ -2472,7 +2472,11 @@ mod tests {
             let mut c: Vec<LoadCandidate> = (0..class0_reqs)
                 .map(|i| cand(100 + i as u64, 0, false, 0))
                 .collect();
-            c.extend([cand(1, 1, false, 0), cand(2, 1, false, 0), cand(3, 1, false, 0)]);
+            c.extend([
+                cand(1, 1, false, 0),
+                cand(2, 1, false, 0),
+                cand(3, 1, false, 0),
+            ]);
             c
         };
         let mut cursors = no_cursors();
@@ -2516,7 +2520,11 @@ mod tests {
         sort_load_candidates(&mut c, &no_cursors());
         let order: Vec<(u64, usize)> = c.iter().map(|c| (c.set_id, c.within)).collect();
         assert_eq!(order, vec![(1, 0), (2, 0), (1, 1), (2, 1), (1, 2)]);
-        let set1: Vec<usize> = c.iter().filter(|c| c.set_id == 1).map(|c| c.within).collect();
+        let set1: Vec<usize> = c
+            .iter()
+            .filter(|c| c.set_id == 1)
+            .map(|c| c.within)
+            .collect();
         assert_eq!(set1, vec![0, 1, 2], "within-set order intact");
     }
 

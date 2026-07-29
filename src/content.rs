@@ -510,7 +510,8 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         None
     };
 
-    let mut items = rewrite_and_decode(json, bytes, bin, marks, draco, nodes_rebased, &mut stage_ms)?;
+    let mut items =
+        rewrite_and_decode(json, bytes, bin, marks, draco, nodes_rebased, &mut stage_ms)?;
     let t = Instant::now();
     resolve_pending_textures(&mut items).await;
     stage_ms[3] += span_ms(t);
@@ -2308,8 +2309,7 @@ mod tests {
             serde_json::json!({ "CESIUM_RTC": { "center": [6378137.0, -1000.5, 2000.25] } });
         // Both extensions REQUIRED: the strict gltf crate rejects either one
         // surviving into the rebuilt container.
-        value["extensionsRequired"] =
-            serde_json::json!(["EXT_meshopt_compression", "CESIUM_RTC"]);
+        value["extensionsRequired"] = serde_json::json!(["EXT_meshopt_compression", "CESIUM_RTC"]);
         value["extensionsUsed"] = serde_json::json!(["EXT_meshopt_compression", "CESIUM_RTC"]);
         let glb = assemble_glb(&serde_json::to_vec(&value).unwrap(), bin.unwrap());
 
