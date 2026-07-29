@@ -11,10 +11,67 @@
 //! map, the orbit camera) — but a standalone viewer can ignore all of them and
 //! still stream local/relative tilesets.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bevy::math::DMat4;
 use bevy::prelude::*;
+
+use bevy_3d_tiles_prepare::{DecodeError, PreparedTile};
+
+/// The crate's `Update` system chain, as public [`SystemSet`]s so a host can
+/// order its own systems against it (e.g. run a memory ledger after
+/// [`Tiles3dSet::Receive`] and before [`Tiles3dSet::Drive`], instead of
+/// racing the chain by a frame). `Receive` runs before `Drive`.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tiles3dSet {
+    /// Attach/detach intake + draining the async channel: tileset opens, tile
+    /// content landing/spawning, decode stats.
+    Receive,
+    /// Per-frame traversal/selection, request issue (where the
+    /// [`TilePrepareHook`] is consulted), eviction, attribution.
+    Drive,
+}
+
+/// The prepare-hook signature: `(tile GLB bytes, georeferenced)` → future of
+/// [`bevy_3d_tiles_prepare::prepare_tile`]'s result. `Ok(None)` = the hook
+/// declines (Draco/splat content needing a platform decoder) and the crate
+/// decodes inline; `Err` = warn-once, then inline. On wasm the future may hold
+/// JS values (a Web Worker round-trip), so it is deliberately non-`Send`
+/// there; native hooks run on IO threads and must be `Send`.
+#[cfg(target_arch = "wasm32")]
+pub type TilePrepareFn =
+    dyn Fn(
+        Vec<u8>,
+        bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PreparedTile>, DecodeError>>>>;
+/// The prepare-hook signature (native: `Send` — hooks run on IO threads).
+#[cfg(not(target_arch = "wasm32"))]
+pub type TilePrepareFn = dyn Fn(
+        Vec<u8>,
+        bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PreparedTile>, DecodeError>> + Send>>
+    + Send
+    + Sync;
+
+/// Host-supplied off-thread tile-prepare hook (offthread-decode plan S4).
+/// `None` (the default) = today's inline decode, byte-identical. Insert it
+/// *before* `add_plugins(Tiles3dPlugin)` — the same `init_resource` override
+/// contract as `Tiles3dConfig`. The crate clones the `Arc` out per request
+/// and calls it from the fetch task; it never learns what a Worker is.
+#[derive(Resource, Default, Clone)]
+pub struct TilePrepareHook(pub Option<Arc<TilePrepareFn>>);
+
+// SAFETY: on wasm32-unknown-unknown this build is single-threaded (no wasm
+// threads — both wasm modules declare unshared memory; bevy runs its
+// single-threaded executor), so the non-`Send` hook is only ever touched from
+// the one thread. `Resource` demands `Send + Sync` unconditionally; these
+// impls exist solely to satisfy that bound on the target where it is vacuous.
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for TilePrepareHook {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for TilePrepareHook {}
 
 /// The ECEF→world transform the host supplies so the crate can place
 /// planet-georeferenced tilesets (a `region` root, a planetary-scale bounding

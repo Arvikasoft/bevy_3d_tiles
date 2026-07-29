@@ -20,13 +20,33 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: fmt
-        run: cargo fmt --check
+        run: |
+          cargo fmt --check
+          cargo fmt --check --manifest-path prepare/Cargo.toml
       - name: clippy (native, all features)
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-features --all-targets -- -D warnings
+          cargo clippy --manifest-path prepare/Cargo.toml --all-targets -- -D warnings
       - name: clippy (wasm32, all features)
         run: cargo clippy --target wasm32-unknown-unknown --all-features -- -D warnings
       - name: test (all features)
-        run: cargo test --all-features
+        run: |
+          cargo test --all-features
+          cargo test --manifest-path prepare/Cargo.toml
+      # The whole point of the prepare split (offthread-decode plan S4): the
+      # crate a Web Worker links must never grow a bevy edge. First line of
+      # `cargo tree` is the package itself (whose NAME contains "bevy"), so
+      # skip it before grepping.
+      #
+      # `cargo tree` gets its OWN command: steps run under `bash -e` with
+      # pipefail OFF, so inside a pipeline its exit status is discarded and a
+      # broken manifest path / unresolvable dep / registry blip would print
+      # nothing, fail `grep -q`, and pass this gate vacuously.
+      - name: prepare crate is bevy-free
+        run: |
+          # Out of the repo: an untracked file here would make `cargo package` dirty.
+          cargo tree --manifest-path prepare/Cargo.toml --prefix none --edges normal > "$RUNNER_TEMP/prepare-tree.txt"
+          ! tail -n +2 "$RUNNER_TEMP/prepare-tree.txt" | grep '^bevy'
       - name: feature matrix
         run: |
           cargo check --no-default-features
@@ -34,4 +54,19 @@ jobs:
           cargo check --features splats
           cargo check --target wasm32-unknown-unknown --features points,splats
       - name: package
-        run: cargo package --no-verify
+        run: |
+          cargo package --no-verify --manifest-path prepare/Cargo.toml
+          # The root package resolves its prepare dep from crates.io, so it can
+          # only be dry-run-packaged once that version is published (the
+          # lockstep pair — release.yml publishes prepare first). Until then,
+          # skip loudly instead of failing every push.
+          PREP_VERSION=$(cargo metadata --no-deps --format-version 1 --manifest-path prepare/Cargo.toml \
+            | jq -r '.packages[] | select(.name == "bevy_3d_tiles_prepare") | .version')
+          # Sparse index, NOT `cargo info` — run in-repo, cargo info resolves
+          # the local path dep and reports unpublished versions as present.
+          if curl -fsSL "https://index.crates.io/be/vy/bevy_3d_tiles_prepare" 2>/dev/null \
+            | grep -q "\"vers\":\"$PREP_VERSION\""; then
+            cargo package --no-verify
+          else
+            echo "::notice::skipping root cargo package — bevy_3d_tiles_prepare@$PREP_VERSION is not on crates.io yet (publish the lockstep pair)"
+          fi

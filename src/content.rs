@@ -35,7 +35,6 @@
     allow(irrefutable_let_patterns)
 )]
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use bevy::asset::RenderAssetUsages;
@@ -55,7 +54,23 @@ use bevy_gaussian_splatting::gaussian::formats::planar_3d::Gaussian3d;
 use bevy_pointcloud::point_cloud::PointCloudData;
 
 use super::draco;
-use super::meshopt;
+
+// The bevy-free CPU half of tile decode lives in the sibling
+// `bevy_3d_tiles_prepare` crate (offthread-decode plan S4) — moved, never
+// copied, and re-exported here so `content::DecodeError` etc. keep working.
+pub use bevy_3d_tiles_prepare::{DecodeError, DecodeStage, PreparedTile, prepare_tile};
+
+#[cfg(feature = "splats")]
+use bevy_3d_tiles_prepare::read_accessor;
+use bevy_3d_tiles_prepare::{
+    DracoPrim, FeatureCtx, Marks, PreparedFeatures, assemble_glb, buffer_view_slice,
+    decode_meshopt_views, extract_planetary_root_offset, find_draco_prims, preprocess_basisu,
+    split_glb, strip_handled_extensions,
+};
+// `lib.rs` sniffs external tilesets with it (`looks_like_external_tileset`).
+pub(crate) use bevy_3d_tiles_prepare::memmem;
+
+use crate::api::TilePrepareFn;
 
 /// Adapter-supported GPU-compressed texture formats (BC on desktop WebGPU,
 /// ASTC/ETC on mobile, NONE headless/native-before-init). Latched ONCE at
@@ -76,71 +91,6 @@ fn supported_formats() -> CompressedImageFormats {
         .get()
         .copied()
         .unwrap_or(CompressedImageFormats::NONE)
-}
-
-/// Typed failure surface of tile-content decoding — the error of
-/// [`decode_tile`] / [`decode_glb`] and the draco/ktx2 shim modules.
-///
-/// [`DecodeStage`] carries the one distinction a caller can act on:
-/// [`DecodeStage::Content`] is a permanent parse/structure failure for these
-/// bytes (retrying cannot succeed), while the shim stages (`Draco`/`Ktx2`/
-/// `Meshopt`) are transcoder paths whose availability is environmental
-/// (missing JS shim, no GPU block format). Internal helpers keep plain
-/// `String` messages; the type is applied at the public boundaries — via
-/// `From<String>`/`From<&str>` (stage = `Content`) or the per-stage
-/// constructors.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{stage:?} decode: {message}")]
-pub struct DecodeError {
-    pub stage: DecodeStage,
-    pub message: String,
-}
-
-/// Which decode stage a [`DecodeError`] came from. See [`DecodeError`] for the
-/// permanent-vs-environmental reading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecodeStage {
-    /// GLB/glTF/JSON structure or unsupported content — permanent for these bytes.
-    Content,
-    /// The Draco decoder shim (`__tt_draco_decode`) or its output shape.
-    Draco,
-    /// KTX2/Basis transcode (JS shim on wasm; bevy's transcoder on native).
-    Ktx2,
-    /// `EXT_meshopt_compression` CPU decode.
-    Meshopt,
-}
-
-impl DecodeError {
-    pub fn new(stage: DecodeStage, message: impl Into<String>) -> Self {
-        Self {
-            stage,
-            message: message.into(),
-        }
-    }
-
-    pub(crate) fn draco(message: impl Into<String>) -> Self {
-        Self::new(DecodeStage::Draco, message)
-    }
-
-    pub(crate) fn ktx2(message: impl Into<String>) -> Self {
-        Self::new(DecodeStage::Ktx2, message)
-    }
-
-    pub(crate) fn meshopt(message: impl Into<String>) -> Self {
-        Self::new(DecodeStage::Meshopt, message)
-    }
-}
-
-impl From<String> for DecodeError {
-    fn from(message: String) -> Self {
-        Self::new(DecodeStage::Content, message)
-    }
-}
-
-impl From<&str> for DecodeError {
-    fn from(message: &str) -> Self {
-        Self::new(DecodeStage::Content, message)
-    }
 }
 
 /// Resolve deferred KTX2 base-color textures (T7): transcode each pending
@@ -371,52 +321,6 @@ fn span_ms(t: Instant) -> f32 {
     t.elapsed().as_secs_f32() * 1000.0
 }
 
-/// Which decode passes a tile needs, from ONE marker scan of its JSON chunk.
-/// Threaded through the whole decode so no pass re-scans and no pass re-parses
-/// (`decode_glb` used to re-enter itself per extension). Deliberately naive
-/// substring scans of the raw chunk rather than a read of
-/// `extensionsUsed`/`extensionsRequired`: content that uses an extension
-/// without declaring it still has to route correctly.
-// ponytail: O(json_len × needle) × 7. The JSON chunk is kilobytes next to a
-// multi-MB BIN; if a producer ever ships a huge JSON chunk, scan once for the
-// shared `"EXT_`/`"KHR_` prefixes instead.
-#[derive(Default, Clone, Copy)]
-struct Marks {
-    splat: bool,
-    draco: bool,
-    rtc: bool,
-    copyright: bool,
-    meshopt: bool,
-    basisu: bool,
-    features: bool,
-}
-
-impl Marks {
-    fn scan(json: &[u8]) -> Self {
-        Self {
-            splat: memmem(json, b"KHR_gaussian_splatting"),
-            draco: memmem(json, b"KHR_draco_mesh_compression"),
-            rtc: memmem(json, b"CESIUM_RTC"),
-            copyright: memmem(json, b"copyright"),
-            meshopt: memmem(json, b"EXT_meshopt_compression"),
-            basisu: memmem(json, b"KHR_texture_basisu"),
-            features: memmem(json, b"EXT_mesh_features"),
-        }
-    }
-
-    /// Nothing to rewrite and no side-band data to extract — the bytes go
-    /// straight to the `gltf` crate with no JSON parse of our own.
-    fn vanilla(&self) -> bool {
-        !(self.splat
-            || self.draco
-            || self.rtc
-            || self.copyright
-            || self.meshopt
-            || self.basisu
-            || self.features)
-    }
-}
-
 /// Decode a tile, routing by content markers ([`Marks`]): splats bypass the
 /// `gltf` crate (see module docs), Draco / `CESIUM_RTC` / meshopt / basisu
 /// content is rewritten to vanilla glTF first (the `gltf` crate rejects
@@ -431,6 +335,75 @@ impl Marks {
 /// leaf cost five serde parses, two re-serializes, three container rebuilds
 /// and ~6 copies of a multi-MB BIN before a vertex was read.)
 pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTile, DecodeError> {
+    decode_tile_with(bytes, georeferenced, None).await
+}
+
+/// [`decode_tile`], but the prep half (the S4 movable set — container split,
+/// marker scan, JSON parse 1, meshopt BIN decode, rewrites, container
+/// rebuild, feature extraction) can be delegated to a host
+/// [`crate::api::TilePrepareHook`] — typically a Web Worker running
+/// `bevy_3d_tiles_prepare` in its own wasm module.
+///
+/// Every fallback route is the inline path that already exists, byte-identical:
+/// * `hook = None` → inline (this IS [`decode_tile`]).
+/// * hook returns `Ok(None)` → the tile needs a platform decoder (Draco,
+///   splats) — inline.
+/// * hook returns `Err` → warn once, inline.
+///
+/// A returned [`PreparedTile`] is consumed WITHOUT re-parsing its JSON: the
+/// feature side-band ([`PreparedFeatures`]) replaces the `FeatureCtx` rebuild
+/// (main-thread parse count for feature tiles drops from 2 to 1).
+pub async fn decode_tile_with(
+    bytes: &[u8],
+    georeferenced: bool,
+    hook: Option<&Arc<TilePrepareFn>>,
+) -> Result<DecodedTile, DecodeError> {
+    if let Some(hook) = hook {
+        match hook(bytes.to_vec(), georeferenced).await {
+            Ok(Some(prepared)) => return decode_prepared(prepared, bytes.len() as u64).await,
+            Ok(None) => {} // declined (Draco/splat) — the inline path handles those
+            Err(e) => warn_prepare_hook_once(&e.to_string()),
+        }
+    }
+    decode_tile_inline(bytes, georeferenced).await
+}
+
+/// One-time warning when the prepare hook errors; the tile still decodes
+/// inline (which surfaces a per-tile error with full diagnostics if the
+/// content itself is bad).
+fn warn_prepare_hook_once(detail: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let detail = detail.to_string();
+    ONCE.call_once(move || {
+        bevy::log::warn!("tiles3d: tile prepare hook failed ({detail}); decoding inline");
+    });
+}
+
+/// Decode a hook-prepared tile: the glb is already vanilla glTF, so only
+/// spans 1-3 (parse 2, geometry, textures) run here — span 0 moved into the
+/// hook and reads 0 in [`DecodedTile::stage_ms`].
+async fn decode_prepared(
+    prepared: PreparedTile,
+    content_bytes: u64,
+) -> Result<DecodedTile, DecodeError> {
+    let mut stage_ms = [0f32; 4];
+    let feat = prepared.features.map(FeatSource::from_prepared);
+    let mut items = decode_vanilla(&prepared.glb, feat.as_ref(), &mut stage_ms)?;
+    let t = Instant::now();
+    resolve_pending_textures(&mut items).await;
+    stage_ms[3] += span_ms(t);
+    Ok(DecodedTile {
+        items,
+        content_bytes,
+        rtc_center: prepared.rtc_center.map(DVec3::from_array),
+        copyright: prepared.copyright,
+        stage_ms,
+    })
+}
+
+/// The inline (main-thread / in-task) decode pipeline — today's path,
+/// untouched by the hook seam.
+async fn decode_tile_inline(bytes: &[u8], georeferenced: bool) -> Result<DecodedTile, DecodeError> {
     let mut stage_ms = [0f32; 4];
     let t = Instant::now();
     let (json_chunk, bin) = split_glb(bytes)?;
@@ -491,7 +464,7 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         && rtc_center.is_none()
         && let Some(center) = extract_planetary_root_offset(&mut json)
     {
-        rtc_center = Some(center);
+        rtc_center = Some(DVec3::from_array(center));
         nodes_rebased = true;
     }
 
@@ -522,68 +495,6 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         copyright,
         stage_ms,
     })
-}
-
-/// When any scene-root node sits at planetary magnitude (Google P3DT bakes
-/// ECEF into node matrices), pick the first such translation as the tile's
-/// offset and subtract it from EVERY root node **in f64**, so the f32 glTF
-/// decode only ever sees tile-local values. Returns the extracted offset.
-/// The spawn transform re-applies it: `world_from_content × T(offset) ×
-/// node'` ≡ `world_from_content × node` exactly.
-fn extract_planetary_root_offset(json: &mut serde_json::Value) -> Option<DVec3> {
-    const PLANETARY_M: f64 = 1.0e6;
-
-    let scene_ix = json["scene"].as_u64().unwrap_or(0) as usize;
-    let roots: Vec<usize> = json["scenes"][scene_ix]["nodes"]
-        .as_array()?
-        .iter()
-        .filter_map(|v| v.as_u64().map(|n| n as usize))
-        .collect();
-
-    let translation_of = |node: &serde_json::Value| -> [f64; 3] {
-        if let Some(m) = node["matrix"].as_array()
-            && m.len() == 16
-        {
-            return [
-                m[12].as_f64().unwrap_or(0.0),
-                m[13].as_f64().unwrap_or(0.0),
-                m[14].as_f64().unwrap_or(0.0),
-            ];
-        }
-        node["translation"]
-            .as_array()
-            .map(|t| {
-                [
-                    t.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    t.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    t.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                ]
-            })
-            .unwrap_or([0.0; 3])
-    };
-
-    let center = roots.iter().find_map(|&ix| {
-        let t = translation_of(&json["nodes"][ix]);
-        (DVec3::from_array(t).length() > PLANETARY_M).then_some(DVec3::from_array(t))
-    })?;
-
-    // Subtract from EVERY root (small-translation roots become -center —
-    // mixing untouched and rebased roots under the re-applied offset would
-    // shift the untouched ones).
-    for &ix in &roots {
-        let t = translation_of(&json["nodes"][ix]);
-        let new = [t[0] - center.x, t[1] - center.y, t[2] - center.z];
-        let node = &mut json["nodes"][ix];
-        if node["matrix"].is_array() {
-            let m = node["matrix"].as_array_mut().unwrap();
-            for (k, v) in new.iter().enumerate() {
-                m[12 + k] = serde_json::json!(v);
-            }
-        } else {
-            node["translation"] = serde_json::json!(new);
-        }
-    }
-    Some(center)
 }
 
 /// Decode a GLB (or self-contained glTF JSON) tile into renderable items.
@@ -678,7 +589,7 @@ fn rewrite_and_decode(
     // with the rebuilt BIN. Built once per tile; attached per primitive.
     let feat = if marks.features {
         match FeatureCtx::build(json, bin) {
-            Ok(ctx) => Some(ctx),
+            Ok(ctx) => Some(FeatSource::from_ctx(ctx)),
             // A malformed table loses picking, never the geometry.
             Err(e) => {
                 bevy::log::warn!("tiles3d: feature metadata ignored ({e})");
@@ -695,7 +606,7 @@ fn rewrite_and_decode(
 /// Decode a vanilla (no unhandled extension) GLB through the `gltf` crate.
 fn decode_vanilla(
     bytes: &[u8],
-    feat: Option<&FeatureCtx>,
+    feat: Option<&FeatSource>,
     stage_ms: &mut [f32; 4],
 ) -> Result<Vec<DecodedItem>, DecodeError> {
     // Span 1 (parse 2): its own cut — this parse does NOT move under S4.
@@ -730,46 +641,35 @@ fn decode_vanilla(
     Ok(out)
 }
 
-/// Decoded `EXT_mesh_features` + `EXT_structural_metadata` context for a tile
-/// (T8). Owns the parsed JSON so `_FEATURE_ID_0` accessors can be read lazily
-/// per primitive against the BIN chunk.
-struct FeatureCtx {
-    json: serde_json::Value,
+/// Feature-picking source for one tile's decode: the parsed-JSON context on
+/// the inline path (accessors read lazily against the BIN), or the
+/// worker-materialized arrays of a [`PreparedTile`] — which is exactly what
+/// lets the hook path skip re-parsing the JSON. Both funnel into the same
+/// triangle/vertex mapping so the two paths cannot drift.
+struct FeatSource {
     /// featureId → source-node path, shared across the tile's primitives.
     node_of_feature: Arc<Vec<String>>,
-    /// (mesh index, primitive index) → `_FEATURE_ID_N` accessor index.
-    accessor: HashMap<(u64, u64), usize>,
+    kind: FeatKind,
 }
 
-impl FeatureCtx {
-    /// Takes the tile's ALREADY-PARSED document (post-rewrite) — the JSON chunk
-    /// is parsed once per tile and handed down, never re-parsed here.
-    fn build(value: serde_json::Value, bin: Option<&[u8]>) -> Result<Self, String> {
-        let node_of_feature = Arc::new(read_node_of_feature(&value, bin)?);
-        let mut accessor = HashMap::new();
-        if let Some(meshes) = value["meshes"].as_array() {
-            for (m, mesh) in meshes.iter().enumerate() {
-                let Some(prims) = mesh["primitives"].as_array() else {
-                    continue;
-                };
-                for (p, prim) in prims.iter().enumerate() {
-                    let ext = &prim["extensions"]["EXT_mesh_features"];
-                    // featureIds[0].attribute = N → the `_FEATURE_ID_N` attribute.
-                    let Some(n) = ext["featureIds"][0]["attribute"].as_u64() else {
-                        continue;
-                    };
-                    let key = format!("_FEATURE_ID_{n}");
-                    if let Some(acc) = prim["attributes"][&key].as_u64() {
-                        accessor.insert((m as u64, p as u64), acc as usize);
-                    }
-                }
-            }
+enum FeatKind {
+    Json(FeatureCtx),
+    Prepared(Vec<((u64, u64), Vec<f32>)>),
+}
+
+impl FeatSource {
+    fn from_ctx(mut ctx: FeatureCtx) -> Self {
+        Self {
+            node_of_feature: Arc::new(std::mem::take(&mut ctx.node_of_feature)),
+            kind: FeatKind::Json(ctx),
         }
-        Ok(Self {
-            json: value,
-            node_of_feature,
-            accessor,
-        })
+    }
+
+    fn from_prepared(f: PreparedFeatures) -> Self {
+        Self {
+            node_of_feature: Arc::new(f.node_of_feature),
+            kind: FeatKind::Prepared(f.vertex_ids),
+        }
     }
 
     /// `feature_of_triangle` for primitive `(mesh_ix, prim_ix)` in `indices`
@@ -783,11 +683,18 @@ impl FeatureCtx {
         indices: Option<&[u32]>,
         vertex_count: usize,
     ) -> Result<Option<TileFeatures>, String> {
-        let Some(&acc) = self.accessor.get(&(mesh_ix, prim_ix)) else {
+        use std::borrow::Cow;
+        let per_vertex: Option<Cow<'_, [f32]>> = match &self.kind {
+            FeatKind::Json(ctx) => ctx.per_vertex_ids(bin, mesh_ix, prim_ix)?.map(Cow::Owned),
+            FeatKind::Prepared(prims) => prims
+                .iter()
+                .find(|((m, p), _)| (*m, *p) == (mesh_ix, prim_ix))
+                .map(|(_, ids)| Cow::Borrowed(ids.as_slice())),
+        };
+        let Some(per_vertex) = per_vertex else {
             return Ok(None);
         };
-        let per_vertex = read_accessor::<1>(&self.json, bin, acc)?;
-        let feature_of = |v: usize| per_vertex.get(v).map(|f| f[0].round() as u32).unwrap_or(0);
+        let feature_of = |v: usize| per_vertex.get(v).map(|f| f.round() as u32).unwrap_or(0);
         let feature_of_triangle = match indices {
             Some(idx) => idx
                 .chunks_exact(3)
@@ -799,7 +706,7 @@ impl FeatureCtx {
         // Exactly vertex_count entries (pad with feature 0) — a mesh attribute
         // must match the position count or bevy rejects the mesh.
         let feature_of_vertex = (0..vertex_count)
-            .map(|v| per_vertex.get(v).map(|f| f[0]).unwrap_or(0.0))
+            .map(|v| per_vertex.get(v).copied().unwrap_or(0.0))
             .collect();
         Ok(Some(TileFeatures {
             feature_of_triangle,
@@ -809,137 +716,7 @@ impl FeatureCtx {
     }
 }
 
-/// Read the `nodePath` STRING property of `EXT_structural_metadata`'s first
-/// property table → `featureId → node path`. UINT32 string offsets (what our
-/// writer emits); other offset widths are unsupported (we control the writer).
-fn read_node_of_feature(
-    json: &serde_json::Value,
-    bin: Option<&[u8]>,
-) -> Result<Vec<String>, String> {
-    let pt = &json["extensions"]["EXT_structural_metadata"]["propertyTables"][0];
-    let count = pt["count"].as_u64().ok_or("property table without count")? as usize;
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    let prop = &pt["properties"]["nodePath"];
-    let values_bv = prop["values"]
-        .as_u64()
-        .ok_or("nodePath property without values")? as usize;
-    let offsets_bv = prop["stringOffsets"]
-        .as_u64()
-        .ok_or("nodePath property without stringOffsets")? as usize;
-    let values =
-        buffer_view_slice(json, bin, values_bv).map_err(|e| format!("nodePath values: {e}"))?;
-    let offsets =
-        buffer_view_slice(json, bin, offsets_bv).map_err(|e| format!("nodePath offsets: {e}"))?;
-    if offsets.len() < (count + 1) * 4 {
-        return Err("nodePath stringOffsets too short".into());
-    }
-    let read_u32 =
-        |i: usize| u32::from_le_bytes(offsets[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let (lo, hi) = (read_u32(i), read_u32(i + 1));
-        let s = values
-            .get(lo..hi)
-            .ok_or("nodePath string range out of bounds")?;
-        out.push(String::from_utf8_lossy(s).into_owned());
-    }
-    Ok(out)
-}
-
-/// Split a GLB container into its JSON chunk and optional BIN chunk. Bytes
-/// without the `glTF` magic are treated as a bare JSON glTF (no buffer).
-fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
-    if bytes.len() < 4 || &bytes[0..4] != b"glTF" {
-        return Ok((bytes, None));
-    }
-    if bytes.len() < 12 {
-        return Err("glb truncated before header end".into());
-    }
-    let mut at = 12; // skip magic + version + length
-    let mut json: Option<&[u8]> = None;
-    let mut bin: Option<&[u8]> = None;
-    while at + 8 <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        let kind = &bytes[at + 4..at + 8];
-        let body = bytes
-            .get(at + 8..at + 8 + len)
-            .ok_or_else(|| format!("glb chunk at {at} overruns the buffer"))?;
-        match kind {
-            b"JSON" => json = Some(body),
-            b"BIN\0" => bin = Some(body),
-            _ => {}
-        }
-        at += 8 + len;
-    }
-    Ok((json.ok_or("glb has no JSON chunk")?, bin))
-}
-
-/// Naive substring scan (the JSON chunk is small; no memmem dependency).
-pub(crate) fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-// ── Draco / CESIUM_RTC preprocessing (T4 — Google P3DT content) ──────────────
-
-/// One `KHR_draco_mesh_compression` primitive found in the document.
-struct DracoPrim {
-    mesh: usize,
-    prim: usize,
-    buffer_view: usize,
-    /// glTF semantic → Draco attribute unique id, straight from the ext JSON.
-    attributes: Vec<(String, u32)>,
-}
-
-fn find_draco_prims(json: &serde_json::Value) -> Vec<DracoPrim> {
-    let mut out = Vec::new();
-    let Some(meshes) = json["meshes"].as_array() else {
-        return out;
-    };
-    for (m, mesh) in meshes.iter().enumerate() {
-        let Some(prims) = mesh["primitives"].as_array() else {
-            continue;
-        };
-        for (p, prim) in prims.iter().enumerate() {
-            let ext = &prim["extensions"]["KHR_draco_mesh_compression"];
-            let Some(view) = ext["bufferView"].as_u64() else {
-                continue;
-            };
-            let Some(attrs) = ext["attributes"].as_object() else {
-                continue;
-            };
-            out.push(DracoPrim {
-                mesh: m,
-                prim: p,
-                buffer_view: view as usize,
-                attributes: attrs
-                    .iter()
-                    .filter_map(|(k, v)| v.as_u64().map(|id| (k.clone(), id as u32)))
-                    .collect(),
-            });
-        }
-    }
-    out
-}
-
-fn buffer_view_slice<'b>(
-    json: &serde_json::Value,
-    bin: Option<&'b [u8]>,
-    view_ix: usize,
-) -> Result<&'b [u8], String> {
-    let bv = &json["bufferViews"][view_ix];
-    if bv["buffer"].as_u64() != Some(0) {
-        return Err("draco bufferView must reference buffer 0 (BIN chunk)".into());
-    }
-    let offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let len = bv["byteLength"]
-        .as_u64()
-        .ok_or("bufferView without byteLength")? as usize;
-    bin.ok_or("draco bufferView references the BIN chunk but the GLB has none")?
-        .get(offset..offset + len)
-        .ok_or_else(|| "draco bufferView out of BIN bounds".into())
-}
+// ── Draco splice (T4 — Google P3DT content; decode shim is main-side) ───────
 
 /// Splice already-decoded Draco primitives into the document: decoded data
 /// appended to the BIN chunk behind fresh accessors, the per-primitive Draco
@@ -1043,35 +820,6 @@ fn splice_draco(
     Ok(new_bin)
 }
 
-/// Drop the extensions this decoder handles itself (`KHR_draco_mesh_compression`
-/// spliced out above, `CESIUM_RTC` extracted as side-band data) from the
-/// document, so the strict `gltf` crate — which hard-rejects any unknown
-/// `extensionsRequired` — accepts the rebuilt tile.
-///
-/// NOTE: use `get_mut`, never `json[key]` — IndexMut on a missing key INSERTS
-/// a literal null, which the gltf crate then chokes on.
-fn strip_handled_extensions(json: &mut serde_json::Value) {
-    if let Some(ext) = json.get_mut("extensions").and_then(|e| e.as_object_mut()) {
-        ext.remove("CESIUM_RTC");
-        if ext.is_empty() {
-            json.as_object_mut().unwrap().remove("extensions");
-        }
-    }
-    for list in ["extensionsUsed", "extensionsRequired"] {
-        if let Some(arr) = json.get_mut(list).and_then(|v| v.as_array_mut()) {
-            arr.retain(|v| {
-                !matches!(
-                    v.as_str(),
-                    Some("KHR_draco_mesh_compression" | "CESIUM_RTC")
-                )
-            });
-            if arr.is_empty() {
-                json.as_object_mut().unwrap().remove(list);
-            }
-        }
-    }
-}
-
 /// Point a primitive slot (`indices` when `semantic` is `None`, else
 /// `attributes[semantic]`) at `accessor`: overwrite the accessor the slot
 /// already references — Draco primitives carry bufferView-less accessors
@@ -1113,171 +861,6 @@ fn push_json(json: &mut serde_json::Value, key: &str, value: serde_json::Value) 
     arr.len() - 1
 }
 
-/// Assemble a GLB container from JSON + BIN chunks (4-byte padded).
-fn assemble_glb(json_bytes: &[u8], bin: &[u8]) -> Vec<u8> {
-    let mut json_bytes = json_bytes.to_vec();
-    let mut bin = bin.to_vec();
-    while !json_bytes.len().is_multiple_of(4) {
-        json_bytes.push(b' ');
-    }
-    while !bin.len().is_multiple_of(4) {
-        bin.push(0);
-    }
-    let mut glb = Vec::with_capacity(28 + json_bytes.len() + bin.len());
-    glb.extend_from_slice(b"glTF");
-    glb.extend_from_slice(&2u32.to_le_bytes());
-    let total = 12 + 8 + json_bytes.len() + if bin.is_empty() { 0 } else { 8 + bin.len() };
-    glb.extend_from_slice(&(total as u32).to_le_bytes());
-    glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json_bytes);
-    if !bin.is_empty() {
-        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
-        glb.extend_from_slice(b"BIN\0");
-        glb.extend_from_slice(&bin);
-    }
-    glb
-}
-
-// ── EXT_meshopt_compression preprocessing (T6 — our emitted geometry) ────────
-
-/// Rewrite an `EXT_meshopt_compression` document into vanilla glTF: decode
-/// every meshopt buffer view on the CPU ([`meshopt::decode_buffer_view`]),
-/// copy through non-meshopt views (embedded image bytes), collapse to a single
-/// buffer (the fallback buffer is virtual — no GLB bytes), and strip the
-/// extension. Returns the NEW BIN chunk; the caller rebuilds the container
-/// once, after every other rewrite pass.
-///
-/// Buffer-view *indices* are preserved (accessors and images keep referencing
-/// the same slots); only each view's `byteOffset`/`byteLength`/`buffer` are
-/// rebuilt against the freshly decoded BIN. The encoder stores compressed data
-/// in the GLB BIN (`ext.buffer == 0`) while the view's own `buffer` points at
-/// the discarded fallback — so we always read compressed bytes via `ext`.
-fn decode_meshopt_views(
-    json: &mut serde_json::Value,
-    bin: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
-    let bin = bin.ok_or("meshopt GLB has no BIN chunk")?;
-    let view_count = json["bufferViews"].as_array().map(|a| a.len()).unwrap_or(0);
-    let mut new_bin: Vec<u8> = Vec::new();
-    let mut new_views: Vec<serde_json::Value> = Vec::with_capacity(view_count);
-
-    for i in 0..view_count {
-        let bv = &json["bufferViews"][i];
-        let ext = &bv["extensions"]["EXT_meshopt_compression"];
-        let def = if ext.is_object() {
-            if ext["buffer"].as_u64().unwrap_or(0) != 0 {
-                return Err("meshopt ext references a non-BIN buffer".into());
-            }
-            let off = ext["byteOffset"].as_u64().unwrap_or(0) as usize;
-            let len = ext["byteLength"]
-                .as_u64()
-                .ok_or("meshopt ext without byteLength")? as usize;
-            let stride = ext["byteStride"]
-                .as_u64()
-                .ok_or("meshopt ext without byteStride")? as usize;
-            let count = ext["count"].as_u64().ok_or("meshopt ext without count")? as usize;
-            let mode = ext["mode"]
-                .as_str()
-                .ok_or("meshopt ext without mode")?
-                .to_string();
-            let filter = ext["filter"].as_str().unwrap_or("NONE").to_string();
-            let src = bin
-                .get(off..off + len)
-                .ok_or("meshopt compressed data out of BIN bounds")?;
-            let decoded = meshopt::decode_buffer_view(&mode, &filter, count, stride, src)?;
-            while !new_bin.len().is_multiple_of(4) {
-                new_bin.push(0);
-            }
-            let new_off = new_bin.len();
-            new_bin.extend_from_slice(&decoded);
-            let mut def = serde_json::json!({
-                "buffer": 0, "byteOffset": new_off, "byteLength": decoded.len(),
-            });
-            // Vertex views keep their stride (honors interleaving for foreign
-            // gltfpack output; == element size for our non-interleaved tiles).
-            if mode == "ATTRIBUTES" {
-                def["byteStride"] = serde_json::json!(stride);
-            }
-            def
-        } else {
-            // Pass-through view (e.g. an embedded image): copy its BIN bytes.
-            if bv["buffer"].as_u64().unwrap_or(0) != 0 {
-                return Err("non-meshopt bufferView references a non-BIN buffer".into());
-            }
-            let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
-            let len = bv["byteLength"]
-                .as_u64()
-                .ok_or("bufferView without byteLength")? as usize;
-            let bytes = bin
-                .get(off..off + len)
-                .ok_or("bufferView out of BIN bounds")?
-                .to_vec();
-            while !new_bin.len().is_multiple_of(4) {
-                new_bin.push(0);
-            }
-            let new_off = new_bin.len();
-            new_bin.extend_from_slice(&bytes);
-            let mut def = serde_json::json!({
-                "buffer": 0, "byteOffset": new_off, "byteLength": len,
-            });
-            if let Some(s) = bv["byteStride"].as_u64() {
-                def["byteStride"] = serde_json::json!(s);
-            }
-            if let Some(t) = bv["target"].as_u64() {
-                def["target"] = serde_json::json!(t);
-            }
-            def
-        };
-        new_views.push(def);
-    }
-
-    json["bufferViews"] = serde_json::Value::Array(new_views);
-    json["buffers"] = serde_json::json!([{ "byteLength": new_bin.len() }]);
-    for list in ["extensionsUsed", "extensionsRequired"] {
-        if let Some(arr) = json.get_mut(list).and_then(|v| v.as_array_mut()) {
-            arr.retain(|v| v.as_str() != Some("EXT_meshopt_compression"));
-            if arr.is_empty() {
-                json.as_object_mut().unwrap().remove(list);
-            }
-        }
-    }
-    Ok(new_bin)
-}
-
-// ── KHR_texture_basisu preprocessing (T7 — KTX2 tile textures) ───────────────
-
-/// Rewrite `KHR_texture_basisu` textures so the `gltf` crate (which doesn't
-/// resolve the extension) finds the KTX2 image: move each texture's
-/// `extensions.KHR_texture_basisu.source` to the standard `source`, then strip
-/// the extension everywhere. JSON-only — the KTX2 image bytes (mimeType
-/// `image/ktx2`, in a buffer view) are untouched; [`decode_material`] passes
-/// them to bevy's KTX2/Basis transcoder with the adapter's supported formats.
-fn preprocess_basisu(json: &mut serde_json::Value) {
-    if let Some(textures) = json["textures"].as_array_mut() {
-        for tex in textures.iter_mut() {
-            let Some(src) = tex["extensions"]["KHR_texture_basisu"]["source"].as_u64() else {
-                continue;
-            };
-            tex["source"] = serde_json::json!(src);
-            if let Some(ext) = tex.get_mut("extensions").and_then(|e| e.as_object_mut()) {
-                ext.remove("KHR_texture_basisu");
-                if ext.is_empty() {
-                    tex.as_object_mut().unwrap().remove("extensions");
-                }
-            }
-        }
-    }
-    for list in ["extensionsUsed", "extensionsRequired"] {
-        if let Some(arr) = json.get_mut(list).and_then(|v| v.as_array_mut()) {
-            arr.retain(|v| v.as_str() != Some("KHR_texture_basisu"));
-            if arr.is_empty() {
-                json.as_object_mut().unwrap().remove(list);
-            }
-        }
-    }
-}
-
 /// Resolve a glTF buffer: GLB BIN chunk only (tiles are self-contained).
 fn resolve_buffer<'b>(buffer: &gltf::Buffer<'_>, blob: Option<&'b [u8]>) -> Option<&'b [u8]> {
     match buffer.source() {
@@ -1290,7 +873,7 @@ fn decode_node(
     node: &gltf::Node<'_>,
     parent: Mat4,
     blob: Option<&[u8]>,
-    feat: Option<&FeatureCtx>,
+    feat: Option<&FeatSource>,
     out: &mut Vec<DecodedItem>,
 ) -> Result<(), String> {
     let global = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
@@ -1324,7 +907,7 @@ fn decode_primitive(
     primitive: &gltf::Primitive<'_>,
     transform: Mat4,
     blob: Option<&[u8]>,
-    feat: Option<&FeatureCtx>,
+    feat: Option<&FeatSource>,
     mesh_ix: u64,
 ) -> Result<DecodedPrimitive, String> {
     let reader = primitive.reader(|buffer| resolve_buffer(&buffer, blob));
@@ -1724,103 +1307,6 @@ fn decode_splat_primitive(
     let pad = (32 - gaussians.len() % 32) % 32;
     gaussians.extend(std::iter::repeat_n(Gaussian3d::default(), pad));
     Ok(gaussians)
-}
-
-/// Read accessor `index` as `Vec<[f32; N]>`. Supports float and the spec's
-/// normalized integer encodings; tightly-packed or strided buffer views; no
-/// sparse accessors (our tilers never emit them).
-fn read_accessor<const N: usize>(
-    json: &serde_json::Value,
-    bin: Option<&[u8]>,
-    index: usize,
-) -> Result<Vec<[f32; N]>, String> {
-    let acc = &json["accessors"][index];
-    if acc.is_null() {
-        return Err(format!("accessor {index} out of bounds"));
-    }
-    let count = acc["count"].as_u64().ok_or("accessor without count")? as usize;
-    let comp_type = acc["componentType"]
-        .as_u64()
-        .ok_or("accessor without componentType")?;
-    let normalized = acc["normalized"].as_bool().unwrap_or(false);
-    let type_str = acc["type"].as_str().ok_or("accessor without type")?;
-    let comps = match type_str {
-        "SCALAR" => 1,
-        "VEC2" => 2,
-        "VEC3" => 3,
-        "VEC4" => 4,
-        other => return Err(format!("unsupported accessor type {other}")),
-    };
-    if comps != N {
-        return Err(format!(
-            "accessor {index} is {type_str}, expected {N} components"
-        ));
-    }
-    let comp_size = match comp_type {
-        5120 | 5121 => 1, // i8 / u8
-        5122 | 5123 => 2, // i16 / u16
-        5125 | 5126 => 4, // u32 / f32
-        other => return Err(format!("unsupported componentType {other}")),
-    };
-    let bv_ix = acc["bufferView"]
-        .as_u64()
-        .ok_or("accessor without bufferView")? as usize;
-    let bv = &json["bufferViews"][bv_ix];
-    if bv["buffer"].as_u64() != Some(0) {
-        return Err("accessor bufferView must reference buffer 0 (BIN chunk)".into());
-    }
-    let bin = bin.ok_or("accessor references the BIN chunk but the GLB has none")?;
-    let bv_offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let bv_len = bv["byteLength"]
-        .as_u64()
-        .ok_or("bufferView without byteLength")? as usize;
-    let stride = bv["byteStride"]
-        .as_u64()
-        .map(|s| s as usize)
-        .unwrap_or(comp_size * N);
-    let acc_offset = acc["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let view = bin
-        .get(bv_offset..bv_offset + bv_len)
-        .ok_or("bufferView out of BIN bounds")?;
-
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let base = acc_offset + i * stride;
-        let mut vals = [0f32; N];
-        for (c, val) in vals.iter_mut().enumerate() {
-            let at = base + c * comp_size;
-            let bytes = view
-                .get(at..at + comp_size)
-                .ok_or_else(|| format!("accessor {index} element {i} out of bounds"))?;
-            *val = match comp_type {
-                5126 => f32::from_le_bytes(bytes.try_into().unwrap()),
-                5121 => {
-                    let v = bytes[0] as f32;
-                    if normalized { v / 255.0 } else { v }
-                }
-                5120 => {
-                    let v = bytes[0] as i8 as f32;
-                    if normalized { (v / 127.0).max(-1.0) } else { v }
-                }
-                5123 => {
-                    let v = u16::from_le_bytes(bytes.try_into().unwrap()) as f32;
-                    if normalized { v / 65535.0 } else { v }
-                }
-                5122 => {
-                    let v = i16::from_le_bytes(bytes.try_into().unwrap()) as f32;
-                    if normalized {
-                        (v / 32767.0).max(-1.0)
-                    } else {
-                        v
-                    }
-                }
-                5125 => u32::from_le_bytes(bytes.try_into().unwrap()) as f32,
-                _ => unreachable!(),
-            };
-        }
-        out.push(vals);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -2297,10 +1783,10 @@ mod tests {
     /// (the gltf crate then rejects the required extension), a `buffers`
     /// byteLength left describing the compressed BIN, or geometry decoded
     /// against the wrong chunk.
-    #[test]
-    fn combined_rewrites_decode_in_one_pass() {
-        use bevy::tasks::block_on;
-
+    /// The meshopt fixture wrapped in copyright + a required `CESIUM_RTC` —
+    /// exercises every synchronous rewrite at once. Shared by the one-pass
+    /// test and the S4 hook-parity test.
+    fn combined_fixture() -> Vec<u8> {
         let fixture = meshopt_fixture();
         let (json, bin) = split_glb(&fixture).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(json).unwrap();
@@ -2311,8 +1797,14 @@ mod tests {
         // surviving into the rebuilt container.
         value["extensionsRequired"] = serde_json::json!(["EXT_meshopt_compression", "CESIUM_RTC"]);
         value["extensionsUsed"] = serde_json::json!(["EXT_meshopt_compression", "CESIUM_RTC"]);
-        let glb = assemble_glb(&serde_json::to_vec(&value).unwrap(), bin.unwrap());
+        assemble_glb(&serde_json::to_vec(&value).unwrap(), bin.unwrap())
+    }
 
+    #[test]
+    fn combined_rewrites_decode_in_one_pass() {
+        use bevy::tasks::block_on;
+
+        let glb = combined_fixture();
         let tile = block_on(decode_tile(&glb, true)).expect("combined decode");
         assert_eq!(tile.copyright.as_deref(), Some("Fixture Co"));
         let rtc = tile.rtc_center.expect("rtc center");
@@ -2342,9 +1834,10 @@ mod tests {
     /// tiler injects). Two triangles, two features; decode must produce a
     /// per-triangle featureId array (index-buffer order) and the node-path
     /// table — the inputs the pick → node → twin resolver consumes.
-    #[test]
-    fn decodes_feature_metadata() {
-        // 6 verts (2 tris). Tri 0 → feature 0, tri 1 → feature 1.
+    /// The `EXT_mesh_features` GLB the feature tests share: 6 verts (2 tris),
+    /// tri 0 → feature 0, tri 1 → feature 1, node paths
+    /// `["AlphaModule", "BetaModule/sub"]`.
+    fn feature_fixture() -> Vec<u8> {
         let positions: [[f32; 3]; 6] = [
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -2423,8 +1916,12 @@ mod tests {
                 }]
             }}
         });
-        let glb = assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin);
+        assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin)
+    }
 
+    #[test]
+    fn decodes_feature_metadata() {
+        let glb = feature_fixture();
         let items = decode_glb(&glb).expect("decode features");
         assert_eq!(items.len(), 1);
         let DecodedItem::Mesh(p) = &items[0] else {
@@ -2520,5 +2017,138 @@ mod tests {
             features: None,
         }))];
         assert_eq!(resident_cost_bytes(&items), 36 + 24 + 12);
+    }
+
+    // ── S4 hook seam (offthread-decode plan): hook path ≡ inline path ───────
+
+    /// Canned in-process prepare hook — exactly what the real worker does
+    /// minus the postMessage: `bevy_3d_tiles_prepare::prepare_tile`.
+    fn canned_hook() -> Arc<crate::api::TilePrepareFn> {
+        Arc::new(|bytes, geo| Box::pin(async move { prepare_tile(&bytes, geo) }))
+    }
+
+    fn indices_u32(mesh: &Mesh) -> Option<Vec<u32>> {
+        match mesh.indices() {
+            Some(Indices::U32(v)) => Some(v.clone()),
+            Some(Indices::U16(v)) => Some(v.iter().map(|&i| u32::from(i)).collect()),
+            None => None,
+        }
+    }
+
+    /// Byte-level equality of two decode outputs: geometry (positions +
+    /// normals byte-for-byte, same indices/transforms), feature picking, and
+    /// the side-band (rtc/copyright/content_bytes). `stage_ms` is timing and
+    /// deliberately not compared.
+    fn assert_tiles_equal(a: &DecodedTile, b: &DecodedTile) {
+        assert_eq!(a.items.len(), b.items.len(), "item count");
+        assert_eq!(a.content_bytes, b.content_bytes, "content_bytes");
+        assert_eq!(a.rtc_center, b.rtc_center, "rtc_center");
+        assert_eq!(a.copyright, b.copyright, "copyright");
+        for (x, y) in a.items.iter().zip(&b.items) {
+            let (DecodedItem::Mesh(x), DecodedItem::Mesh(y)) = (x, y) else {
+                panic!("expected mesh items");
+            };
+            assert_eq!(x.transform, y.transform, "primitive transform");
+            for attr in [Mesh::ATTRIBUTE_POSITION, Mesh::ATTRIBUTE_NORMAL] {
+                assert_eq!(
+                    x.mesh.attribute(attr).map(|v| v.get_bytes()),
+                    y.mesh.attribute(attr).map(|v| v.get_bytes()),
+                    "attribute bytes"
+                );
+            }
+            assert_eq!(x.mesh.attributes().count(), y.mesh.attributes().count());
+            assert_eq!(indices_u32(&x.mesh), indices_u32(&y.mesh), "indices");
+            match (&x.features, &y.features) {
+                (None, None) => {}
+                (Some(fx), Some(fy)) => {
+                    assert_eq!(fx.feature_of_triangle, fy.feature_of_triangle);
+                    assert_eq!(fx.feature_of_vertex, fy.feature_of_vertex);
+                    assert_eq!(fx.node_of_feature, fy.node_of_feature);
+                }
+                _ => panic!("feature presence differs between paths"),
+            }
+        }
+    }
+
+    /// S4 gate test (a): the hook path — a canned in-process hook running
+    /// `prepare_tile`, the same function the real worker wasm links — decodes
+    /// the meshopt+RTC+copyright fixture byte-identically to the inline path.
+    #[test]
+    fn hook_path_matches_inline_on_meshopt_fixture() {
+        use bevy::tasks::block_on;
+
+        let glb = combined_fixture();
+        let hook = canned_hook();
+        let inline = block_on(decode_tile(&glb, true)).expect("inline decode");
+        let hooked = block_on(decode_tile_with(&glb, true, Some(&hook))).expect("hook-path decode");
+        assert_tiles_equal(&inline, &hooked);
+        // Prep really moved: span 0 is the hook's, so the main-side report is 0.
+        assert_eq!(hooked.stage_ms[0], 0.0, "span 0 lives in the hook now");
+        // And the plain meshopt fixture (anchored set, no side-band) too.
+        let glb = meshopt_fixture();
+        let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+        let hooked =
+            block_on(decode_tile_with(&glb, false, Some(&hook))).expect("hook-path decode");
+        assert_tiles_equal(&inline, &hooked);
+    }
+
+    /// S4 feature side-band: the hook reply's `PreparedFeatures` — not a JSON
+    /// re-parse — must rebuild picking data identical to the inline path's
+    /// `FeatureCtx` route.
+    #[test]
+    fn hook_path_consumes_prepared_features() {
+        use bevy::tasks::block_on;
+
+        let glb = feature_fixture();
+        // The prepared reply really carries the feature fields.
+        let prepared = prepare_tile(&glb, false).unwrap().expect("accepted");
+        let feats = prepared.features.as_ref().expect("features in the reply");
+        assert_eq!(
+            feats.node_of_feature,
+            vec!["AlphaModule".to_string(), "BetaModule/sub".to_string()]
+        );
+        assert_eq!(feats.vertex_ids.len(), 1, "one feature-carrying primitive");
+
+        let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+        let hooked = block_on(decode_tile_with(&glb, false, Some(&canned_hook())))
+            .expect("hook-path decode");
+        assert_tiles_equal(&inline, &hooked);
+        let DecodedItem::Mesh(p) = &hooked.items[0] else {
+            panic!("expected mesh")
+        };
+        let f = p.features.as_ref().expect("features decoded via hook");
+        assert_eq!(f.feature_of_triangle, vec![0, 1]);
+    }
+
+    /// S4 gate test (b): a declining hook (`Ok(None)` — the Draco/splat
+    /// platform-decoder answer) falls back to the inline path and decodes the
+    /// same tile.
+    #[test]
+    fn declining_hook_falls_back_inline() {
+        use bevy::tasks::block_on;
+
+        let decline: Arc<crate::api::TilePrepareFn> =
+            Arc::new(|_, _| Box::pin(async { Ok::<_, DecodeError>(None) }));
+        let glb = combined_fixture();
+        let inline = block_on(decode_tile(&glb, true)).expect("inline decode");
+        let fallen =
+            block_on(decode_tile_with(&glb, true, Some(&decline))).expect("fallback decode");
+        assert_tiles_equal(&inline, &fallen);
+        // The fallback IS the inline path — span 0 is back on this side.
+        assert!(fallen.stage_ms[0] > 0.0, "inline prep span recorded");
+    }
+
+    /// An erroring hook warns once and falls back inline — never fatal.
+    #[test]
+    fn erroring_hook_falls_back_inline() {
+        use bevy::tasks::block_on;
+
+        let broken: Arc<crate::api::TilePrepareFn> =
+            Arc::new(|_, _| Box::pin(async { Err(DecodeError::from("canned hook failure")) }));
+        let glb = meshopt_fixture();
+        let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+        let fallen =
+            block_on(decode_tile_with(&glb, false, Some(&broken))).expect("fallback decode");
+        assert_tiles_equal(&inline, &fallen);
     }
 }
