@@ -66,7 +66,8 @@ pub mod traversal;
 #[cfg(feature = "points")]
 pub use api::PointTileMaterial;
 pub use api::{
-    EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, Tiles3dCamera,
+    EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, TilePriorityClass,
+    Tiles3dCamera,
 };
 
 use archive::Archive3tz;
@@ -407,6 +408,42 @@ pub struct TilesetCredits {
     pub ground_covering: bool,
 }
 
+/// Cumulative tile-decode span stats (offthread-decode plan S1(b)) — the
+/// host's F3 instrument. Accumulated per landed tile in `receive_tiles3d`
+/// from [`content::DecodedTile::stage_ms`]; see that field's doc for the
+/// exact span boundaries (they are load-bearing for the S4 go/no-go gate).
+///
+/// **Read spans 0–2, never span 3 alone.** Span 3 (tex) is wall time around an
+/// `.await`, so on wasm it absorbs whatever other tiles decode while it is
+/// suspended and over-reads by an unbounded amount. The S2/S4 gate inputs are
+/// spans 0–2 plus `window.__tt_ktx2_stats` (the host's synchronous-transcode
+/// counter), which is the CPU truth for what span 3 is trying to measure.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct Tiles3dDecodeStats {
+    /// Content tiles decoded (subtree grafts don't decode geometry).
+    pub tiles: u64,
+    /// Cumulative ms per span: `[prep, parse, geom, tex]`.
+    pub stage_ms: [f64; 4],
+    /// Worst single-tile total decode ms.
+    pub worst_ms: f32,
+}
+
+impl Tiles3dDecodeStats {
+    /// Per-span averages in ms (zeros before the first tile).
+    pub fn avg_ms(&self) -> [f64; 4] {
+        let n = self.tiles.max(1) as f64;
+        self.stage_ms.map(|s| s / n)
+    }
+
+    pub(crate) fn record(&mut self, stage_ms: [f32; 4]) {
+        self.tiles += 1;
+        for (acc, s) in self.stage_ms.iter_mut().zip(stage_ms) {
+            *acc += f64::from(s);
+        }
+        self.worst_ms = self.worst_ms.max(stage_ms.iter().sum());
+    }
+}
+
 /// Live tilesets + scheduler counters.
 #[derive(Resource, Default)]
 pub struct Tiles3dSets {
@@ -561,6 +598,7 @@ impl Plugin for Tiles3dPlugin {
             .init_resource::<Tiles3dSets>()
             .init_resource::<Tiles3dChannel>()
             .init_resource::<TilesetCredits>()
+            .init_resource::<Tiles3dDecodeStats>()
             // Host-supplied seams (defaults are inert: no origin, no resolver).
             // The host overwrites these via its own adapter systems; a
             // standalone viewer leaves them and streams local/relative sets.
@@ -839,6 +877,7 @@ fn receive_tiles3d(
     // Inert by default — every feature falls back to the tile's anchor owner.
     resolver: Res<TileFeatureResolver>,
     mut sets: ResMut<Tiles3dSets>,
+    mut decode_stats: ResMut<Tiles3dDecodeStats>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -1044,7 +1083,9 @@ fn receive_tiles3d(
                             content_bytes: _,
                             rtc_center,
                             copyright,
+                            stage_ms,
                         } = *decoded;
+                        decode_stats.record(stage_ms);
                         set.rtc_centers[tile] = rtc_center;
                         if let Some(c) = copyright {
                             for frag in c.split(';') {
@@ -1509,6 +1550,59 @@ fn compact_grafted_subtrees(set: &mut ActiveTileset, frame: u64, grace: u64) -> 
 
 // ── Per-frame manager ────────────────────────────────────────────────────────
 
+/// One issuable tile request, gathered across every set each frame so the
+/// global load pool is granted with cross-set fairness (many-tileset scenes
+/// used to starve later sets — see [`sort_load_candidates`]).
+struct LoadCandidate {
+    /// Index into `Tiles3dSets::sets` THIS frame (stable within one system
+    /// run: the GC `retain` happens before collection).
+    set_idx: usize,
+    /// The set's stable id — the round-robin cursor is keyed on it so
+    /// rotation survives sets detaching/reshuffling.
+    set_id: u64,
+    /// Tile index within the set's tree.
+    tile: usize,
+    /// [`api::TilePriorityClass`] of the set (default 1).
+    class: u8,
+    /// First request of a set with zero Ready content — its entry into
+    /// visibility (typically its root tile).
+    starving_root: bool,
+    /// Rank within the set's own `sel.loads` order this frame.
+    within: usize,
+}
+
+/// Order candidates for issue:
+///
+/// * (a) **Starving sets first, across every class.** A set with nothing Ready
+///   gets its first (root) request before ANY set's refinement, whatever the
+///   classes. Class must not be able to gate this: a class-0 world layer
+///   (Google P3DT) refines without bound, so keying on class first lets it
+///   starve a class-1 twin's root forever — the original many-tileset
+///   starvation incident, one class up.
+/// * (b) Class ascending — ordering starving roots among themselves (terrain
+///   root before twin roots) and, separately, refinements among themselves.
+/// * (c) Breadth-first across sets — every set's k-th request before any set's
+///   (k+1)-th — rotated by `cursors`, which holds the set id last granted a
+///   slot **per class** (missing ⇒ start at the lowest id), so a saturated
+///   pool still rotates across sets over successive frames. Per class, not
+///   global: a frame whose slots all go to class 0 would otherwise leave the
+///   cursor pointing at a class-0 id, and every leftover slot thereafter would
+///   land on the same lowest-id class-1 set.
+/// * (d) Within one set, selection order is preserved.
+fn sort_load_candidates(cands: &mut [LoadCandidate], cursors: &std::collections::HashMap<u8, u64>) {
+    cands.sort_by_key(|c| {
+        let cursor = cursors.get(&c.class).copied().unwrap_or(u64::MAX);
+        (
+            !c.starving_root,
+            c.class,
+            c.within,
+            // Rotation: ids past this class's cursor first (ascending), then wrap.
+            c.set_id <= cursor,
+            c.set_id,
+        )
+    });
+}
+
 /// Run the selection pass per tileset, apply the render cut as visibility,
 /// schedule loads by priority (recomputed every frame, out-of-cut requests
 /// aborted), and evict stale residents.
@@ -1528,6 +1622,13 @@ fn drive_tiles3d(
     // Last logged state of the load halt (hard stop / host brake) — log
     // transitions, not every frame.
     mut halt_logged: Local<bool>,
+    // Host-supplied per-set priority (looked up via the set's anchor entity).
+    classes: Query<&api::TilePriorityClass>,
+    // Round-robin cursors, one per priority class: id of the set that class
+    // last granted a load slot to. Persists across frames so fairness holds
+    // under a saturated pool, and is keyed by set id (not position) so it
+    // stays sane when sets detach.
+    mut rr_cursors: Local<std::collections::HashMap<u8, u64>>,
 ) {
     let Tiles3dSets {
         sets,
@@ -1641,7 +1742,10 @@ fn drive_tiles3d(
     let mut google_visible = false;
     let mut ground_covering = false;
     let mut compacted_this_frame = false;
-    for set in sets.iter_mut() {
+    // Issuable requests across ALL sets — collected per set below, issued
+    // after the loop under the global pool (cross-set fairness).
+    let mut candidates: Vec<LoadCandidate> = Vec::new();
+    for (set_idx, set) in sets.iter_mut().enumerate() {
         // Reclaim stale grafted subtrees once the tree has grown well past the
         // last pass — bounds the monotonic P3DT graft creep so the per-frame
         // O(tree) bookkeeping below stops getting slower the longer you fly.
@@ -1869,54 +1973,41 @@ fn drive_tiles3d(
             _ => false,
         };
 
-        // Issue new requests in priority order under the GLOBAL concurrency
-        // pool (`load_slots`) — and not at all while loads are halted (hard
-        // stop / host brake).
-        for req in &sel.loads {
-            if budget_exhausted || halt_loads || load_slots == 0 {
-                break;
-            }
-            if !matches!(set.slots[req.tile], TileSlot::NotLoaded) {
-                continue; // already in flight, ready, or failed
-            }
-            let Some(uri) = tree.nodes[req.tile].content_uri.clone() else {
-                continue;
-            };
-            let generation = *next_generation;
-            *next_generation += 1;
-            set.slots[req.tile] = TileSlot::InFlight { generation };
-            load_slots -= 1;
-            let abort = fetch::register_abort(generation);
-            let source = set.source.clone();
-            let tx = channel.tx.clone();
-            let set_id = set.id;
-            let georeferenced = matches!(set.frame, SetFrame::Ecef { .. });
-            fetch::spawn_io(async move {
-                // Fetch + decode entirely inside the task (wasm: every IO step
-                // awaits a JS future and yields; decode is small-tile CPU).
-                // External tilesets are detected by CONTENT, not URI — P3DT
-                // serves subtree JSON and GLBs from the same extensionless
-                // /files/<id> namespace.
-                let result = match source.read_entry_cached(&uri, Some(&abort)).await {
-                    Ok(bytes) if looks_like_external_tileset(&bytes) => {
-                        schema::parse_tileset(&bytes)
-                            .map(|ts| TileOutput::Subtree(Box::new(ts)))
-                            .map_err(|e| format!("parse external tileset: {e}"))
-                    }
-                    Ok(bytes) => content::decode_tile(&bytes, georeferenced)
-                        .await
-                        .map(|tile| TileOutput::Content(Box::new(tile)))
-                        .map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                };
-                fetch::unregister_abort(generation);
-                // Receiver gone (plugin torn down) is fine — drop silently.
-                let _ = tx.send(Tiles3dMsg::TileContent {
-                    set_id,
-                    generation,
-                    result,
+        // Collect this set's issuable requests for the cross-set scheduler
+        // after the loop — nothing is issued per set any more, so the first
+        // sets in iteration order can no longer starve the rest of the pool.
+        // `load_slots == 0` (pool fully in flight) skips collection outright:
+        // nothing above this point depends on it, and the abort pass, budget
+        // warn and halt logging all still ran.
+        if load_slots > 0 && !budget_exhausted && !halt_loads {
+            let class = set
+                .anchor
+                .and_then(|a| classes.get(a).ok())
+                .copied()
+                .unwrap_or_default()
+                .0;
+            let has_ready = set
+                .slots
+                .iter()
+                .any(|s| matches!(s, TileSlot::Ready { .. }));
+            let mut within = 0usize;
+            for req in &sel.loads {
+                if !matches!(set.slots[req.tile], TileSlot::NotLoaded) {
+                    continue; // already in flight, ready, or failed
+                }
+                if tree.nodes[req.tile].content_uri.is_none() {
+                    continue;
+                }
+                candidates.push(LoadCandidate {
+                    set_idx,
+                    set_id: set.id,
+                    tile: req.tile,
+                    class,
+                    starving_root: !has_ready && within == 0,
+                    within,
                 });
-            });
+                within += 1;
+            }
         }
 
         // Eviction: out-of-cut residents past the grace window, then the
@@ -1976,6 +2067,60 @@ fn drive_tiles3d(
             .slots
             .iter()
             .any(|s| matches!(s, TileSlot::InFlight { .. }));
+    }
+
+    // Issue across ALL sets under the GLOBAL concurrency pool (`load_slots`),
+    // in cross-set fairness order — see `sort_load_candidates`. Halt/budget
+    // gating and the empty-pool skip already happened at collection time
+    // (`candidates` is empty in either case, so this is a no-op then).
+    sort_load_candidates(&mut candidates, &rr_cursors);
+    for c in candidates {
+        if load_slots == 0 {
+            break;
+        }
+        let set = &mut sets[c.set_idx];
+        if !matches!(set.slots[c.tile], TileSlot::NotLoaded) {
+            continue; // defensive: collection guarantees this today
+        }
+        let Some(uri) = set.tree.nodes[c.tile].content_uri.clone() else {
+            continue;
+        };
+        let generation = *next_generation;
+        *next_generation += 1;
+        set.slots[c.tile] = TileSlot::InFlight { generation };
+        load_slots -= 1;
+        // Advance ONLY this class's cursor — see `sort_load_candidates` (c).
+        rr_cursors.insert(c.class, c.set_id);
+        any_in_flight = true;
+        let abort = fetch::register_abort(generation);
+        let source = set.source.clone();
+        let tx = channel.tx.clone();
+        let set_id = set.id;
+        let georeferenced = matches!(set.frame, SetFrame::Ecef { .. });
+        fetch::spawn_io(async move {
+            // Fetch + decode entirely inside the task (wasm: every IO step
+            // awaits a JS future and yields; decode is small-tile CPU).
+            // External tilesets are detected by CONTENT, not URI — P3DT
+            // serves subtree JSON and GLBs from the same extensionless
+            // /files/<id> namespace.
+            let result = match source.read_entry_cached(&uri, Some(&abort)).await {
+                Ok(bytes) if looks_like_external_tileset(&bytes) => schema::parse_tileset(&bytes)
+                    .map(|ts| TileOutput::Subtree(Box::new(ts)))
+                    .map_err(|e| format!("parse external tileset: {e}")),
+                Ok(bytes) => content::decode_tile(&bytes, georeferenced)
+                    .await
+                    .map(|tile| TileOutput::Content(Box::new(tile)))
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            fetch::unregister_abort(generation);
+            // Receiver gone (plugin torn down) is fine — drop silently.
+            let _ = tx.send(Tiles3dMsg::TileContent {
+                set_id,
+                generation,
+                result,
+            });
+        });
     }
 
     // Attribution side-band (D7/L-D5): aggregated tile copyrights + the
@@ -2228,6 +2373,165 @@ mod tests {
         let uri = tree.nodes[5].content_uri.clone().unwrap();
         let glb = block_on(ar.read_entry(&uri)).expect("tile glb via ranged read");
         assert!(content::decode_glb(&glb).is_ok());
+    }
+
+    fn cand(set_id: u64, class: u8, starving_root: bool, within: usize) -> LoadCandidate {
+        LoadCandidate {
+            set_idx: set_id as usize,
+            set_id,
+            tile: within,
+            class,
+            starving_root,
+            within,
+        }
+    }
+
+    /// No rotation history — every class starts at its lowest set id.
+    fn no_cursors() -> std::collections::HashMap<u8, u64> {
+        std::collections::HashMap::new()
+    }
+
+    /// (a) A set with zero Ready content gets its first (root) request before
+    /// an older, already-visible set's refinements at equal class.
+    #[test]
+    fn starving_set_root_beats_refinement() {
+        let mut c = vec![
+            cand(1, 1, false, 0), // old set's refinements
+            cand(1, 1, false, 1),
+            cand(2, 1, true, 0), // new set's root
+        ];
+        sort_load_candidates(&mut c, &no_cursors());
+        assert_eq!((c[0].set_id, c[0].within), (2, 0), "root request first");
+    }
+
+    /// (a) Root-first outranks class: an unbounded class-0 refiner (a Google
+    /// P3DT world layer) must NOT be able to starve a class-1 twin's root.
+    #[test]
+    fn class1_starving_root_beats_class0_refinement() {
+        let mut c = vec![
+            cand(2, 0, false, 3), // class-0 world layer, refining forever
+            cand(2, 0, false, 4),
+            cand(1, 1, true, 0), // class-1 twin with nothing Ready yet
+        ];
+        sort_load_candidates(&mut c, &no_cursors());
+        assert_eq!(c[0].set_id, 1, "starving root wins across classes");
+    }
+
+    /// (b) Class orders like-for-like: refinement vs refinement, class 0 first.
+    /// (Same among starving roots — terrain root before twin roots.)
+    #[test]
+    fn class_zero_beats_class_one() {
+        let mut c = vec![
+            cand(1, 1, false, 0), // class-1 refinement
+            cand(2, 0, false, 3), // class-0 refinement
+        ];
+        sort_load_candidates(&mut c, &no_cursors());
+        assert_eq!(c[0].set_id, 2, "class 0 refinement first");
+
+        let mut c = vec![cand(1, 1, true, 0), cand(2, 0, true, 0)];
+        sort_load_candidates(&mut c, &no_cursors());
+        assert_eq!(c[0].set_id, 2, "class 0 root first among starving roots");
+    }
+
+    /// (c) Round-robin: under a saturated pool (one grant per frame), the
+    /// cursor rotates the grant across equal-class sets over successive calls.
+    #[test]
+    fn round_robin_rotates_across_equal_class_sets() {
+        let fresh = || {
+            vec![
+                cand(1, 1, false, 0),
+                cand(1, 1, false, 1),
+                cand(2, 1, false, 0),
+                cand(2, 1, false, 1),
+                cand(3, 1, false, 0),
+                cand(3, 1, false, 1),
+            ]
+        };
+        let mut cursors = no_cursors();
+        let mut served = Vec::new();
+        for _ in 0..4 {
+            let mut c = fresh();
+            sort_load_candidates(&mut c, &cursors);
+            cursors.insert(c[0].class, c[0].set_id); // pool of 1: only the first is granted
+            served.push(c[0].set_id);
+        }
+        assert_eq!(served, vec![1, 2, 3, 1], "rotation wraps across frames");
+    }
+
+    /// (c) Rotation is PER CLASS, and this is what a shared cursor breaks:
+    /// alternate a frame whose whole pool goes to class 0 with a frame that
+    /// leaves one slot over. One cursor would end each saturated frame keyed
+    /// to a class-0 id ABOVE every class-1 id, so every leftover slot sorts
+    /// class 1 from scratch and lands on set 1 forever (`[1, 1, 1, 1]`);
+    /// per-class cursors keep class 1 rotating across the leftover slots.
+    #[test]
+    fn round_robin_rotates_per_class() {
+        // Class-0 ids sit above the class-1 ids, as a late-attached world
+        // layer's would. Refinements only — a starving root would jump ahead.
+        let frame = |class0_reqs: usize| {
+            let mut c: Vec<LoadCandidate> = (0..class0_reqs)
+                .map(|i| cand(100 + i as u64, 0, false, 0))
+                .collect();
+            c.extend([cand(1, 1, false, 0), cand(2, 1, false, 0), cand(3, 1, false, 0)]);
+            c
+        };
+        let mut cursors = no_cursors();
+        let mut leftover_served = Vec::new();
+        for _ in 0..4 {
+            // Saturated frame: pool of 2, both slots taken by class 0.
+            let mut c = frame(2);
+            sort_load_candidates(&mut c, &cursors);
+            assert!(c[..2].iter().all(|g| g.class == 0), "class 0 saturates");
+            for g in c.iter().take(2) {
+                cursors.insert(g.class, g.set_id);
+            }
+            // Leftover frame: class 0 wants one slot, class 1 gets the other.
+            let mut c = frame(1);
+            sort_load_candidates(&mut c, &cursors);
+            for g in c.iter().take(2) {
+                cursors.insert(g.class, g.set_id);
+            }
+            assert_eq!(c[1].class, 1, "the leftover slot is class 1's");
+            leftover_served.push(c[1].set_id);
+        }
+        assert_eq!(
+            leftover_served,
+            vec![1, 2, 3, 1],
+            "class-1 rotation survives class-0 saturation frames"
+        );
+    }
+
+    /// (c)+(d) Within one frame the order is breadth-first across sets
+    /// (every set's k-th request before any set's (k+1)-th), and within one
+    /// set the `sel.loads` order is preserved.
+    #[test]
+    fn within_set_selection_order_preserved() {
+        let mut c = vec![
+            cand(2, 1, false, 1),
+            cand(1, 1, false, 2),
+            cand(2, 1, false, 0),
+            cand(1, 1, false, 0),
+            cand(1, 1, false, 1),
+        ];
+        sort_load_candidates(&mut c, &no_cursors());
+        let order: Vec<(u64, usize)> = c.iter().map(|c| (c.set_id, c.within)).collect();
+        assert_eq!(order, vec![(1, 0), (2, 0), (1, 1), (2, 1), (1, 2)]);
+        let set1: Vec<usize> = c.iter().filter(|c| c.set_id == 1).map(|c| c.within).collect();
+        assert_eq!(set1, vec![0, 1, 2], "within-set order intact");
+    }
+
+    /// The cursor is keyed by set id, so it stays sane when the set it points
+    /// at detaches: rotation continues from the next id past it.
+    #[test]
+    fn rotation_cursor_survives_set_detach() {
+        // Cursor points at set 2, which has since detached.
+        let mut c = vec![cand(1, 1, false, 0), cand(3, 1, false, 0)];
+        sort_load_candidates(&mut c, &std::collections::HashMap::from([(1u8, 2u64)]));
+        assert_eq!(c[0].set_id, 3, "next id past the dead cursor goes first");
+        // Cursor past every live id wraps to the lowest.
+        let mut c = vec![cand(1, 1, false, 0), cand(3, 1, false, 0)];
+        sort_load_candidates(&mut c, &std::collections::HashMap::from([(1u8, 99u64)]));
+        assert_eq!(c[0].set_id, 1, "wraps to the lowest live id");
     }
 
     /// Aborting a registered generation flips its handle; a triggered source

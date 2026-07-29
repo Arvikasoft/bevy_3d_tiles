@@ -142,6 +142,33 @@ impl TileFeatureResolver {
     }
 }
 
+/// Per-tileset streaming priority class, read live from the tileset's **anchor
+/// entity** ([`crate::Tiles3dAttach::anchor`]). `0` = highest; default `1`.
+///
+/// When the global load pool ([`crate::Tiles3dConfig::max_concurrent_loads`])
+/// is contended, class orders requests across ALL sets — but it is **not** the
+/// primary key. Any set with nothing Ready yet gets its first (root) request
+/// before any set's refinement, class notwithstanding; a class-0 world layer
+/// refines without bound, and letting class win would let it starve a class-1
+/// twin's root forever. Class then orders *among* starving roots, and
+/// separately among refinements, with sets round-robining inside each.
+///
+/// So the class is for *semantic* precedence (TurboTwin marks ground-context
+/// sets — terrain surfaces, background layers — class 0 so the ground appears
+/// before twin tilesets fight over the pool), never a starvation lever.
+///
+/// Host-supplied like [`EcefOrigin`] / [`TileFeatureResolver`]: insert it on
+/// the anchor entity, before or after attach. Absent — or on a world-anchored
+/// dev set with no anchor — the set streams at the default class 1.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TilePriorityClass(pub u8);
+
+impl Default for TilePriorityClass {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
 /// Marker the host inserts on the camera the streamer uses for screen-space-error
 /// tile selection. Add it alongside your `Camera3d` (TurboTwin adds it next to
 /// the orbit camera). Replaces the former hard-coded `PanOrbitCamera` filter.

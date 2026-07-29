@@ -45,6 +45,10 @@ use bevy::image::{
 };
 use bevy::math::{DVec3, Mat4};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
+// ponytail: `performance.now()` on wasm via bevy_platform's `web` feature —
+// already on transitively through bevy_render/bevy_winit; nothing here asks
+// for it explicitly.
+use bevy::platform::time::Instant;
 #[cfg(feature = "splats")]
 use bevy_gaussian_splatting::gaussian::formats::planar_3d::Gaussian3d;
 #[cfg(feature = "points")]
@@ -339,6 +343,32 @@ pub struct DecodedTile {
     /// glTF `asset.copyright` — aggregated into the attribution overlay
     /// (required by the Google ToS, plan D7/L-D5).
     pub copyright: Option<String>,
+    /// Per-span decode cost in ms, cut ALONG THE S4 SEAM (offthread-decode
+    /// plan S1(b)) — the boundaries are load-bearing for the S4 go/no-go gate:
+    /// * `[0]` prep — `split_glb` + `Marks::scan` + parse 1
+    ///   (`serde_json::from_slice`) + `decode_meshopt_views` +
+    ///   `serde_json::to_vec` + `assemble_glb`. Exactly the movable set.
+    /// * `[1]` parse 2 — `gltf::Gltf::from_slice`. Its OWN span, never merged
+    ///   into `[0]`: it does not move under S4, and merging would make
+    ///   "span 0 dominant ⇒ build S4" unfalsifiable.
+    /// * `[2]` geometry — `decode_node`/`decode_primitive` attribute collect +
+    ///   `compute_normals` + inline PNG/JPEG decode.
+    /// * `[3]` textures — `resolve_pending_textures` (KTX2 transcode). **Wall
+    ///   time, not CPU time**: it brackets an `.await`, and on wasm every
+    ///   decode task shares one thread (`spawn_local`), so any other tile's
+    ///   synchronous work that interleaves while this future is suspended is
+    ///   counted here too. It therefore over-reads, without bound, whenever
+    ///   more than one tile is in flight. The CPU truth for transcode is the
+    ///   host's `window.__tt_ktx2_stats` counter; span 3 alone must never
+    ///   decide the S2/S4 gate.
+    ///
+    /// No inflate span: `.3tz` entries are STORED.
+    pub stage_ms: [f32; 4],
+}
+
+/// Elapsed milliseconds since `t` (span accumulator for [`DecodedTile::stage_ms`]).
+fn span_ms(t: Instant) -> f32 {
+    t.elapsed().as_secs_f32() * 1000.0
 }
 
 /// Which decode passes a tile needs, from ONE marker scan of its JSON chunk.
@@ -401,22 +431,30 @@ impl Marks {
 /// leaf cost five serde parses, two re-serializes, three container rebuilds
 /// and ~6 copies of a multi-MB BIN before a vertex was read.)
 pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTile, DecodeError> {
+    let mut stage_ms = [0f32; 4];
+    let t = Instant::now();
     let (json_chunk, bin) = split_glb(bytes)?;
     let marks = Marks::scan(json_chunk);
+    stage_ms[0] += span_ms(t);
 
     if !georeferenced && marks.vanilla() {
-        let mut items = decode_vanilla(bytes, None)?;
+        let mut items = decode_vanilla(bytes, None, &mut stage_ms)?;
+        let t = Instant::now();
         resolve_pending_textures(&mut items).await;
+        stage_ms[3] += span_ms(t);
         return Ok(DecodedTile {
             items,
             content_bytes: bytes.len() as u64,
             rtc_center: None,
             copyright: None,
+            stage_ms,
         });
     }
 
+    let t = Instant::now();
     let mut json: serde_json::Value =
         serde_json::from_slice(json_chunk).map_err(|e| format!("tile json: {e}"))?;
+    stage_ms[0] += span_ms(t);
     let copyright = json["asset"]["copyright"].as_str().map(str::to_string);
     let mut rtc_center = json["extensions"]["CESIUM_RTC"]["center"]
         .as_array()
@@ -433,6 +471,7 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
             content_bytes: bytes.len() as u64,
             rtc_center,
             copyright,
+            stage_ms,
         });
     }
 
@@ -471,13 +510,16 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
         None
     };
 
-    let mut items = rewrite_and_decode(json, bytes, bin, marks, draco, nodes_rebased)?;
+    let mut items = rewrite_and_decode(json, bytes, bin, marks, draco, nodes_rebased, &mut stage_ms)?;
+    let t = Instant::now();
     resolve_pending_textures(&mut items).await;
+    stage_ms[3] += span_ms(t);
     Ok(DecodedTile {
         items,
         content_bytes: bytes.len() as u64,
         rtc_center,
         copyright,
+        stage_ms,
     })
 }
 
@@ -548,14 +590,15 @@ fn extract_planetary_root_offset(json: &mut serde_json::Value) -> Option<DVec3> 
 /// async) and falls through to the `gltf` crate, which rejects it — use
 /// [`decode_tile`] for that. Same single-parse/single-rebuild pipeline.
 pub fn decode_glb(bytes: &[u8]) -> Result<Vec<DecodedItem>, DecodeError> {
+    let mut discard_ms = [0f32; 4]; // spans reported only via `decode_tile`
     let (json_chunk, bin) = split_glb(bytes)?;
     let marks = Marks::scan(json_chunk);
     if marks.vanilla() {
-        return decode_vanilla(bytes, None);
+        return decode_vanilla(bytes, None, &mut discard_ms);
     }
     let json: serde_json::Value =
         serde_json::from_slice(json_chunk).map_err(|e| format!("tile json: {e}"))?;
-    rewrite_and_decode(json, bytes, bin, marks, None, false)
+    rewrite_and_decode(json, bytes, bin, marks, None, false, &mut discard_ms)
 }
 
 /// Every synchronous rewrite a tile can need, in ONE pass over the
@@ -575,12 +618,16 @@ fn rewrite_and_decode(
     marks: Marks,
     draco: Option<(Vec<DracoPrim>, Vec<draco::DracoMesh>)>,
     json_dirty: bool,
+    stage_ms: &mut [f32; 4],
 ) -> Result<Vec<DecodedItem>, DecodeError> {
     // meshopt first (T6/D12 — what our mesh tiler emits, and POINTS tiles
     // too): it REBUILDS the BIN, so every later pass reads decoded bytes.
     // Buffer-view indices are preserved, so nothing else has to move.
     let mut new_bin: Option<Vec<u8>> = if marks.meshopt {
-        Some(decode_meshopt_views(&mut json, bin).map_err(DecodeError::meshopt)?)
+        let t = Instant::now();
+        let b = decode_meshopt_views(&mut json, bin).map_err(DecodeError::meshopt)?;
+        stage_ms[0] += span_ms(t);
+        Some(b)
     } else {
         None
     };
@@ -615,8 +662,10 @@ fn rewrite_and_decode(
 
     let rebuilt;
     let glb: &[u8] = if json_dirty || stripped || marks.meshopt || marks.basisu {
+        let t = Instant::now();
         let json_bytes = serde_json::to_vec(&json).map_err(|e| format!("tile splice json: {e}"))?;
         rebuilt = assemble_glb(&json_bytes, bin.unwrap_or(&[]));
+        stage_ms[0] += span_ms(t);
         &rebuilt
     } else {
         original
@@ -639,14 +688,17 @@ fn rewrite_and_decode(
         None
     };
 
-    decode_vanilla(glb, feat.as_ref())
+    decode_vanilla(glb, feat.as_ref(), stage_ms)
 }
 
 /// Decode a vanilla (no unhandled extension) GLB through the `gltf` crate.
 fn decode_vanilla(
     bytes: &[u8],
     feat: Option<&FeatureCtx>,
+    stage_ms: &mut [f32; 4],
 ) -> Result<Vec<DecodedItem>, DecodeError> {
+    // Span 1 (parse 2): its own cut — this parse does NOT move under S4.
+    let t = Instant::now();
     let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| {
         // Diagnostic: a parse failure here means the bytes reaching the gltf
         // crate aren't the clean vanilla glTF we expect (bad archive range-read,
@@ -661,9 +713,11 @@ fn decode_vanilla(
             j.len()
         )
     })?;
+    stage_ms[1] += span_ms(t);
     let doc = gltf.document;
     let blob = gltf.blob;
 
+    let t = Instant::now();
     let mut out = Vec::new();
     let Some(scene) = doc.default_scene().or_else(|| doc.scenes().next()) else {
         return Ok(out); // empty content tile — legal, renders nothing
@@ -671,6 +725,7 @@ fn decode_vanilla(
     for node in scene.nodes() {
         decode_node(&node, Mat4::IDENTITY, blob.as_deref(), feat, &mut out)?;
     }
+    stage_ms[2] += span_ms(t);
     Ok(out)
 }
 
@@ -1336,8 +1391,9 @@ fn decode_primitive(
     }
     match normals {
         Some(n) => mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n),
-        // Tiler output may omit normals to save bytes; smooth-compute them
-        // (decode-task CPU, not frame time).
+        // Tiler output may omit normals to save bytes; smooth-compute them.
+        // On wasm the decode task IS the frame thread (`spawn_local`), so this
+        // is frame time — counted in `DecodedTile::stage_ms[2]`.
         None => mesh.compute_normals(),
     }
 
@@ -1868,6 +1924,35 @@ mod tests {
         assert_eq!(tile.copyright.as_deref(), Some("Data A;Data B"));
         let rtc = tile.rtc_center.expect("rtc center");
         assert!((rtc - DVec3::new(6_378_137.0, 1000.5, -2000.25)).length() < 1e-9);
+    }
+
+    /// S1(b): `Tiles3dDecodeStats::record` accumulates spans across two
+    /// decoded tiles — count, per-span sums, worst-tile total, averages.
+    #[test]
+    fn decode_stats_accumulate_across_two_tiles() {
+        use bevy::tasks::block_on;
+
+        let a = block_on(decode_tile(&tiny_glb(), false)).expect("decode a");
+        let b = block_on(decode_tile(&tiny_glb(), false)).expect("decode b");
+
+        let mut stats = crate::Tiles3dDecodeStats::default();
+        stats.record(a.stage_ms);
+        stats.record(b.stage_ms);
+
+        assert_eq!(stats.tiles, 2);
+        for i in 0..4 {
+            let want = f64::from(a.stage_ms[i]) + f64::from(b.stage_ms[i]);
+            assert!((stats.stage_ms[i] - want).abs() < 1e-9, "span {i} sums");
+        }
+        let worst = a
+            .stage_ms
+            .iter()
+            .sum::<f32>()
+            .max(b.stage_ms.iter().sum::<f32>());
+        assert_eq!(stats.worst_ms, worst, "worst = max single-tile total");
+        for (i, avg) in stats.avg_ms().iter().enumerate() {
+            assert!((avg * 2.0 - stats.stage_ms[i]).abs() < 1e-12, "avg {i}");
+        }
     }
 
     /// Google P3DT shape: ECEF baked into the node MATRIX (no CESIUM_RTC),
