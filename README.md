@@ -102,7 +102,7 @@ native, `?tiles3d=…` on wasm.
 
 ## Host integration (the seams)
 
-The crate is backend-agnostic: it knows nothing about your data model. Five
+The crate is backend-agnostic: it knows nothing about your data model. These
 optional seams wire it into a host app:
 
 | Seam | What the host does with it |
@@ -111,6 +111,7 @@ optional seams wire it into a host app:
 | `Tiles3dCamera` (marker) | tag the camera SSE selection follows |
 | `TileOwner` (Component) | read it back — every spawned tile entity carries the attach's `owner_id`, so selection/highlight map to your domain |
 | `TileFeatureResolver` (Resource) | map `EXT_mesh_features` node paths to your own sub-entity ids |
+| `TileSseMultiplier` (Component) | per-set refine-threshold dial on the anchor — coarsen ground/background sets without touching the twins |
 | `PointTileMaterial` (Resource, `points`) | own the point material (sizing/shading) |
 
 All have inert defaults — a standalone viewer can ignore every one of them.
@@ -156,6 +157,40 @@ attribution lines whenever tiles are visible, and bring your own API key
 Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
 
 ## Upgrading
+
+### 0.2.3 → 0.2.4
+
+- **Hidden tiles no longer keep their entities.** A tile outside the render cut
+  (a REPLACE-refined parent, or one waiting out the eviction grace window) is
+  **despawned**; its decoded assets stay in `Assets<*>`, held by the slot, and a
+  re-entering tile respawns from them — no fetch, no decode. Residency and
+  `Tiles3dSets::resident_content_bytes()` are unchanged by design (the memory
+  really is still resident); only eviction reclaims. What changes for a host:
+  **a tile's `Entity` is no longer stable** — resolve tiles by identity, never by
+  a cached `Entity`, and expect `Added<TileOwner>` / `Added<TileGeometry>` /
+  `Added<TileFeaturePick>` (and `Added<Mesh3d>`) to fire again on every re-entry,
+  which is what keeps host material/clip/section adapters correct.
+- **New knob `Tiles3dConfig::max_respawns_per_frame`** (default 64, GLOBAL across
+  sets) boxes those re-entries. It is separate from `max_spawns_per_frame` on
+  purpose: that one boxes *decode* (wasm hosts lower it to 2–4), while a respawn
+  reuses assets that are already decoded and uploaded. A despawn is held only for
+  the tiles actually covering a selected tile that has not spawned yet — its
+  ancestors and descendants — so a refining parent never leaves before its
+  children arrive, and unrelated out-of-cut tiles still leave immediately.
+- **Swap sequencing is unchanged from a viewer's seat.** A refinement still shows
+  exactly one rung per frame: while a coarse parent is held and painting, its
+  arrived children WAIT (spawned, hidden) instead of drawing on top of it, and
+  they all flip visible on the same frame the parent is despawned — one command
+  flush, so no gap and no coarse-over-fine overlap however long the respawn
+  budget makes the children trickle. A tile with no painting ancestor to wait
+  behind — cut entry from cache, where the whole chain is despawned — respawns
+  VISIBLE on the frame it is selected. Coarsening keeps its one-frame
+  coarse-over-fine overlap (the parent paints while the children it replaces are
+  still up), which is deliberate: coarse over fine beats a gap.
+- **New seam `TileSseMultiplier(f32)`** on the anchor entity — a live, relative
+  dial on the set's refine threshold (`>1.0` = coarser cut). The
+  "ground tilesets don't need twin-grade density" knob; composes with
+  `Tiles3dAttach::sse_threshold_px` and the memory-pressure valve.
 
 ### 0.1.8 → 0.1.9
 
