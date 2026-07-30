@@ -55,11 +55,23 @@ pub type TilePrepareFn = dyn Fn(
     + Send
     + Sync;
 
-/// Host-supplied off-thread tile-prepare hook (offthread-decode plan S4).
+/// Host-supplied off-thread tile-prepare hook (offthread-decode plan S4/S5).
 /// `None` (the default) = today's inline decode, byte-identical. Insert it
 /// *before* `add_plugins(Tiles3dPlugin)` — the same `init_resource` override
 /// contract as `Tiles3dConfig`. The crate clones the `Arc` out per request
 /// and calls it from the fetch task; it never learns what a Worker is.
+///
+/// A hook returns one of two payload shapes in the same [`PreparedTile`], and
+/// picks by how much work it did off-thread:
+/// * `meshes: None` (S4, [`bevy_3d_tiles_prepare::prepare_tile`]) — prepared
+///   glTF bytes in `glb`; the crate parses them and collects attributes.
+/// * `meshes: Some(_)` (S5,
+///   [`bevy_3d_tiles_prepare::prepare_tile_extracting`]) — typed vertex
+///   buffers; the crate only builds `Mesh` objects and uploads them, and `glb`
+///   is empty. Extraction declines content it cannot reproduce exactly
+///   (textures, non-triangle, quantized attributes), which lands back on the
+///   first shape — so a hook can always return the richer call and let the
+///   fallbacks sort it out.
 #[derive(Resource, Default, Clone)]
 pub struct TilePrepareHook(pub Option<Arc<TilePrepareFn>>);
 

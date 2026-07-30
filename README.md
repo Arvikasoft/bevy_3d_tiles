@@ -152,10 +152,31 @@ attribution lines whenever tiles are visible, and bring your own API key
 
 | `bevy_3d_tiles` | Bevy |
 |---|---|
-| 0.3 | 0.19 |
+| 0.3 – 0.4 | 0.19 |
 | 0.1 – 0.2 | 0.18 |
 
 ## Upgrading
+
+### 0.3.0 → 0.4.0
+
+- **Breaking, and the only break:** `PreparedTile` gained a public field
+  (`meshes`), so a hook that builds one with a struct literal must add
+  `meshes: None` — which keeps today's behaviour exactly. Nothing else changed
+  shape. (Minor bump, not patch, precisely because of that one line;
+  `bevy_3d_tiles_prepare` goes 0.1 → 0.2 alongside it.)
+- **The `TilePrepareHook` can now hand back decoded GEOMETRY, not just prepared
+  glTF bytes.** `bevy_3d_tiles_prepare` 0.2 adds `prepare_tile_extracting` /
+  `extract_tile_meshes`, which run the glTF parse and the per-primitive
+  attribute collect on the hook's thread and return plain typed buffers
+  (`ExtractedMeshes`); the crate then only builds `Mesh` objects and uploads
+  them, which is the part that cannot leave the main thread. `prepare_tile`
+  still fills `meshes` with `None`.
+- Extraction **declines** (`meshes: None`) anything it cannot reproduce
+  byte-identically to the in-engine decode — textured tiles, non-triangle
+  content, quantized/integer vertex attributes, a surviving `extensionsRequired`
+  — and those tiles take the previous route with identical output.
+- `DecodedTile::stage_ms[1]` (the glTF parse) reads **0** on the extracted
+  route, and `[2]` measures the `Mesh` build alone.
 
 ### 0.2.4 → 0.3.0
 

@@ -1,6 +1,6 @@
 [package]
 name = "bevy_3d_tiles"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "OGC 3D Tiles 1.1 streaming renderer for Bevy — packed .3tz ranged reader, per-tile SSE traversal, glTF tile content, KTX2 + meshopt (+ Draco read), EXT_mesh_features picking, ECEF georeferencing, Google Photorealistic 3D Tiles. Native + WebGPU/wasm."
@@ -31,7 +31,7 @@ splats = ["dep:bevy_gaussian_splatting"]
 # `prepare_tile`. Everything is re-exported here so downstream never notices
 # the split; a host's Web Worker links the prepare crate ALONE (no bevy).
 # Version-lockstep: publish both crates together (see prepare/Cargo.toml).
-bevy_3d_tiles_prepare = { version = "0.1.0", path = "prepare" }
+bevy_3d_tiles_prepare = { version = "0.2.0", path = "prepare" }
 # Exact-pin, in lockstep with bevy-client and bevy_pointcloud_x (which pins
 # `=0.19.0` per-subcrate), so no bevy patch release enters the tree without
 # someone deciding to. It is NOT what keeps `Assets<PointCloud>` typechecking
