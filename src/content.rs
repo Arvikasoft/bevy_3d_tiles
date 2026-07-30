@@ -58,7 +58,10 @@ use super::draco;
 // The bevy-free CPU half of tile decode lives in the sibling
 // `bevy_3d_tiles_prepare` crate (offthread-decode plan S4) — moved, never
 // copied, and re-exported here so `content::DecodeError` etc. keep working.
-pub use bevy_3d_tiles_prepare::{DecodeError, DecodeStage, PreparedTile, prepare_tile};
+pub use bevy_3d_tiles_prepare::{
+    DecodeError, DecodeStage, ExtractedMaterial, ExtractedMeshes, ExtractedPrimitive, PreparedTile,
+    extract_tile_meshes, prepare_tile, prepare_tile_extracting,
+};
 
 #[cfg(feature = "splats")]
 use bevy_3d_tiles_prepare::read_accessor;
@@ -313,6 +316,13 @@ pub struct DecodedTile {
     ///   decide the S2/S4 gate.
     ///
     /// No inflate span: `.3tz` entries are STORED.
+    ///
+    /// On the **extracted** route (S5 — the hook returned
+    /// [`PreparedTile::meshes`]) spans `[0]` and `[1]` read 0 because both ran
+    /// on the hook's thread, and `[2]` measures ONLY the `Mesh` build from the
+    /// hook's buffers (`insert_attribute` + `compute_normals`) — no attribute
+    /// collect, no image decode. Comparing `[2]` across the two routes is
+    /// therefore comparing two different quantities; compare route totals.
     pub stage_ms: [f32; 4],
 }
 
@@ -379,16 +389,28 @@ fn warn_prepare_hook_once(detail: &str) {
     });
 }
 
-/// Decode a hook-prepared tile: the glb is already vanilla glTF, so only
-/// spans 1-3 (parse 2, geometry, textures) run here — span 0 moved into the
-/// hook and reads 0 in [`DecodedTile::stage_ms`].
+/// Decode a hook-prepared tile.
+///
+/// Two routes, and the hook picks by what it put in [`PreparedTile::meshes`]:
+/// * **extracted (S5)** — typed vertex buffers; only the `Mesh` build runs
+///   here (span 2), spans 0-1 moved into the hook and read 0;
+/// * **prepared GLB (S4)** — the glb is already vanilla glTF, so spans 1-3
+///   run here and only span 0 moved.
 async fn decode_prepared(
     prepared: PreparedTile,
     content_bytes: u64,
 ) -> Result<DecodedTile, DecodeError> {
     let mut stage_ms = [0f32; 4];
     let feat = prepared.features.map(FeatSource::from_prepared);
-    let mut items = decode_vanilla(&prepared.glb, feat.as_ref(), &mut stage_ms)?;
+    let mut items = match prepared.meshes {
+        Some(meshes) => {
+            let t = Instant::now();
+            let items = items_from_extracted(meshes, feat.as_ref())?;
+            stage_ms[2] += span_ms(t);
+            items
+        }
+        None => decode_vanilla(&prepared.glb, feat.as_ref(), &mut stage_ms)?,
+    };
     let t = Instant::now();
     resolve_pending_textures(&mut items).await;
     stage_ms[3] += span_ms(t);
@@ -635,7 +657,7 @@ fn decode_vanilla(
         return Ok(out); // empty content tile — legal, renders nothing
     };
     for node in scene.nodes() {
-        decode_node(&node, Mat4::IDENTITY, blob.as_deref(), feat, &mut out)?;
+        decode_node(&node, Mat4::IDENTITY, blob.as_deref(), feat, 0, &mut out)?;
     }
     stage_ms[2] += span_ms(t);
     Ok(out)
@@ -874,8 +896,18 @@ fn decode_node(
     parent: Mat4,
     blob: Option<&[u8]>,
     feat: Option<&FeatSource>,
+    depth: usize,
     out: &mut Vec<DecodedItem>,
 ) -> Result<(), String> {
+    // Tile bytes are untrusted network input and the `gltf` crate does not
+    // reject a cyclic `children` chain, so this recursion is unbounded without
+    // a cap — on wasm it runs on the FRAME thread, where a stack overflow
+    // takes the whole page. Same limit as the off-thread extraction's
+    // `MAX_NODE_DEPTH`, so a tile that declines there for depth errors here
+    // rather than crashing (a >256-deep node chain is not real tile content).
+    if depth > 256 {
+        return Err("node graph deeper than 256 — cyclic or malformed".into());
+    }
     let global = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(mesh) = node.mesh() {
         let mesh_ix = mesh.index() as u64;
@@ -898,7 +930,7 @@ fn decode_node(
         }
     }
     for child in node.children() {
-        decode_node(&child, global, blob, feat, out)?;
+        decode_node(&child, global, blob, feat, depth + 1, out)?;
     }
     Ok(())
 }
@@ -912,16 +944,23 @@ fn decode_primitive(
 ) -> Result<DecodedPrimitive, String> {
     let reader = primitive.reader(|buffer| resolve_buffer(&buffer, blob));
 
-    let positions: Vec<[f32; 3]> = reader
-        .read_positions()
-        .ok_or("primitive has no POSITION (or buffer is an external URI)")?
-        .collect();
-    let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|it| it.collect());
-    let uvs: Option<Vec<[f32; 2]>> = reader.read_tex_coords(0).map(|tc| tc.into_f32().collect());
-    let colors: Option<Vec<[f32; 4]>> = reader.read_colors(0).map(|c| c.into_rgba_f32().collect());
-    let indices: Option<Vec<u32>> = reader.read_indices().map(|ix| ix.into_u32().collect());
-    let vertex_count = positions.len();
-    let has_uv0 = uvs.is_some();
+    // Collected into the SAME buffer struct the off-thread extraction
+    // produces, so both routes then run one shared `Mesh` build and cannot
+    // drift (offthread-decode plan S5).
+    let mut buffers = ExtractedPrimitive {
+        transform: transform.to_cols_array(),
+        mesh_ix,
+        prim_ix: primitive.index() as u64,
+        material: primitive.material().index(),
+        positions: reader
+            .read_positions()
+            .ok_or("primitive has no POSITION (or buffer is an external URI)")?
+            .collect(),
+        normals: reader.read_normals().map(|it| it.collect()),
+        uvs: reader.read_tex_coords(0).map(|tc| tc.into_f32().collect()),
+        colors: reader.read_colors(0).map(|c| c.into_rgba_f32().collect()),
+        indices: reader.read_indices().map(|ix| ix.into_u32().collect()),
+    };
 
     // T8: per-feature picking — derive feature_of_triangle from `_FEATURE_ID_0`
     // (raw JSON) in the SAME index order as the mesh below.
@@ -929,13 +968,29 @@ fn decode_primitive(
         Some(ctx) => ctx.for_primitive(
             blob,
             mesh_ix,
-            primitive.index() as u64,
-            indices.as_deref(),
-            positions.len(),
+            buffers.prim_ix,
+            buffers.indices.as_deref(),
+            buffers.positions.len(),
         )?,
         None => None,
     };
 
+    let mesh = mesh_from_buffers(&mut buffers, features.as_ref());
+    let material = decode_material(&primitive.material(), blob)?;
+    Ok(DecodedPrimitive {
+        transform,
+        mesh,
+        material,
+        features,
+    })
+}
+
+/// Build one `Mesh` from plain typed vertex buffers — the ONE place a tile
+/// mesh is assembled, shared by the inline `gltf` route and the off-thread
+/// extracted route (S5). Consumes the buffers (`take`), so nothing is copied.
+fn mesh_from_buffers(p: &mut ExtractedPrimitive, features: Option<&TileFeatures>) -> Mesh {
+    let vertex_count = p.positions.len();
+    let has_uv0 = p.uvs.is_some();
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         // MAIN_WORLD + RENDER_WORLD: the camera-focus/selection raycasts read
@@ -943,13 +998,13 @@ fn decode_primitive(
         // copy is a T2 memory-budget follow-up, not a T0 risk.
         RenderAssetUsages::default(),
     );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    if let Some(uvs) = uvs {
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, std::mem::take(&mut p.positions));
+    if let Some(uvs) = p.uvs.take() {
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     }
     // Feature ids ride UV1 so a host material can tint per feature in the
     // fragment stage (see `TileFeatures::feature_of_vertex`).
-    if let Some(f) = &features {
+    if let Some(f) = features {
         // UV1 WITHOUT UV0 is a combination bevy 0.18's pbr shader never
         // handles: `pbr_fragment.wgsl` declares `var uv` only under
         // VERTEX_UVS_A but references it in VERTEX_UVS-gated code (defined by
@@ -959,35 +1014,93 @@ fn decode_primitive(
         if !has_uv0 {
             mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32, 0.0]; vertex_count]);
         }
-        mesh.insert_attribute(
-            Mesh::ATTRIBUTE_UV_1,
-            f.feature_of_vertex
-                .iter()
-                .map(|&id| [id, 0.0])
-                .collect::<Vec<[f32; 2]>>(),
-        );
+        let mut uv1: Vec<[f32; 2]> = Vec::with_capacity(f.feature_of_vertex.len());
+        uv1.extend(f.feature_of_vertex.iter().map(|&id| [id, 0.0]));
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1);
     }
-    if let Some(colors) = colors {
+    if let Some(colors) = p.colors.take() {
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     }
-    if let Some(indices) = indices {
+    if let Some(indices) = p.indices.take() {
         mesh.insert_indices(Indices::U32(indices));
     }
-    match normals {
+    match p.normals.take() {
         Some(n) => mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n),
         // Tiler output may omit normals to save bytes; smooth-compute them.
         // On wasm the decode task IS the frame thread (`spawn_local`), so this
-        // is frame time — counted in `DecodedTile::stage_ms[2]`.
+        // is frame time — counted in `DecodedTile::stage_ms[2]`, and on a
+        // normal-less tileset it DOMINATES that span even on the extracted
+        // route. ponytail: it stays here anyway. Moving it needs a bit-exact
+        // copy of bevy's angle-weighted `compute_smooth_normals` (glam
+        // `angle_between`/`acos_approx`/`try_normalize`) inside the
+        // math-dependency-free prepare crate, and "almost the same normals"
+        // is the one failure mode the parity lattice exists to forbid. Do it
+        // only if a real flight shows the extracted route is actually taken
+        // (read the `extracted / off_thread` counters) AND span 2 is still
+        // over budget — then take a `glam` dep rather than hand-rolling it.
         None => mesh.compute_normals(),
     }
+    mesh
+}
 
-    let material = decode_material(&primitive.material(), blob)?;
-    Ok(DecodedPrimitive {
-        transform,
-        mesh,
-        material,
-        features,
-    })
+/// The extracted route (S5): meshes straight from the hook's typed buffers —
+/// no `gltf` parse, no attribute collect, just `Mesh` assembly. Item order is
+/// the extraction's node-traversal order, which is the inline route's.
+fn items_from_extracted(
+    meshes: ExtractedMeshes,
+    feat: Option<&FeatSource>,
+) -> Result<Vec<DecodedItem>, String> {
+    let ExtractedMeshes {
+        mut primitives,
+        materials,
+    } = meshes;
+    let mut out = Vec::with_capacity(primitives.len());
+    for p in &mut primitives {
+        let features = match feat {
+            // `bin` is unused for a prepared feature source (the ids are
+            // already materialized) — there is no BIN chunk on this route.
+            Some(ctx) => ctx.for_primitive(
+                None,
+                p.mesh_ix,
+                p.prim_ix,
+                p.indices.as_deref(),
+                p.positions.len(),
+            )?,
+            None => None,
+        };
+        // No material index = the glTF default material, which is what the
+        // `gltf` crate hands the inline route for the same primitive.
+        let material = p
+            .material
+            .and_then(|ix| materials.get(ix))
+            .copied()
+            .unwrap_or_default();
+        let transform = Mat4::from_cols_array(&p.transform);
+        let mesh = mesh_from_buffers(p, features.as_ref());
+        out.push(DecodedItem::Mesh(Box::new(DecodedPrimitive {
+            transform,
+            mesh,
+            material: material_from_extracted(&material),
+            features,
+        })));
+    }
+    Ok(out)
+}
+
+/// Extracted material factors → the decode-time material. Textured tiles never
+/// reach this route (the extraction declines any document with an image), so
+/// there is nothing to resolve later.
+fn material_from_extracted(m: &ExtractedMaterial) -> DecodedMaterial {
+    DecodedMaterial {
+        base_color: m.base_color,
+        metallic: m.metallic,
+        roughness: m.roughness,
+        double_sided: m.double_sided,
+        unlit: m.unlit,
+        base_color_image: None,
+        base_color_ktx2: None,
+        base_color_sampler: ImageSamplerDescriptor::default(),
+    }
 }
 
 /// `POINTS`-mode primitive → point-renderer data. Positions stay in the glTF
@@ -1953,28 +2066,34 @@ mod tests {
         assert_eq!(uv0.len(), 6);
     }
 
-    /// T7: a GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,
-    /// the writer's exact output) decodes through `preprocess_basisu` + the gltf
-    /// path + the async texture-resolve pass. The `gltf` crate can't resolve the
-    /// extension and the transcoder isn't callable from the sync decode, so this
-    /// proves the source rewrite + deferred transcode work end-to-end. On native
-    /// (this test) the resolve uses bevy's `basis-universal`; we latch `BC` (as a
-    /// desktop adapter would) so UASTC → BC7 on the CPU. GLB captured from
-    /// `@gltf-transform` + `ktx create --encode uastc` (BEVY-3D-TILES T7).
+    /// A GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,
+    /// the writer's exact output). GLB captured from `@gltf-transform` +
+    /// `ktx create --encode uastc` (BEVY-3D-TILES T7). Shared by the transcode
+    /// test and the S5 decline lattice (a textured tile takes the S4 route).
+    fn basisu_fixture() -> Vec<u8> {
+        use base64::Engine;
+
+        const GLB_B64: &str = "Z2xURgIAAACUBQAAMAQAAEpTT057ImFzc2V0Ijp7ImdlbmVyYXRvciI6ImdsVEYtVHJhbnNmb3JtIHY0LjMuMCIsInZlcnNpb24iOiIyLjAifSwiYWNjZXNzb3JzIjpbeyJ0eXBlIjoiVkVDMyIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJtYXgiOlsxLDEsMF0sIm1pbiI6WzAsMCwwXSwiYnVmZmVyVmlldyI6MSwiYnl0ZU9mZnNldCI6MH0seyJ0eXBlIjoiVkVDMiIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJidWZmZXJWaWV3IjoxLCJieXRlT2Zmc2V0IjoxMn0seyJ0eXBlIjoiU0NBTEFSIiwiY29tcG9uZW50VHlwZSI6NTEyNSwiY291bnQiOjMsImJ1ZmZlclZpZXciOjIsImJ5dGVPZmZzZXQiOjB9XSwiYnVmZmVyVmlld3MiOlt7ImJ1ZmZlciI6MCwiYnl0ZU9mZnNldCI6NzIsImJ5dGVMZW5ndGgiOjI1NH0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjYwLCJieXRlU3RyaWRlIjoyMCwidGFyZ2V0IjozNDk2Mn0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjYwLCJieXRlTGVuZ3RoIjoxMiwidGFyZ2V0IjozNDk2M31dLCJzYW1wbGVycyI6W3sid3JhcFMiOjEwNDk3LCJ3cmFwVCI6MTA0OTd9XSwidGV4dHVyZXMiOlt7InNhbXBsZXIiOjAsImV4dGVuc2lvbnMiOnsiS0hSX3RleHR1cmVfYmFzaXN1Ijp7InNvdXJjZSI6MH19fV0sImltYWdlcyI6W3sibmFtZSI6ImJhc2UiLCJtaW1lVHlwZSI6ImltYWdlL2t0eDIiLCJidWZmZXJWaWV3IjowfV0sImJ1ZmZlcnMiOlt7ImJ5dGVMZW5ndGgiOjMyOH1dLCJtYXRlcmlhbHMiOlt7Im5hbWUiOiJtIiwicGJyTWV0YWxsaWNSb3VnaG5lc3MiOnsiYmFzZUNvbG9yVGV4dHVyZSI6eyJpbmRleCI6MH19fV0sIm1lc2hlcyI6W3sicHJpbWl0aXZlcyI6W3siYXR0cmlidXRlcyI6eyJQT1NJVElPTiI6MCwiVEVYQ09PUkRfMCI6MX0sIm1vZGUiOjQsIm1hdGVyaWFsIjowLCJpbmRpY2VzIjoyfV19XSwibm9kZXMiOlt7Im1lc2giOjB9XSwic2NlbmVzIjpbeyJub2RlcyI6WzBdfV0sImV4dGVuc2lvbnNVc2VkIjpbIktIUl90ZXh0dXJlX2Jhc2lzdSJdLCJleHRlbnNpb25zUmVxdWlyZWQiOlsiS0hSX3RleHR1cmVfYmFzaXN1Il19SAEAAEJJTgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAQAAAAIAAACrS1RYIDIwuw0KGgoAAAAAAQAAAAgAAAAIAAAAAAAAAAAAAAABAAAAAQAAAAIAAABoAAAALAAAAJQAAABQAAAAAAAAAAAAAAAAAAAAAAAAAOQAAAAAAAAAGgAAAAAAAABAAAAAAAAAACwAAAAAAAAAAgAoAKYBAgADAwAAEAAAAAAAAAAAAH8AAAAAAAAAAAD/////LAAAAEtUWHdyaXRlcgBrdHggY3JlYXRlIHY0LjQuMiAvIGxpYmt0eCB2NC40LjIAHAAAAEtUWHdyaXRlclNjUGFyYW1zAC0tenN0ZCAxOAAotS/9IECNAABIVwGZ5/87vgEAAgDNjCADRwAA";
+        base64::engine::general_purpose::STANDARD
+            .decode(GLB_B64)
+            .unwrap()
+    }
+
+    /// T7: the basisu tile decodes through `preprocess_basisu`, the gltf path
+    /// and the async texture-resolve pass. The `gltf` crate can't resolve the
+    /// extension and the transcoder isn't callable from the sync decode, so
+    /// this proves the source rewrite plus deferred transcode work end-to-end.
+    /// On native (this test) the resolve uses bevy's `basis-universal`; we
+    /// latch `BC` (as a desktop adapter would) so UASTC becomes BC7 on the CPU.
     #[test]
     fn decodes_basisu_ktx2_base_color() {
-        use base64::Engine;
         use bevy::tasks::block_on;
 
         // Pretend the adapter supports BC (desktop WebGPU). OnceLock first-wins;
         // no other test latches it, and it only affects KTX2 decode.
         set_supported_compressed_formats(CompressedImageFormats::BC);
 
-        const GLB_B64: &str = "Z2xURgIAAACUBQAAMAQAAEpTT057ImFzc2V0Ijp7ImdlbmVyYXRvciI6ImdsVEYtVHJhbnNmb3JtIHY0LjMuMCIsInZlcnNpb24iOiIyLjAifSwiYWNjZXNzb3JzIjpbeyJ0eXBlIjoiVkVDMyIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJtYXgiOlsxLDEsMF0sIm1pbiI6WzAsMCwwXSwiYnVmZmVyVmlldyI6MSwiYnl0ZU9mZnNldCI6MH0seyJ0eXBlIjoiVkVDMiIsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjozLCJidWZmZXJWaWV3IjoxLCJieXRlT2Zmc2V0IjoxMn0seyJ0eXBlIjoiU0NBTEFSIiwiY29tcG9uZW50VHlwZSI6NTEyNSwiY291bnQiOjMsImJ1ZmZlclZpZXciOjIsImJ5dGVPZmZzZXQiOjB9XSwiYnVmZmVyVmlld3MiOlt7ImJ1ZmZlciI6MCwiYnl0ZU9mZnNldCI6NzIsImJ5dGVMZW5ndGgiOjI1NH0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjYwLCJieXRlU3RyaWRlIjoyMCwidGFyZ2V0IjozNDk2Mn0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjYwLCJieXRlTGVuZ3RoIjoxMiwidGFyZ2V0IjozNDk2M31dLCJzYW1wbGVycyI6W3sid3JhcFMiOjEwNDk3LCJ3cmFwVCI6MTA0OTd9XSwidGV4dHVyZXMiOlt7InNhbXBsZXIiOjAsImV4dGVuc2lvbnMiOnsiS0hSX3RleHR1cmVfYmFzaXN1Ijp7InNvdXJjZSI6MH19fV0sImltYWdlcyI6W3sibmFtZSI6ImJhc2UiLCJtaW1lVHlwZSI6ImltYWdlL2t0eDIiLCJidWZmZXJWaWV3IjowfV0sImJ1ZmZlcnMiOlt7ImJ5dGVMZW5ndGgiOjMyOH1dLCJtYXRlcmlhbHMiOlt7Im5hbWUiOiJtIiwicGJyTWV0YWxsaWNSb3VnaG5lc3MiOnsiYmFzZUNvbG9yVGV4dHVyZSI6eyJpbmRleCI6MH19fV0sIm1lc2hlcyI6W3sicHJpbWl0aXZlcyI6W3siYXR0cmlidXRlcyI6eyJQT1NJVElPTiI6MCwiVEVYQ09PUkRfMCI6MX0sIm1vZGUiOjQsIm1hdGVyaWFsIjowLCJpbmRpY2VzIjoyfV19XSwibm9kZXMiOlt7Im1lc2giOjB9XSwic2NlbmVzIjpbeyJub2RlcyI6WzBdfV0sImV4dGVuc2lvbnNVc2VkIjpbIktIUl90ZXh0dXJlX2Jhc2lzdSJdLCJleHRlbnNpb25zUmVxdWlyZWQiOlsiS0hSX3RleHR1cmVfYmFzaXN1Il19SAEAAEJJTgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAQAAAAIAAACrS1RYIDIwuw0KGgoAAAAAAQAAAAgAAAAIAAAAAAAAAAAAAAABAAAAAQAAAAIAAABoAAAALAAAAJQAAABQAAAAAAAAAAAAAAAAAAAAAAAAAOQAAAAAAAAAGgAAAAAAAABAAAAAAAAAACwAAAAAAAAAAgAoAKYBAgADAwAAEAAAAAAAAAAAAH8AAAAAAAAAAAD/////LAAAAEtUWHdyaXRlcgBrdHggY3JlYXRlIHY0LjQuMiAvIGxpYmt0eCB2NC40LjIAHAAAAEtUWHdyaXRlclNjUGFyYW1zAC0tenN0ZCAxOAAotS/9IECNAABIVwGZ5/87vgEAAgDNjCADRwAA";
-        let glb = base64::engine::general_purpose::STANDARD
-            .decode(GLB_B64)
-            .unwrap();
-
+        let glb = basisu_fixture();
         let tile = block_on(decode_tile(&glb, false)).expect("ktx2 decode");
         assert_eq!(tile.items.len(), 1);
         let DecodedItem::Mesh(p) = &tile.items[0] else {
@@ -2049,7 +2168,13 @@ mod tests {
                 panic!("expected mesh items");
             };
             assert_eq!(x.transform, y.transform, "primitive transform");
-            for attr in [Mesh::ATTRIBUTE_POSITION, Mesh::ATTRIBUTE_NORMAL] {
+            for attr in [
+                Mesh::ATTRIBUTE_POSITION,
+                Mesh::ATTRIBUTE_NORMAL,
+                Mesh::ATTRIBUTE_UV_0,
+                Mesh::ATTRIBUTE_UV_1,
+                Mesh::ATTRIBUTE_COLOR,
+            ] {
                 assert_eq!(
                     x.mesh.attribute(attr).map(|v| v.get_bytes()),
                     y.mesh.attribute(attr).map(|v| v.get_bytes()),
@@ -2058,6 +2183,25 @@ mod tests {
             }
             assert_eq!(x.mesh.attributes().count(), y.mesh.attributes().count());
             assert_eq!(indices_u32(&x.mesh), indices_u32(&y.mesh), "indices");
+            // Material factors/flags, and whether a texture resolved at all
+            // (the image CONTENTS are the transcoder's business, tested
+            // separately — presence is what differs if a route drops one).
+            let (mx, my) = (&x.material, &y.material);
+            assert_eq!(mx.base_color, my.base_color, "base_color");
+            assert_eq!(mx.metallic, my.metallic, "metallic");
+            assert_eq!(mx.roughness, my.roughness, "roughness");
+            assert_eq!(mx.double_sided, my.double_sided, "double_sided");
+            assert_eq!(mx.unlit, my.unlit, "unlit");
+            assert_eq!(
+                mx.base_color_image.is_some(),
+                my.base_color_image.is_some(),
+                "base color texture presence"
+            );
+            assert_eq!(
+                mx.base_color_ktx2.is_some(),
+                my.base_color_ktx2.is_some(),
+                "pending ktx2 presence"
+            );
             match (&x.features, &y.features) {
                 (None, None) => {}
                 (Some(fx), Some(fy)) => {
@@ -2136,6 +2280,275 @@ mod tests {
         assert_tiles_equal(&inline, &fallen);
         // The fallback IS the inline path — span 0 is back on this side.
         assert!(fallen.stage_ms[0] > 0.0, "inline prep span recorded");
+    }
+
+    // ── S5 extracted route (offthread-decode plan): buffers ≡ inline ────────
+
+    /// Canned in-process S5 hook: `prepare_tile_extracting` — prep AND
+    /// geometry extraction, the pair the real worker runs in its own wasm.
+    fn canned_extract_hook() -> Arc<crate::api::TilePrepareFn> {
+        Arc::new(|bytes, geo| Box::pin(async move { prepare_tile_extracting(&bytes, geo) }))
+    }
+
+    /// A THREE-deep node chain — TRS with a real rotation + non-uniform scale,
+    /// then a `matrix` node, then a translated mesh node — plus NORMAL,
+    /// TEXCOORD_0, u16 indices and an authored material. Everything the
+    /// extracted route composes by hand instead of through `gltf` + `glam`.
+    fn nested_transform_fixture() -> Vec<u8> {
+        let positions: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let normals: [[f32; 3]; 3] = [[0.0, 0.0, 1.0]; 3];
+        let uvs: [[f32; 2]; 3] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let indices: [u16; 3] = [0, 1, 2];
+
+        let mut bin: Vec<u8> = Vec::new();
+        for v in positions.iter().flatten().chain(normals.iter().flatten()) {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        let uv_off = bin.len();
+        for v in uvs.iter().flatten() {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        let idx_off = bin.len();
+        for i in indices {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [
+                // 22.5° about Y, non-uniform scale, offset — T×R×S order matters.
+                { "children": [1], "translation": [5.0, -2.0, 0.5],
+                  "rotation": [0.0, 0.19509032, 0.0, 0.98078528], "scale": [2.0, 3.0, 4.0] },
+                // A `matrix` node in the middle of the chain.
+                { "children": [2],
+                  "matrix": [0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0,
+                             0.0, 0.0, 1.0, 0.0, 0.25, 0.5, -0.75, 1.0] },
+                { "mesh": 0, "translation": [1.0, 2.0, 3.0] }
+            ],
+            "meshes": [{ "primitives": [{
+                "attributes": { "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 },
+                "indices": 3, "mode": 4, "material": 0
+            }]}],
+            "materials": [{
+                "doubleSided": true,
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [0.2, 0.4, 0.6, 1.0],
+                    "metallicFactor": 0.25, "roughnessFactor": 0.75
+                }
+            }],
+            "accessors": [
+                { "bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                  "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0] },
+                { "bufferView": 0, "byteOffset": 36, "componentType": 5126, "count": 3, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" },
+                { "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": uv_off },
+                { "buffer": 0, "byteOffset": uv_off, "byteLength": idx_off - uv_off },
+                { "buffer": 0, "byteOffset": idx_off, "byteLength": 6 }
+            ],
+            "buffers": [{ "byteLength": bin.len() }],
+        });
+        assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin)
+    }
+
+    /// The transform math is the one part of the extraction written by hand
+    /// (the prepare crate has no `glam`), so pin it against the real thing:
+    /// a rotated + non-uniformly scaled chain through a `matrix` node must
+    /// come out of the extracted route BIT-identical to `gltf` + `glam`.
+    /// Materials, NORMAL/UV attributes and u16→u32 index widening ride along.
+    #[test]
+    fn extracted_route_matches_inline_on_a_nested_transform_chain() {
+        use bevy::tasks::block_on;
+
+        let glb = nested_transform_fixture();
+        // The route under test really is the extracted one — without this a
+        // future decline rule makes the whole test compare inline to inline.
+        assert!(
+            prepare_tile_extracting(&glb, false)
+                .unwrap()
+                .is_some_and(|p| p.meshes.is_some()),
+            "fixture must extract"
+        );
+        let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+        let hooked = block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook())))
+            .expect("extracted decode");
+        assert_tiles_equal(&inline, &hooked);
+
+        let DecodedItem::Mesh(p) = &hooked.items[0] else {
+            panic!("expected mesh")
+        };
+        // Not identity — a fixture that composed to identity would prove nothing.
+        assert_ne!(p.transform, Mat4::IDENTITY);
+        assert_eq!(p.material.base_color, [0.2, 0.4, 0.6, 1.0]);
+        assert_eq!(indices_u32(&p.mesh), Some(vec![0, 1, 2]), "u16 → u32");
+        assert!(p.mesh.attribute(Mesh::ATTRIBUTE_NORMAL).is_some());
+        assert!(p.mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_some());
+    }
+
+    /// S5 gate test (a): the extracted route — typed vertex buffers, no glTF
+    /// parse on this side at all — decodes byte-identically to the inline
+    /// path, on the meshopt fixture (COLOR_0, u32 indices, a TRS node) and on
+    /// the meshopt+RTC+copyright+georeferenced one.
+    ///
+    /// Both fixtures declare `EXT_meshopt_compression` **required**, like our
+    /// own tiler's output, so the `meshes.is_some()` guards below are also what
+    /// pins `decode_meshopt_views`' extension strip: leave the extension in
+    /// `extensionsRequired` and `extract_tile_meshes` declines the document,
+    /// silently costing a meshopt scene the whole S5 geometry saving.
+    #[test]
+    fn extracted_route_matches_inline_on_meshopt_fixtures() {
+        use bevy::tasks::block_on;
+
+        let hook = canned_extract_hook();
+        for (glb, geo) in [
+            (meshopt_fixture(), false),
+            (meshopt_fixture(), true),
+            (combined_fixture(), true),
+        ] {
+            // The route under test really is the extracted one.
+            assert!(
+                prepare_tile_extracting(&glb, geo)
+                    .unwrap()
+                    .is_some_and(|p| p.meshes.is_some()),
+                "fixture must extract (geo={geo})"
+            );
+            let inline = block_on(decode_tile(&glb, geo)).expect("inline decode");
+            let hooked =
+                block_on(decode_tile_with(&glb, geo, Some(&hook))).expect("extracted decode");
+            assert_tiles_equal(&inline, &hooked);
+            // Both movable spans really moved: prep AND the glTF parse are the
+            // hook's now, and span 2 is Mesh-from-buffers only.
+            assert_eq!(hooked.stage_ms[0], 0.0, "span 0 lives in the hook");
+            assert_eq!(hooked.stage_ms[1], 0.0, "no gltf parse on this route");
+        }
+    }
+
+    /// The extracted reply carries buffers INSTEAD of a container — a rebuilt
+    /// GLB nobody parses is wasted CPU on the worker and wasted bytes on the
+    /// wire, so `glb` must come back empty.
+    #[test]
+    fn extracted_reply_carries_buffers_not_a_container() {
+        let glb = meshopt_fixture();
+        let prepared = prepare_tile_extracting(&glb, false)
+            .unwrap()
+            .expect("accepted");
+        assert!(
+            prepared.glb.is_empty(),
+            "no container on the extracted route"
+        );
+        let meshes = prepared.meshes.expect("geometry extracted");
+        assert_eq!(meshes.primitives.len(), 1);
+        let p = &meshes.primitives[0];
+        assert_eq!(p.positions.len(), 6);
+        assert_eq!(p.colors.as_ref().map(Vec::len), Some(6));
+        assert_eq!(p.indices.as_ref().map(Vec::len), Some(12));
+        assert!(p.normals.is_none(), "fixture has no NORMAL");
+        // Node translation [10,0,0] flattened into the primitive transform.
+        assert_eq!(&p.transform[12..15], &[10.0, 0.0, 0.0]);
+        // `prepare_tile` (S4) still returns a container and no buffers.
+        let s4 = prepare_tile(&glb, false).unwrap().expect("accepted");
+        assert!(!s4.glb.is_empty() && s4.meshes.is_none());
+    }
+
+    /// S5 gate test (c): feature picking survives the extracted route — the
+    /// per-vertex ids ride the same side-band, and the triangle table is built
+    /// from the extracted index buffer.
+    #[test]
+    fn extracted_route_keeps_feature_picking() {
+        use bevy::tasks::block_on;
+
+        let glb = feature_fixture();
+        // As above: guard against the test degenerating into inline-vs-inline.
+        assert!(
+            prepare_tile_extracting(&glb, false)
+                .unwrap()
+                .is_some_and(|p| p.meshes.is_some()),
+            "fixture must extract"
+        );
+        let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+        let hooked = block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook())))
+            .expect("extracted decode");
+        assert_tiles_equal(&inline, &hooked);
+        let DecodedItem::Mesh(p) = &hooked.items[0] else {
+            panic!("expected mesh")
+        };
+        let f = p
+            .features
+            .as_ref()
+            .expect("features on the extracted route");
+        assert_eq!(f.feature_of_triangle, vec![0, 1]);
+        assert_eq!(f.feature_of_vertex, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        // UV1 (feature ids) + the backfilled zero UV0 come from the SHARED
+        // mesh builder, so they must be on this route too.
+        assert!(p.mesh.attribute(Mesh::ATTRIBUTE_UV_1).is_some());
+        assert!(p.mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_some());
+    }
+
+    /// S5 gate test (b), the decline lattice: content the extraction cannot
+    /// reproduce exactly falls back to the S4 container route (or all the way
+    /// inline) and renders identically. A textured tile is the live one — it
+    /// decodes for real through both routes.
+    #[test]
+    fn extraction_declines_textured_tile_to_the_s4_route() {
+        use bevy::tasks::block_on;
+
+        set_supported_compressed_formats(CompressedImageFormats::BC);
+        let glb = basisu_fixture();
+        // Declined: buffers absent, container present — the S4 payload.
+        let prepared = prepare_tile_extracting(&glb, false)
+            .unwrap()
+            .expect("accepted");
+        assert!(prepared.meshes.is_none(), "a textured tile must decline");
+        assert!(!prepared.glb.is_empty(), "declining still prepares the glb");
+
+        let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+        let hooked = block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook())))
+            .expect("declined-to-S4 decode");
+        assert_tiles_equal(&inline, &hooked);
+        let DecodedItem::Mesh(p) = &hooked.items[0] else {
+            panic!("expected mesh")
+        };
+        assert!(
+            p.material.base_color_image.is_some(),
+            "texture still resolves through the declined route"
+        );
+    }
+
+    /// The rest of the lattice: Draco and splat content declines the whole
+    /// trip (`Ok(None)` — there is no decoder for it here at all), and the
+    /// cheap pre-dispatch triage agrees, so a host never pays a round trip to
+    /// learn it. Their rendering fallback is covered by
+    /// `declining_hook_falls_back_inline`.
+    #[test]
+    fn extraction_declines_draco_and_splat_content() {
+        for json in [
+            r#"{"extensionsRequired":["KHR_draco_mesh_compression"]}"#,
+            r#"{"extensionsUsed":["KHR_gaussian_splatting"]}"#,
+        ] {
+            let b = json.as_bytes();
+            assert!(
+                prepare_tile_extracting(b, true).unwrap().is_none(),
+                "{json}"
+            );
+            assert!(
+                bevy_3d_tiles_prepare::extract_would_decline(b, true),
+                "{json}"
+            );
+        }
+        // ...and a vanilla tile is NOT declined by the S5 triage, unlike S4's:
+        // its geometry is exactly what the trip is for.
+        let vanilla = br#"{"asset":{"version":"2.0"}}"#;
+        assert!(bevy_3d_tiles_prepare::prepare_would_decline(vanilla, false));
+        assert!(!bevy_3d_tiles_prepare::extract_would_decline(
+            vanilla, false
+        ));
     }
 
     /// An erroring hook warns once and falls back inline — never fatal.

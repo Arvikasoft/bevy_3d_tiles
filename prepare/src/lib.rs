@@ -16,7 +16,10 @@
 
 use std::collections::HashMap;
 
+mod extract;
 pub mod meshopt;
+
+pub use extract::{ExtractedMaterial, ExtractedMeshes, ExtractedPrimitive, extract_tile_meshes};
 
 /// Typed failure surface of tile-content decoding — the error of
 /// `decode_tile` / `decode_glb` (in `bevy_3d_tiles`), [`prepare_tile`], and
@@ -716,11 +719,24 @@ pub struct PreparedFeatures {
 
 /// The output of [`prepare_tile`]: a plain (extension-free) glTF binary the
 /// strict `gltf` crate accepts, plus the side-band data extracted on the way.
+///
+/// Geometry travels one of two ways, and `meshes` says which:
+/// * `meshes: None` (S4) — `glb` holds the prepared container and the consumer
+///   parses it with the `gltf` crate;
+/// * `meshes: Some(_)` (S5, [`prepare_tile_extracting`]) — the geometry is
+///   already typed buffers, the consumer never parses glTF at all, and `glb`
+///   is **empty** (rebuilding a container nobody reads is pure cost, on both
+///   the producing thread and the wire).
 pub struct PreparedTile {
     /// Vanilla GLB — meshopt views decoded, basisu sources rewritten,
     /// CESIUM_RTC / planetary offsets stripped. For a tile that needed no
-    /// rewrite these are the input bytes unchanged.
+    /// rewrite these are the input bytes unchanged; **empty** when `meshes`
+    /// carries the geometry instead.
     pub glb: Vec<u8>,
+    /// Extracted geometry (S5). `None` = the consumer decodes `glb` itself,
+    /// either because extraction was not asked for ([`prepare_tile`]) or
+    /// because [`extract_tile_meshes`] declined this tile's content.
+    pub meshes: Option<ExtractedMeshes>,
     /// `CESIUM_RTC` center or extracted planetary root offset (ECEF metres).
     pub rtc_center: Option<[f64; 3]>,
     /// glTF `asset.copyright` (attribution overlay side-band).
@@ -749,6 +765,39 @@ pub fn prepare_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
     declines(&Marks::scan(json_chunk), georeferenced)
 }
 
+/// [`prepare_would_decline`] for [`prepare_tile_extracting`], relaxed by
+/// exactly one case: a vanilla tile — nothing to rewrite, so nothing for
+/// `prepare_tile` to do — IS worth the trip under S5, because the parse +
+/// attribute collect its geometry extraction saves is the cost S5 exists to
+/// move.
+///
+/// The relaxation is conditional on the tile being extractable at all: a
+/// vanilla tile [`extract_tile_meshes`] will decline anyway would pay a full
+/// round trip (two worker-side copies of a multi-MB GLB) to get its own bytes
+/// back and decode inline — strictly worse than S4. The two decline reasons a
+/// marker scan can see, an image/texture and a surviving `extensionsRequired`
+/// (`KHR_mesh_quantization` and anything else no pass here handles), keep
+/// declining here.
+///
+/// Ceiling: the decline reasons that live in *values* rather than keys — a
+/// non-TRIANGLES `mode`, a sparse or non-`FLOAT` attribute, a VEC3 `COLOR_0` —
+/// have no marker to scan for (`mode` is a number, the rest are accessor
+/// properties), so those tiles still pay one wasted round trip each. Catching
+/// them means parsing the JSON twice, which costs more than the trip saves.
+pub fn extract_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
+    let Ok((json_chunk, _)) = split_glb(bytes) else {
+        return false;
+    };
+    let marks = Marks::scan(json_chunk);
+    // Marker scan, not a parse: `"images":[]` reads as textured and keeps the
+    // S4 answer, which is the safe direction (one skipped extraction, never a
+    // wasted trip).
+    let unextractable = memmem(json_chunk, b"\"images\"")
+        || memmem(json_chunk, b"\"textures\"")
+        || memmem(json_chunk, b"\"extensionsRequired\"");
+    declines(&marks, georeferenced) && (unextractable || marks.draco || marks.splat)
+}
+
 /// The predicate [`prepare_tile`] opens with, in ONE place — an off-thread
 /// caller needs the same answer before it dispatches ([`prepare_would_decline`])
 /// and the two drifting apart is a silent round trip per tile.
@@ -771,15 +820,44 @@ pub fn prepare_tile(
     bytes: &[u8],
     georeferenced: bool,
 ) -> Result<Option<PreparedTile>, DecodeError> {
+    prepare_tile_inner(bytes, georeferenced, false)
+}
+
+/// [`prepare_tile`] plus geometry extraction (offthread-decode plan S5): the
+/// same single JSON parse also yields [`ExtractedMeshes`], so the consumer
+/// builds meshes straight from typed buffers and skips the `gltf` parse and
+/// the per-primitive attribute collect entirely (the dominant remaining
+/// main-thread streaming cost — 6-9 ms/tile on bevy 0.19).
+///
+/// Same three outcomes as [`prepare_tile`], plus one shade: extraction is
+/// best-effort. Content it cannot reproduce byte-identically (textures,
+/// non-triangle primitives, quantized attributes — see [`extract_tile_meshes`])
+/// comes back as an ordinary S4 [`PreparedTile`] with `meshes: None`, which
+/// the consumer decodes exactly as before.
+pub fn prepare_tile_extracting(
+    bytes: &[u8],
+    georeferenced: bool,
+) -> Result<Option<PreparedTile>, DecodeError> {
+    prepare_tile_inner(bytes, georeferenced, true)
+}
+
+fn prepare_tile_inner(
+    bytes: &[u8],
+    georeferenced: bool,
+    extract: bool,
+) -> Result<Option<PreparedTile>, DecodeError> {
     let (json_chunk, bin) = split_glb(bytes)?;
     let marks = Marks::scan(json_chunk);
-    if declines(&marks, georeferenced) {
-        if marks.draco || marks.splat {
-            return Ok(None); // needs a platform decoder this crate has not got
-        }
-        // Vanilla and not georeferenced: no rewrite, nothing to extract.
+    if marks.draco || marks.splat {
+        return Ok(None); // needs a platform decoder this crate has not got
+    }
+    // Vanilla and not georeferenced: no rewrite, nothing to extract from the
+    // JSON side-band. Without S5 there is no reason to parse it at all; WITH
+    // S5 the geometry is the whole point of the trip, so it falls through.
+    if !extract && declines(&marks, georeferenced) {
         return Ok(Some(PreparedTile {
             glb: bytes.to_vec(),
+            meshes: None,
             rtc_center: None,
             copyright: None,
             features: None,
@@ -827,7 +905,18 @@ pub fn prepare_tile(
     }
     let bin = new_bin.as_deref().or(bin);
 
-    let glb = if nodes_rebased || stripped || marks.meshopt || marks.basisu {
+    // S5: geometry off the document we already hold. Runs BEFORE the feature
+    // pass (which consumes `json`) and before the container rebuild — when it
+    // succeeds there is no container to rebuild, because nobody will parse one.
+    let meshes = if extract {
+        extract_tile_meshes(&json, bin)?
+    } else {
+        None
+    };
+
+    let glb = if meshes.is_some() {
+        Vec::new()
+    } else if nodes_rebased || stripped || marks.meshopt || marks.basisu {
         let json_bytes = serde_json::to_vec(&json).map_err(|e| format!("tile splice json: {e}"))?;
         assemble_glb(&json_bytes, bin.unwrap_or(&[]))
     } else {
@@ -856,6 +945,7 @@ pub fn prepare_tile(
 
     Ok(Some(PreparedTile {
         glb,
+        meshes,
         rtc_center,
         copyright,
         features,
@@ -911,6 +1001,57 @@ mod tests {
                 "should prepare: {json} ({geo})"
             );
         }
+    }
+
+    /// The S5 triage relaxes `prepare_would_decline` for exactly one shape —
+    /// an untextured vanilla tile, whose geometry extraction is the whole
+    /// point. Everything `prepare_would_decline` rejects for having no work to
+    /// do AND no extractable geometry must still be rejected, or the host pays
+    /// a full round trip (two multi-MB copies) to get its own bytes back.
+    #[test]
+    fn extract_would_decline_still_rejects_textured_vanilla_tiles() {
+        // The relaxation: nothing to rewrite, nothing textured — dispatch it.
+        let plain = br#"{"asset":{"version":"2.0"},"meshes":[]}"#;
+        assert!(prepare_would_decline(plain, false));
+        assert!(!extract_would_decline(plain, false), "S5 dispatches this");
+
+        for json in [
+            // A plain PNG/JPEG-textured tile: no basisu, no meshopt, no RTC —
+            // `prepare_tile` echoes the bytes and extraction declines on the
+            // images, so the trip learns nothing.
+            r#"{"asset":{"version":"2.0"},"images":[{"mimeType":"image/png"}]}"#,
+            r#"{"asset":{"version":"2.0"},"textures":[{"source":0}]}"#,
+            // And the pre-existing no-decoder cases stay declined.
+            r#"{"extensionsUsed":["KHR_draco_mesh_compression"]}"#,
+            r#"{"extensionsUsed":["KHR_gaussian_splatting"]}"#,
+            // Untextured, nothing to rewrite, but `extract_tile_meshes` declines
+            // any surviving `extensionsRequired` — so does the triage, or every
+            // quantized tile pays the round trip to learn that.
+            r#"{"extensionsRequired":["KHR_mesh_quantization"],"meshes":[]}"#,
+        ] {
+            assert!(
+                extract_would_decline(json.as_bytes(), false),
+                "should decline: {json}"
+            );
+        }
+        // Textured but with real prep waiting (basisu) is still dispatched —
+        // that is S4 work, unchanged.
+        let basisu =
+            br#"{"extensionsUsed":["KHR_texture_basisu"],"images":[{"mimeType":"image/ktx2"}]}"#;
+        assert!(!extract_would_decline(basisu, false));
+
+        // A meshopt tile declares EXT_meshopt_compression REQUIRED (our tiler
+        // does: `setRequired(true)` in tile_mesh.mjs), so the
+        // `extensionsRequired` marker above DOES match it — it is only the
+        // `declines()` short-circuit that saves the dispatch, because a meshopt
+        // tile has real prep waiting. It must keep dispatching: the decode
+        // strips the extension once the views are decoded, and extraction then
+        // applies, which is where the whole geometry saving on a meshopt scene
+        // comes from. The marker half of this predicate must never be allowed
+        // to reach it.
+        let meshopt = br#"{"extensionsUsed":["EXT_meshopt_compression"],"extensionsRequired":["EXT_meshopt_compression"]}"#;
+        assert!(!extract_would_decline(meshopt, false), "meshopt dispatches");
+        assert!(!extract_would_decline(meshopt, true), "meshopt dispatches");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "bevy_3d_tiles_prepare"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "CPU-side tile preparation for bevy_3d_tiles: 3D Tiles GLB → plain glTF bytes (meshopt decode, basisu/CESIUM_RTC rewrites, feature-metadata extraction) with no bevy dependency — runnable inside a Web Worker's own wasm module."
