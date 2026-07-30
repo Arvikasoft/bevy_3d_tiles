@@ -73,7 +73,7 @@ pub use bevy_3d_tiles_prepare::meshopt;
 pub use api::PointTileMaterial;
 pub use api::{
     EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, TilePrepareFn,
-    TilePrepareHook, TilePriorityClass, Tiles3dCamera, Tiles3dSet,
+    TilePrepareHook, TilePriorityClass, TileSseMultiplier, Tiles3dCamera, Tiles3dSet,
 };
 
 use archive::Archive3tz;
@@ -134,6 +134,17 @@ pub struct Tiles3dConfig {
     pub max_concurrent_loads: usize,
     /// Main-thread time box: max decoded tiles turned into entities per frame.
     pub max_spawns_per_frame: usize,
+    /// Main-thread time box for RE-spawns: max hidden-tile re-entries turned
+    /// back into entities per frame, **GLOBAL across every tileset** (like
+    /// `max_concurrent_loads`, unlike the per-set counter this replaced).
+    ///
+    /// Deliberately NOT `max_spawns_per_frame`: that one boxes DECODE (a wasm
+    /// host lowers it to 2 because one tile's GLB+meshopt decode is tens of ms
+    /// on the single main thread), while a respawn re-uses the already-decoded
+    /// assets and costs a `spawn` plus whatever the host's `Added<…>` adapters
+    /// do. Sharing the field made a 23-tileset scene refill a re-entered area
+    /// at 2 tiles/set/frame — seconds of visible catch-up under an orbit.
+    pub max_respawns_per_frame: usize,
     /// Frames an out-of-cut tile stays resident before eviction (zoom/orbit
     /// in-and-back reuse, mirrors basemap). Generous: P3DT content is never
     /// CAS-cached (ToS), so every eviction is a real re-download and the
@@ -212,6 +223,12 @@ impl Default for Tiles3dConfig {
             // real fix for the decode hitch is a worker pool (off-main-thread).
             max_concurrent_loads: 16,
             max_spawns_per_frame: 4,
+            // Generous next to the decode box: no fetch, no decode, no asset
+            // insert and no GPU upload — a re-entering tile is a `spawn` against
+            // handles that are already live. Sized so a whole re-entered ground
+            // area (hundreds of tiles) refills in a handful of frames instead of
+            // trickling in visibly behind the camera.
+            max_respawns_per_frame: 64,
             grace_frames: 600,
             max_resident_tiles: 1024,
             // Comfortable working set before reclaiming: the grace window keeps
@@ -307,9 +324,14 @@ enum TileSlot {
     InFlight {
         generation: u64,
     },
-    /// Content spawned (hidden until selected by the render cut).
+    /// Content decoded and RESIDENT (its assets are alive in `Assets<*>`,
+    /// held by `ActiveTileset::caches[tile]`).
     Ready {
-        entity: Entity,
+        /// The spawned tile-root entity, or `None` while the tile is out of the
+        /// render cut: a hidden tile gives up its ENTITIES but keeps its assets
+        /// (0.2.4 hidden-tile despawn — see [`CachedItem`]). Re-entry respawns
+        /// from the cache; only eviction drops the assets.
+        entity: Option<Entity>,
         /// Decoded main-world CPU bytes (`content::resident_cost_bytes`) —
         /// what the memory-pressure valve sums; see
         /// [`Tiles3dConfig::memory_budget_bytes`].
@@ -317,6 +339,39 @@ enum TileSlot {
     },
     /// Terminal fetch/decode failure — never re-queued this session.
     Failed,
+}
+
+/// One resident tile's spawn recipe, built once at decode time and kept for the
+/// life of the [`TileSlot::Ready`] slot (0.2.4 hidden-tile despawn).
+///
+/// Holding these handles is what keeps a hidden tile's meshes/textures in
+/// `Assets<*>` — [`Tiles3dSets::resident_content_bytes`] is deliberately
+/// unchanged by a despawn, because the memory really is still resident. A
+/// re-entering tile therefore costs a `spawn` (the GPU upload reuses the live
+/// `RenderAssets`), never a re-download or re-decode; only eviction drops the
+/// cache and reclaims the bytes.
+///
+/// The tile-root transform is NOT cached: it is recomposed at respawn from the
+/// CURRENT [`EcefOrigin`], so a tile that was hidden across an origin rebase
+/// comes back in the right place.
+#[derive(Clone)]
+enum CachedItem {
+    Mesh {
+        mesh: Handle<Mesh>,
+        material: Handle<StandardMaterial>,
+        transform: Transform,
+        pick: Option<TileFeaturePick>,
+    },
+    #[cfg(feature = "points")]
+    Points {
+        cloud: Handle<PointCloud>,
+        transform: Transform,
+    },
+    #[cfg(feature = "splats")]
+    Splat {
+        cloud: Handle<PlanarGaussian3d>,
+        transform: Transform,
+    },
 }
 
 /// How a set's tree coordinates reach Bevy world space.
@@ -355,6 +410,10 @@ pub struct ActiveTileset {
     tree: TileTree,
     source: TilesetSource,
     slots: Vec<TileSlot>,
+    /// Per-tile spawn recipe of every [`TileSlot::Ready`] tile (empty for every
+    /// other state) — see [`CachedItem`]. Index-aligned with `slots`, so it
+    /// rides `resize`/`gather` with the rest of the per-tile arrays.
+    caches: Vec<Vec<CachedItem>>,
     history: History,
     /// Frame each tile was last in the wanted set (eviction clock).
     last_touched: Vec<u64>,
@@ -974,6 +1033,7 @@ fn receive_tiles3d(
                                 tree,
                                 source,
                                 slots: vec![TileSlot::NotLoaded; n],
+                                caches: vec![Vec::new(); n],
                                 history,
                                 last_touched: vec![0; n],
                                 grafts: Vec::new(),
@@ -1058,6 +1118,7 @@ fn receive_tiles3d(
                                 set.tree.nodes[tile].content_uri = None;
                                 let n = set.tree.len();
                                 set.slots.resize(n, TileSlot::NotLoaded);
+                                set.caches.resize(n, Vec::new());
                                 set.last_touched.resize(n, 0);
                                 set.rtc_centers.resize(n, None);
                                 set.history.resize(n);
@@ -1119,8 +1180,6 @@ fn receive_tiles3d(
                         let renderers = ContentRenderers {
                             #[cfg(feature = "points")]
                             clouds: &mut clouds,
-                            #[cfg(feature = "points")]
-                            point_material: &point_material,
                             #[cfg(feature = "splats")]
                             splats: &mut splats,
                             _marker: std::marker::PhantomData,
@@ -1129,20 +1188,31 @@ fn receive_tiles3d(
                         // from the actual buffers (not the raw content len —
                         // see `content::resident_cost_bytes`).
                         let resident_cost = content::resident_cost_bytes(&items);
-                        let entity = spawn_tile_content(
-                            &mut commands,
+                        let cache = build_tile_cache(
                             &mut meshes,
                             &mut materials,
                             &mut images,
                             renderers,
                             &resolver,
                             set,
-                            tile,
-                            transform,
                             items,
                         );
+                        // Spawned HIDDEN; `drive_tiles3d` flips it visible in
+                        // this same frame if the cut selects it (the documented
+                        // `Added<TileGeometry>` window for host adapters).
+                        let entity = spawn_tile_entities(
+                            &mut commands,
+                            #[cfg(feature = "points")]
+                            &point_material,
+                            set,
+                            tile,
+                            transform,
+                            &cache,
+                            Visibility::Hidden,
+                        );
+                        set.caches[tile] = cache;
                         set.slots[tile] = TileSlot::Ready {
-                            entity,
+                            entity: Some(entity),
                             bytes: resident_cost,
                         };
                     }
@@ -1182,6 +1252,54 @@ fn tile_spawn_transform(
     }
 }
 
+/// Which out-of-cut tiles must NOT give up their entities this frame, and
+/// whether any wanted tile is still waiting for one (0.2.4 hidden-tile despawn).
+///
+/// A wanted tile with `entity: None` has nothing of itself on screen — it is
+/// starved by the respawn budget, or waiting for the origin — so whatever is
+/// currently covering its screen area has to stay. Under REPLACE refinement
+/// that is exactly its
+/// **ancestors** (zooming in: the coarse parent holds until the children land)
+/// and its **descendants** (zooming out: the fine children hold until the parent
+/// lands). Everything else in the set is unrelated screen area and leaves on the
+/// frame it leaves the cut — which is the entire point of despawning.
+///
+/// A set-wide hold instead of this one was the first cut of the feature and it
+/// undid the feature: while ANY tile was starved, every out-of-cut tile of that
+/// set stayed spawned AND VISIBLE, so `drawn` climbed toward `resident` for as
+/// long as the camera moved and a refining parent drew on top of its own
+/// children. Under a host budget of 2 respawns per frame that state was
+/// effectively permanent during motion.
+fn refinement_hold(
+    tree: &TileTree,
+    want_visible: &[bool],
+    slots: &[TileSlot],
+) -> (Vec<bool>, bool) {
+    let mut hold = vec![false; tree.len()];
+    let mut starved = false;
+    let mut down: Vec<usize> = Vec::new();
+    for i in 0..tree.len() {
+        if !want_visible[i] || !matches!(slots[i], TileSlot::Ready { entity: None, .. }) {
+            continue;
+        }
+        starved = true;
+        let mut up = tree.nodes[i].parent;
+        while let Some(a) = up {
+            hold[a] = true;
+            up = tree.nodes[a].parent;
+        }
+        down.extend(tree.nodes[i].children.iter().copied());
+        while let Some(d) = down.pop() {
+            if hold[d] {
+                continue; // subtree already marked
+            }
+            hold[d] = true;
+            down.extend(tree.nodes[d].children.iter().copied());
+        }
+    }
+    (hold, starved)
+}
+
 /// `world_from_ecef(origin) × ecef_from_content × T(rtc_center)`, in f64.
 fn compose_ecef_tile_matrix(
     world_from_ecef: DMat4,
@@ -1195,24 +1313,22 @@ fn compose_ecef_tile_matrix(
     m
 }
 
-/// Heavy-renderer asset stores threaded into [`spawn_tile_content`] for
+/// Heavy-renderer asset stores threaded into [`build_tile_cache`] for
 /// point-cloud (`points`) and Gaussian-splat (`splats`) tile content. Each
 /// field exists only under its feature; with neither, this is just the
 /// lifetime marker. The host's render plugins own the `Assets` stores.
 struct ContentRenderers<'a> {
     #[cfg(feature = "points")]
     clouds: &'a mut Assets<PointCloud>,
-    #[cfg(feature = "points")]
-    point_material: &'a PointTileMaterial,
     #[cfg(feature = "splats")]
     splats: &'a mut Assets<PlanarGaussian3d>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-/// Spawn one tile's decoded items under a hidden tile-root entity. The
-/// render cut flips the root's visibility; children inherit. Owner-anchored
-/// sets tag content with [`TileOwner`] so the host's selection/highlight/focus
-/// treat tiles like any other owned geometry.
+/// Decode-side half: insert one tile's decoded items into the asset stores
+/// ONCE and return the [`CachedItem`] spawn recipe. The returned handles are
+/// what keep the tile resident across hidden-tile despawns — dropping them
+/// (eviction) is what actually reclaims the memory.
 #[allow(clippy::too_many_arguments)]
 // `renderers` is only read by the cfg-gated point/splat arms; with neither
 // feature it's unused. Scope the allow to that config so a genuinely unused
@@ -1221,47 +1337,23 @@ struct ContentRenderers<'a> {
     not(any(feature = "points", feature = "splats")),
     allow(unused_variables)
 )]
-fn spawn_tile_content(
-    commands: &mut Commands,
+fn build_tile_cache(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     renderers: ContentRenderers<'_>,
     resolver: &TileFeatureResolver,
     set: &ActiveTileset,
-    tile: usize,
-    transform: Transform,
     items: Vec<DecodedItem>,
-) -> Entity {
-    let tile_root = commands
-        .spawn((
-            Tiles3dTile {
-                set_id: set.id,
-                tile,
-            },
-            transform,
-            // Spawned hidden; `drive_tiles3d` flips it visible once the render
-            // cut selects this tile (children inherit the root's visibility).
-            Visibility::Hidden,
-            ChildOf(set.root_entity),
-            Name::new(format!("Tiles3dTile({} #{tile})", set.label)),
-        ))
-        .id();
+) -> Vec<CachedItem> {
     let anchor = set.owner_id.as_deref();
-    let anchor_group = anchor.map(|id| TileOwner { id: id.to_string() });
-    // Goes on EVERY content entity, owned or not, so a host can post-process
-    // tile geometry per tileset (custom materials, clipping, styling). Unlike
-    // `TileOwner` this is unconditional — world-layer sets have no owner but
-    // are exactly the ones a host most wants to treat specially.
-    let content_tag = TileGeometry { set_id: set.id };
-    // T8 highlight: a feature tile under an owner splits into per-feature
-    // submeshes, each tagged with its resolved owner id via the host
-    // [`TileFeatureResolver`] — the host's click/hover/outline machinery then
-    // treats each feature's geometry as its own entity, exactly like the
-    // whole-file sections path. `has_resolver` gates the split: with no
-    // resolver every feature resolves to the anchor anyway, so we keep the
-    // cheaper single-mesh path.
+    // T8 highlight: a feature tile under an owner resolves its feature paths to
+    // host sub-owners via the host [`TileFeatureResolver`], so the host's
+    // click/hover/outline machinery can treat each feature as its own thing.
+    // `has_resolver` gates the work: with no resolver every feature resolves to
+    // the anchor anyway.
     let has_resolver = anchor.is_some() && resolver.0.is_some();
+    let mut cache = Vec::with_capacity(items.len());
 
     for item in items {
         match item {
@@ -1329,55 +1421,118 @@ fn spawn_tile_content(
                     }
                     _ => None,
                 };
-                let mut e = commands.spawn((
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(mat_handle),
-                    prim_transform,
-                    ChildOf(tile_root),
-                    content_tag,
-                ));
-                if let Some(group) = &anchor_group {
-                    e.insert(group.clone());
-                }
-                if let Some(pick) = pick {
-                    e.insert(pick);
-                }
+                cache.push(CachedItem::Mesh {
+                    mesh: meshes.add(mesh),
+                    material: mat_handle,
+                    transform: prim_transform,
+                    pick,
+                });
             }
             #[cfg(feature = "points")]
             DecodedItem::Points { transform, points } => {
-                let handle = renderers.clouds.add(PointCloud { points });
-                let child = commands
-                    .spawn((
-                        PointCloud3d(handle),
-                        PointCloudMaterial3d(renderers.point_material.0.clone()),
-                        Transform::from_matrix(transform),
-                        ChildOf(tile_root),
-                        content_tag,
-                    ))
-                    .id();
-                if let Some(group) = &anchor_group {
-                    commands.entity(child).insert(group.clone());
-                }
+                cache.push(CachedItem::Points {
+                    cloud: renderers.clouds.add(PointCloud { points }),
+                    transform: Transform::from_matrix(transform),
+                });
             }
             #[cfg(feature = "splats")]
             DecodedItem::Splat {
                 transform,
                 gaussians,
             } => {
-                let handle = renderers.splats.add(PlanarGaussian3d::from(gaussians));
-                let child = commands
-                    .spawn((
-                        PlanarGaussian3dHandle(handle),
-                        CloudSettings::default(),
-                        Transform::from_matrix(transform),
-                        ChildOf(tile_root),
-                        content_tag,
-                    ))
-                    .id();
-                if let Some(group) = &anchor_group {
-                    commands.entity(child).insert(group.clone());
-                }
+                cache.push(CachedItem::Splat {
+                    cloud: renderers.splats.add(PlanarGaussian3d::from(gaussians)),
+                    transform: Transform::from_matrix(transform),
+                });
             }
+        }
+    }
+    cache
+}
+
+/// Spawn one tile's cached content under a tile-root entity, at `visibility`
+/// (children inherit it). Used both by the fresh-decode path — `Hidden`, so a
+/// host reacting to `Added<TileGeometry>` lands its changes before the geometry
+/// is drawn — and by the hidden-tile respawn path, which re-runs it from the
+/// cache alone: no fetch, no decode, no `Assets` insert.
+///
+/// Every re-spawn is a brand-new entity, so every `Added<…>` host adapter
+/// (`TileOwner` → domain groups, `TileGeometry` → materials/clipping,
+/// `TileFeaturePick` → tint/outline) re-fires exactly as on first spawn. Nothing
+/// may cache an `Entity` per tile: the set's `slots` is the only authority.
+fn spawn_tile_entities(
+    commands: &mut Commands,
+    #[cfg(feature = "points")] point_material: &PointTileMaterial,
+    set: &ActiveTileset,
+    tile: usize,
+    transform: Transform,
+    cache: &[CachedItem],
+    visibility: Visibility,
+) -> Entity {
+    let tile_root = commands
+        .spawn((
+            Tiles3dTile {
+                set_id: set.id,
+                tile,
+            },
+            transform,
+            visibility,
+            ChildOf(set.root_entity),
+            Name::new(format!("Tiles3dTile({} #{tile})", set.label)),
+        ))
+        .id();
+    let anchor_group = set
+        .owner_id
+        .as_deref()
+        .map(|id| TileOwner { id: id.to_string() });
+    // Goes on EVERY content entity, owned or not, so a host can post-process
+    // tile geometry per tileset (custom materials, clipping, styling). Unlike
+    // `TileOwner` this is unconditional — world-layer sets have no owner but
+    // are exactly the ones a host most wants to treat specially.
+    let content_tag = TileGeometry { set_id: set.id };
+    for item in cache {
+        let child = match item {
+            CachedItem::Mesh {
+                mesh,
+                material,
+                transform,
+                pick,
+            } => {
+                let mut e = commands.spawn((
+                    Mesh3d(mesh.clone()),
+                    MeshMaterial3d(material.clone()),
+                    *transform,
+                    ChildOf(tile_root),
+                    content_tag,
+                ));
+                if let Some(pick) = pick {
+                    e.insert(pick.clone());
+                }
+                e.id()
+            }
+            #[cfg(feature = "points")]
+            CachedItem::Points { cloud, transform } => commands
+                .spawn((
+                    PointCloud3d(cloud.clone()),
+                    PointCloudMaterial3d(point_material.0.clone()),
+                    *transform,
+                    ChildOf(tile_root),
+                    content_tag,
+                ))
+                .id(),
+            #[cfg(feature = "splats")]
+            CachedItem::Splat { cloud, transform } => commands
+                .spawn((
+                    PlanarGaussian3dHandle(cloud.clone()),
+                    CloudSettings::default(),
+                    *transform,
+                    ChildOf(tile_root),
+                    content_tag,
+                ))
+                .id(),
+        };
+        if let Some(group) = &anchor_group {
+            commands.entity(child).insert(group.clone());
         }
     }
     tile_root
@@ -1547,6 +1702,7 @@ fn compact_grafted_subtrees(set: &mut ActiveTileset, frame: u64, grace: u64) -> 
     // surviving record's `child_root` is kept ⇒ its `at` is kept too
     // (ancestor-closed), so both remap cleanly.
     set.slots = gather(&set.slots, &keep);
+    set.caches = gather(&set.caches, &keep);
     set.last_touched = gather(&set.last_touched, &keep);
     set.rtc_centers = gather(&set.rtc_centers, &keep);
     set.history.rendered = gather(&set.history.rendered, &keep);
@@ -1634,8 +1790,16 @@ fn drive_tiles3d(
     // Last logged state of the load halt (hard stop / host brake) — log
     // transitions, not every frame.
     mut halt_logged: Local<bool>,
-    // Host-supplied per-set priority (looked up via the set's anchor entity).
-    classes: Query<&api::TilePriorityClass>,
+    // Host-supplied per-set tuning, both looked up on the set's ANCHOR entity:
+    // streaming priority class and SSE relaxation. One query, not two — bevy
+    // caps a system at 16 params and the `points` feature adds one.
+    anchor_tuning: Query<(
+        Option<&api::TilePriorityClass>,
+        Option<&api::TileSseMultiplier>,
+    )>,
+    // Shared material for respawned POINTS tiles (the fresh-decode path reads
+    // the same resource in `receive_tiles3d`).
+    #[cfg(feature = "points")] point_material: Res<PointTileMaterial>,
     // Round-robin cursors, one per priority class: id of the set that class
     // last granted a load slot to. Persists across frames so fairness holds
     // under a saturated pool, and is keyed by set id (not position) so it
@@ -1755,12 +1919,21 @@ fn drive_tiles3d(
     }
 
     let mut any_in_flight = false;
+    // A wanted tile is spawned-but-not-yet-shown (or still awaiting its respawn
+    // budget) somewhere, so the next frame has work to do even if nothing streams.
+    let mut pending_respawns = false;
     let mut google_visible = false;
     let mut ground_covering = false;
     let mut compacted_this_frame = false;
     // Issuable requests across ALL sets — collected per set below, issued
     // after the loop under the global pool (cross-set fairness).
     let mut candidates: Vec<LoadCandidate> = Vec::new();
+    // Hidden-tile respawn budget, GLOBAL across sets like `max_concurrent_loads`
+    // — per set it multiplied by tileset count (23 on the Hermosa site).
+    // ponytail: earlier sets in iteration order drain it first; that only delays
+    // a later set's refill (its hold keeps the coverage), so the round-robin
+    // machinery below is not worth spending on it until a scene actually starves.
+    let mut respawns_left = config.max_respawns_per_frame;
     for (set_idx, set) in sets.iter_mut().enumerate() {
         // Reclaim stale grafted subtrees once the tree has grown well past the
         // last pass — bounds the monotonic P3DT graft creep so the per-frame
@@ -1814,8 +1987,15 @@ fn drive_tiles3d(
                     // ORIGIN REBASE (basemap's model, exact-recompute form):
                     // re-place every resident tile from absolutes in f64.
                     *built = Some(o);
+                    // Despawned-but-cached tiles need nothing here: their
+                    // transform is recomposed from the current origin when they
+                    // respawn (`tile_spawn_transform`).
                     for (i, slot) in set.slots.iter_mut().enumerate() {
-                        let TileSlot::Ready { entity, .. } = *slot else {
+                        let TileSlot::Ready {
+                            entity: Some(entity),
+                            ..
+                        } = *slot
+                        else {
                             continue;
                         };
                         if let Ok(mut t) = tile_transforms.get_mut(entity) {
@@ -1860,14 +2040,27 @@ fn drive_tiles3d(
         } else {
             0.0
         };
+        // Per-class SSE relaxation (0.2.4): read once per set per frame off the
+        // anchor, the same entity that carries `TilePriorityClass`. Absent, or
+        // nonsense (≤0 / NaN), means 1.0.
+        let sse_mult = set
+            .anchor
+            .and_then(|a| anchor_tuning.get(a).ok())
+            .and_then(|(_, mult)| mult)
+            .map(|m| f64::from(m.0))
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .unwrap_or(1.0);
         let params = SelectParams {
             cam_pos,
             cam_forward,
             k_px,
             // Per-set override (dense single-asset preview) wins; else the
             // app-global config default (globe basemap). The memory-pressure
-            // factor scales EITHER — over budget, everything coarsens.
-            sse_threshold_px: set.sse_threshold_px.unwrap_or(config.sse_threshold_px) * pressure,
+            // factor and the anchor's `TileSseMultiplier` scale EITHER — over
+            // budget, or on a ground-context set, everything coarsens.
+            sse_threshold_px: set.sse_threshold_px.unwrap_or(config.sse_threshold_px)
+                * pressure
+                * sse_mult,
             detail_falloff_m,
             cam_height_m,
         };
@@ -1920,25 +2113,164 @@ fn drive_tiles3d(
             }
         }
 
-        // Apply the render cut as per-tile-root visibility — the selected tiles
-        // show, everything else hides (children inherit the root's visibility).
+        // Apply the render cut. A selected tile shows; an unselected one gives
+        // up its ENTITIES entirely (0.2.4) while keeping its decoded assets in
+        // `caches[i]`, so ~5k hidden mesh entities stop paying per-frame ECS tax
+        // and a re-entry costs a spawn instead of a download.
+        //
+        // Three things make a REPLACE refinement show EXACTLY ONE rung per frame
+        // — never a hole, never coarse over fine (the coarsen direction keeps its
+        // one-frame coarse-over-fine overlap on purpose; see `covered_by_coarser`):
+        //
+        // * respawns are issued BEFORE any despawn, in this same system, so both
+        //   land at the same command flush — spawn → show → despawn inside one
+        //   frame, never across two;
+        // * an out-of-cut tile that is currently covering for a wanted tile with
+        //   no entity yet is HELD: kept spawned and visible until that tile
+        //   confirms. `refinement_hold` is what picks those, and it is
+        //   deliberately narrow — ancestors and descendants of the starved tile,
+        //   not the whole set;
+        // * while such a hold is PAINTING this tile's footprint, the tile waits
+        //   (`covered_by_coarser`) instead of drawing on top of it — and when no
+        //   hold is painting it, it shows the frame it is wanted instead of
+        //   waiting. One predicate decides both.
         let mut want_visible = vec![false; tree.len()];
         for &t in &sel.render {
             want_visible[t] = true;
         }
-        for (i, slot) in set.slots.iter().enumerate() {
-            if let TileSlot::Ready { entity, .. } = slot
-                && let Ok(mut vis) = vis_q.get_mut(*entity)
-            {
-                let want = if want_visible[i] {
-                    Visibility::Visible
-                } else {
-                    Visibility::Hidden
-                };
-                if *vis != want {
-                    *vis = want;
+        // An ECEF set has no placement at all until the host publishes an
+        // `EcefOrigin` (`tile_spawn_transform` → `None`). Such a set can't
+        // respawn, so it must not despawn either — it keeps what it has, and
+        // deliberately does NOT report a pending respawn, which would pin the
+        // host's reactive loop at full frame rate on a parked camera for as long
+        // as the origin stays missing.
+        let respawnable =
+            !matches!(set.frame, SetFrame::Ecef { .. }) || origin.world_from_ecef.is_some();
+        let (hold, starved) = refinement_hold(tree, &want_visible, &set.slots);
+        let starved = starved && respawnable;
+        // Which held tiles are actually PAINTING right now. A held tile that was
+        // never shown (decoded straight into an out-of-cut slot) covers nothing,
+        // and a spawned tile that is not held leaves this frame — neither can be
+        // waited behind. A tile that is itself in the cut is excluded: it draws
+        // on its own merit, so a `Refine::Add` parent never gates its own
+        // children here. Reading `Visibility` per tile is cheap now — after the
+        // despawn only ~cut-many tiles have an entity at all.
+        let covering: Vec<bool> = (0..tree.len())
+            .map(|i| {
+                hold[i]
+                    && !want_visible[i]
+                    && matches!(set.slots[i],
+                        TileSlot::Ready { entity: Some(e), .. }
+                            if vis_q.get(e).is_ok_and(|v| *v == Visibility::Visible))
+            })
+            .collect();
+        // The atomicity predicate. A painting, held ANCESTOR covers this tile's
+        // whole footprint (its bounding volume contains the child's), so a wanted
+        // tile that has one waits — hidden — until the last of its starved
+        // siblings arrives and the hold lifts. That is what makes a refinement
+        // swap flip every sibling at once instead of trickling fine tiles on top
+        // of the coarse they replace. With NO painting ancestor, nothing is on
+        // screen here at all and waiting a frame IS the hole — that is cut entry
+        // from cache, where the footprint's whole ancestor chain is despawned, so
+        // the tile draws the frame it is wanted.
+        //
+        // Ancestors only, deliberately: a held DESCENDANT is the coarsen
+        // direction, where the incoming parent overlapping its outgoing children
+        // for one frame is the accepted deviation (coarse over fine beats a gap).
+        let covered_by_coarser = |i: usize| {
+            let mut up = tree.nodes[i].parent;
+            while let Some(a) = up {
+                if covering[a] {
+                    return true;
                 }
+                up = tree.nodes[a].parent;
             }
+            false
+        };
+        let mut hide: Vec<usize> = Vec::new();
+        for (i, &want) in want_visible.iter().enumerate() {
+            let TileSlot::Ready { entity, bytes } = set.slots[i] else {
+                continue;
+            };
+            match (want, entity) {
+                (true, Some(e)) => {
+                    // Its coverage is still painting: wait for the siblings
+                    // instead of drawing fine on top of the coarse. `starved` is
+                    // necessarily true whenever this fires (a hold implies one),
+                    // so the reactive loop keeps ticking until the swap lands.
+                    if covered_by_coarser(i) {
+                        continue;
+                    }
+                    // Visible from this frame on: the write is immediate, so a
+                    // tile flipped here is on screen for the same frame the
+                    // despawns below take effect.
+                    if let Ok(mut vis) = vis_q.get_mut(e)
+                        && *vis != Visibility::Visible
+                    {
+                        *vis = Visibility::Visible;
+                    }
+                }
+                (true, None) => {
+                    // Re-entry: respawn from the cache against the CURRENT
+                    // origin (never the one captured at first spawn).
+                    if respawns_left == 0 {
+                        continue;
+                    }
+                    let Some(transform) = tile_spawn_transform(set, i, origin.world_from_ecef)
+                    else {
+                        continue;
+                    };
+                    respawns_left -= 1;
+                    // Same predicate as the show arm, for the same reason: land
+                    // hidden behind live coverage (and join the swap when it
+                    // lifts), land VISIBLE when there is none — a hidden frame
+                    // with nothing covering it is a hole.
+                    let visibility = if covered_by_coarser(i) {
+                        Visibility::Hidden
+                    } else {
+                        Visibility::Visible
+                    };
+                    let e = spawn_tile_entities(
+                        &mut commands,
+                        #[cfg(feature = "points")]
+                        &point_material,
+                        set,
+                        i,
+                        transform,
+                        &set.caches[i],
+                        visibility,
+                    );
+                    set.slots[i] = TileSlot::Ready {
+                        entity: Some(e),
+                        bytes,
+                    };
+                }
+                // Held tiles keep BOTH their entity and their visibility: they
+                // are the coverage a starved tile has not provided yet.
+                (false, Some(_)) if respawnable && !hold[i] => hide.push(i),
+                (false, _) => {}
+            }
+        }
+        for i in hide {
+            let TileSlot::Ready {
+                entity: Some(e),
+                bytes,
+            } = set.slots[i]
+            else {
+                continue;
+            };
+            commands.entity(e).despawn();
+            // Slot stays Ready — the assets (and the ledger bytes) are
+            // deliberately still resident; only eviction reclaims them.
+            set.slots[i] = TileSlot::Ready {
+                entity: None,
+                bytes,
+            };
+        }
+        if starved {
+            // Keep the reactive loop ticking until the pending respawns have
+            // shown, or a settled camera would leave them hidden.
+            pending_respawns = true;
         }
 
         // First painted cut: strip the anchor's placeholder cube geometry
@@ -1998,7 +2330,8 @@ fn drive_tiles3d(
         if load_slots > 0 && !budget_exhausted && !halt_loads {
             let class = set
                 .anchor
-                .and_then(|a| classes.get(a).ok())
+                .and_then(|a| anchor_tuning.get(a).ok())
+                .and_then(|(class, _)| class)
                 .copied()
                 .unwrap_or_default()
                 .0;
@@ -2034,17 +2367,23 @@ fn drive_tiles3d(
                 resident.push((i, set.last_touched[i]));
             }
         }
+        // `!hold[i]`: eviction is the one despawn path that would otherwise
+        // ignore the refinement hold, and it drops the CACHE too — evicting a
+        // held tile opens the hole the hold exists to prevent and pays a
+        // re-download to close it. Both arms are gated: the grace arm because a
+        // long starved motion can outlast `grace_frames`, the overflow arm
+        // because it consults no clock at all.
         let mut evict: Vec<usize> = resident
             .iter()
             .filter(|(i, seen)| {
-                !want_visible[*i] && frame.saturating_sub(*seen) > config.grace_frames
+                !want_visible[*i] && !hold[*i] && frame.saturating_sub(*seen) > config.grace_frames
             })
             .map(|(i, _)| *i)
             .collect();
         if resident.len() - evict.len() > config.max_resident_tiles {
             let mut extras: Vec<(usize, u64)> = resident
                 .iter()
-                .filter(|(i, _)| !want_visible[*i] && !evict.contains(i))
+                .filter(|(i, _)| !want_visible[*i] && !hold[*i] && !evict.contains(i))
                 .copied()
                 .collect();
             extras.sort_by_key(|(_, seen)| *seen);
@@ -2053,7 +2392,12 @@ fn drive_tiles3d(
         }
         for i in evict {
             if let TileSlot::Ready { entity, .. } = set.slots[i] {
-                commands.entity(entity).despawn();
+                if let Some(e) = entity {
+                    commands.entity(e).despawn();
+                }
+                // Dropping the cache drops the asset handles — THIS is what
+                // reclaims the memory a hidden tile deliberately kept.
+                set.caches[i] = Vec::new();
                 set.slots[i] = TileSlot::NotLoaded;
             }
         }
@@ -2156,10 +2500,11 @@ fn drive_tiles3d(
         *credits = want;
     }
 
-    // Keep the reactive loop awake while content streams — without this the
-    // idle 200 ms tick would crawl through the decode queue (the same lesson
-    // as `keep_awake_while_loading` in the asset loader).
-    if any_in_flight {
+    // Keep the reactive loop awake while content streams (or while a respawn
+    // still has to be shown) — without this the idle 200 ms tick would crawl
+    // through the decode queue (the same lesson as `keep_awake_while_loading`
+    // in the asset loader).
+    if any_in_flight || pending_respawns {
         redraw.write(RequestRedraw);
     }
 }
@@ -2557,6 +2902,590 @@ mod tests {
         let mut c = vec![cand(1, 1, false, 0), cand(3, 1, false, 0)];
         sort_load_candidates(&mut c, &std::collections::HashMap::from([(1u8, 99u64)]));
         assert_eq!(c[0].set_id, 1, "wraps to the lowest live id");
+    }
+
+    // ── Hidden-tile despawn / respawn (0.2.4) ────────────────────────────────
+    //
+    // These drive the real `receive_tiles3d`/`drive_tiles3d` chain over a
+    // synthetic all-Ready set, which is the only way to test the swap ORDERING
+    // (the invariant that actually bites) rather than the selection math alone.
+
+    /// Per-tile ledger cost of the synthetic sets below.
+    const TEST_TILE_BYTES: u64 = 100;
+
+    /// Streaming config for the synthetic sets: a spawn budget big enough that a
+    /// whole cut lands in one frame (tests that care about the budget lower it),
+    /// and no distance falloff so the SSE assertions stay exact.
+    fn test_config() -> Tiles3dConfig {
+        Tiles3dConfig {
+            max_spawns_per_frame: 64,
+            detail_falloff_m: 0.0,
+            ..Default::default()
+        }
+    }
+
+    /// Just enough app to run the streamer's two systems: real `Assets<Mesh>` (so
+    /// cached handles are real handles), the `RequestRedraw` message, and the
+    /// plugin. No render/window/transform plugins — nothing here draws, and
+    /// `GlobalTransform`s are set by hand.
+    fn despawn_test_app(config: Tiles3dConfig) -> App {
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .add_message::<RequestRedraw>()
+            .insert_resource(config)
+            .add_plugins(Tiles3dPlugin);
+        app
+    }
+
+    /// root(depth 0) → 4 children(depth 1) → 4 leaves each(depth 2), REPLACE,
+    /// all content-bearing, spheres around the origin. `ge = [root, child, leaf]`
+    /// drives the cut: for a 1080p 45° camera at z = 600, `[100, 6, 0]` refines
+    /// the root at any sane threshold and the children only below ~13 px.
+    fn synth_tree(ge: [f64; 3]) -> TileTree {
+        let node = |parent, depth, geometric_error, center, radius| traversal::TileNode {
+            parent,
+            children: vec![],
+            depth,
+            geometric_error,
+            refine: schema::Refine::Replace,
+            content_uri: Some("t.glb".into()),
+            volume: traversal::WorldVolume::Sphere { center, radius },
+            world_from_content: DMat4::IDENTITY,
+            world_from_tile: DMat4::IDENTITY,
+        };
+        let mut tree = TileTree::default();
+        tree.nodes.push(node(None, 0, ge[0], DVec3::ZERO, 100.0));
+        let quad = [(-30.0, -30.0), (30.0, -30.0), (-30.0, 30.0), (30.0, 30.0)];
+        for (cx, cz) in quad {
+            let c = tree.nodes.len();
+            tree.nodes
+                .push(node(Some(0), 1, ge[1], DVec3::new(cx, 0.0, cz), 25.0));
+            tree.nodes[0].children.push(c);
+            for (lx, lz) in quad {
+                let l = tree.nodes.len();
+                let center = DVec3::new(cx + lx * 0.25, 0.0, cz + lz * 0.25);
+                tree.nodes.push(node(Some(c), 2, ge[2], center, 8.0));
+                tree.nodes[c].children.push(l);
+            }
+        }
+        tree
+    }
+
+    fn tiles_at_depth(tree: &TileTree, depth: u32) -> Vec<usize> {
+        (0..tree.len())
+            .filter(|&i| tree.nodes[i].depth == depth)
+            .collect()
+    }
+
+    /// Install one synthetic set with every tile already `Ready` but
+    /// despawned-but-cached (one cached mesh each), plus the streamer camera.
+    /// Returns `(anchor, camera, mesh handles)`.
+    fn install_set(
+        app: &mut App,
+        tree: TileTree,
+        frame: SetFrame,
+        cam: Vec3,
+    ) -> (Entity, Entity, Vec<Handle<Mesh>>) {
+        let n = tree.len();
+        let world = app.world_mut();
+        let anchor = world
+            .spawn((Transform::IDENTITY, GlobalTransform::IDENTITY))
+            .id();
+        let root_entity = world
+            .spawn((
+                Transform::IDENTITY,
+                GlobalTransform::IDENTITY,
+                Visibility::default(),
+            ))
+            .id();
+        let camera = world
+            .spawn((
+                Camera::default(),
+                Projection::default(),
+                Frustum::default(),
+                GlobalTransform::from(Transform::from_translation(cam)),
+                Tiles3dCamera,
+            ))
+            .id();
+        let mut meshes = world.resource_mut::<Assets<Mesh>>();
+        let handles: Vec<Handle<Mesh>> = (0..n)
+            .map(|_| {
+                meshes.add(Mesh::new(
+                    bevy::mesh::PrimitiveTopology::TriangleList,
+                    bevy::asset::RenderAssetUsages::default(),
+                ))
+            })
+            .collect();
+        let caches: Vec<Vec<CachedItem>> = handles
+            .iter()
+            .map(|h| {
+                vec![CachedItem::Mesh {
+                    mesh: h.clone(),
+                    material: Handle::default(),
+                    transform: Transform::IDENTITY,
+                    pick: None,
+                }]
+            })
+            .collect();
+        let mut history = History::default();
+        history.resize(n);
+        let mut sets = world.resource_mut::<Tiles3dSets>();
+        sets.sets.push(ActiveTileset {
+            id: 1,
+            label: "synth".into(),
+            tree,
+            source: TilesetSource::Exploded(ExplodedBase::Url("http://x".into())),
+            slots: vec![
+                TileSlot::Ready {
+                    entity: None,
+                    bytes: TEST_TILE_BYTES,
+                };
+                n
+            ],
+            caches,
+            history,
+            last_touched: vec![0; n],
+            grafts: Vec::new(),
+            compact_high_water: n,
+            root_entity,
+            anchor: Some(anchor),
+            owner_id: None,
+            sse_threshold_px: None,
+            placeholder_cleared: true,
+            last_cut: None,
+            frame,
+            rtc_centers: vec![None; n],
+            copyrights: BTreeSet::new(),
+            budget_warned: false,
+        });
+        (anchor, camera, handles)
+    }
+
+    /// Tiles of set 0 that are actually on screen: entity spawned AND visible.
+    fn visible_tiles(app: &App) -> Vec<usize> {
+        let world = app.world();
+        world.resource::<Tiles3dSets>().sets[0]
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                matches!(slot, TileSlot::Ready { entity: Some(e), .. }
+                    if world.get::<Visibility>(*e) == Some(&Visibility::Visible))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn move_camera(app: &mut App, camera: Entity, pos: Vec3) {
+        *app.world_mut().get_mut::<GlobalTransform>(camera).unwrap() =
+            GlobalTransform::from(Transform::from_translation(pos));
+    }
+
+    /// Pan the set out of view (and back). There are no render plugins here, so
+    /// the camera's `Frustum` is inert — `default()`'s zero half-spaces intersect
+    /// everything — and a pan has to be written by hand: one half-space that
+    /// rejects everything near the origin. Slot 0 because `intersects_sphere(_,
+    /// false)` only tests the first five.
+    fn look_away(app: &mut App, camera: Entity, away: bool) {
+        let mut frustum = Frustum::default();
+        if away {
+            frustum.half_spaces[0] =
+                bevy::camera::primitives::HalfSpace::new(Vec4::new(0.0, 0.0, 1.0, -1.0e9));
+        }
+        *app.world_mut().get_mut::<Frustum>(camera).unwrap() = frustum;
+    }
+
+    /// (a) A tile that leaves the cut gives up its ENTITIES but keeps its assets:
+    /// the slot stays `Ready`, the cached mesh is still in `Assets<Mesh>`, and the
+    /// memory ledger is byte-for-byte unchanged — the memory IS still resident,
+    /// deliberately.
+    #[test]
+    fn hidden_tile_despawns_entities_but_keeps_assets() {
+        let mut app = despawn_test_app(test_config());
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        let leaves = tiles_at_depth(&tree, 2);
+        let (_, cam, handles) = install_set(
+            &mut app,
+            tree,
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        let ledger = app
+            .world()
+            .resource::<Tiles3dSets>()
+            .resident_content_bytes();
+
+        // Close in: the cut is the leaf level (spawn hidden, then show).
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), leaves, "leaf cut on screen");
+
+        // Pull back: the root alone covers the view, so every leaf is hidden.
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), vec![0], "root cut on screen");
+
+        let sets = app.world().resource::<Tiles3dSets>();
+        for &l in &leaves {
+            assert!(
+                matches!(
+                    sets.sets[0].slots[l],
+                    TileSlot::Ready {
+                        entity: None,
+                        bytes: TEST_TILE_BYTES
+                    }
+                ),
+                "leaf {l} despawned but still Ready"
+            );
+            assert_eq!(sets.sets[0].caches[l].len(), 1, "leaf {l} kept its cache");
+        }
+        assert_eq!(
+            sets.resident_content_bytes(),
+            ledger,
+            "ledger unchanged by despawn"
+        );
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        assert!(
+            handles.iter().all(|h| meshes.get(h).is_some()),
+            "every cached mesh is still in Assets<Mesh>"
+        );
+    }
+
+    /// (b) A REPLACE **refinement** swap shows EXACTLY ONE rung per frame: either
+    /// the coarse parent, or the WHOLE finer cut. Never neither (a hole), and
+    /// never both — a parent's geometry sits slightly off the surface its children
+    /// draw, so any overlap reads as z-shimmer for as long as it lasts. Driven at
+    /// one respawn per frame so the children trickle in over many frames, which is
+    /// the fast-orbit case the hold and the deferred show exist for.
+    #[test]
+    fn replace_swap_shows_exactly_one_rung() {
+        let mut app = despawn_test_app(Tiles3dConfig {
+            max_respawns_per_frame: 1,
+            ..test_config()
+        });
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        let leaves = tiles_at_depth(&tree, 2);
+        // Settled far away first: the root alone is the cut.
+        let (_, cam, _) = install_set(
+            &mut app,
+            tree,
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 60_000.0),
+        );
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), vec![0], "root cut first");
+
+        // Zoom in: the cut becomes the 16 leaves, one respawn per frame.
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 600.0));
+        let mut swapped = false;
+        for f in 0..40 {
+            app.update();
+            let vis = visible_tiles(&app);
+            let parent_up = vis.contains(&0);
+            let children_up = leaves.iter().all(|l| vis.contains(l));
+            let any_child_up = leaves.iter().any(|l| vis.contains(l));
+            assert!(
+                !(parent_up && any_child_up),
+                "frame {f}: coarse parent co-rendering with arrived children ({vis:?})"
+            );
+            assert!(
+                parent_up || children_up,
+                "frame {f}: neither the parent nor the full child cut is visible ({vis:?})"
+            );
+            swapped |= children_up;
+        }
+        assert!(swapped, "the swap completed inside 40 frames");
+    }
+
+    /// (b2) The COARSENING direction, which an ancestors-only hold would miss:
+    /// zooming out makes the parent the cut and its children the out-of-cut tiles,
+    /// so the CHILDREN are what has to hold until the parent's respawn is on
+    /// screen. Weaker on purpose — NO HOLE is the invariant here, and the incoming
+    /// parent overlapping its outgoing children for one frame is the accepted
+    /// deviation: coarse draws over fine, which beats a gap. (b) is the strict
+    /// exactly-one-rung direction.
+    #[test]
+    fn coarsening_swap_never_shows_a_hole() {
+        let mut app = despawn_test_app(Tiles3dConfig {
+            max_respawns_per_frame: 1,
+            ..test_config()
+        });
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        let leaves = tiles_at_depth(&tree, 2);
+        let (_, cam, _) = install_set(
+            &mut app,
+            tree,
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        // `install_set` starts every tile despawned-but-cached, so the FIRST cut
+        // is a respawn burst too — settle it at one per frame before measuring.
+        for _ in 0..40 {
+            app.update();
+        }
+        assert_eq!(visible_tiles(&app), leaves, "leaf cut first");
+
+        // Pull back: the root alone becomes the cut, and it has no entity.
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
+        let mut swapped = false;
+        for f in 0..10 {
+            app.update();
+            let vis = visible_tiles(&app);
+            let parent_up = vis.contains(&0);
+            let children_up = leaves.iter().all(|l| vis.contains(l));
+            assert!(
+                parent_up || children_up,
+                "frame {f}: neither the parent nor the full child cut is visible ({vis:?})"
+            );
+            swapped |= parent_up && !children_up;
+        }
+        assert!(swapped, "the coarsening swap completed");
+    }
+
+    /// (b2b) Cut ENTRY from cache with NOTHING to hold: a footprint that panned
+    /// out of view has its whole ancestor chain despawned, so no coarse rung is on
+    /// screen to cover the re-entry and `refinement_hold` has nothing to pick.
+    /// The respawn must therefore PAINT on the frame it is wanted — landing hidden
+    /// for the next frame's show pass is a hole (~90 ms of nothing at the frame
+    /// rates this feature exists for).
+    #[test]
+    fn cut_entry_from_cache_paints_the_same_frame() {
+        let mut app = despawn_test_app(test_config());
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        let leaves = tiles_at_depth(&tree, 2);
+        let (_, cam, _) = install_set(
+            &mut app,
+            tree,
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), leaves, "leaf cut on screen");
+
+        // Pan away: the cut empties, so the whole set — ancestors included —
+        // gives up its entities and keeps only its caches.
+        look_away(&mut app, cam, true);
+        app.update();
+        assert!(visible_tiles(&app).is_empty(), "nothing on screen off-view");
+        assert!(
+            app.world().resource::<Tiles3dSets>().sets[0]
+                .slots
+                .iter()
+                .all(|s| matches!(s, TileSlot::Ready { entity: None, .. })),
+            "the whole set is despawned-but-cached — no rung left to hold"
+        );
+
+        // Pan back: ONE frame, and the cut is painting.
+        look_away(&mut app, cam, false);
+        app.update();
+        assert_eq!(
+            visible_tiles(&app),
+            leaves,
+            "re-entry paints the frame it is wanted"
+        );
+    }
+
+    /// (b3) The hold is NARROW: only the starved tile's own ancestors and
+    /// descendants, never the rest of the set. A set-wide hold kept every
+    /// out-of-cut tile spawned AND visible for as long as the camera moved,
+    /// which is the whole cost this feature exists to remove.
+    #[test]
+    fn the_hold_covers_only_the_starved_tile_s_line() {
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        let starved = *tiles_at_depth(&tree, 2).first().unwrap(); // leaf under child 1
+        let parent = tree.nodes[starved].parent.unwrap();
+        let mut slots = vec![
+            TileSlot::Ready {
+                entity: Some(Entity::from_raw_u32(1).unwrap()),
+                bytes: TEST_TILE_BYTES,
+            };
+            tree.len()
+        ];
+        slots[starved] = TileSlot::Ready {
+            entity: None,
+            bytes: TEST_TILE_BYTES,
+        };
+        let mut want = vec![false; tree.len()];
+        want[starved] = true;
+
+        let (hold, is_starved) = refinement_hold(&tree, &want, &slots);
+        assert!(is_starved);
+        assert!(hold[0], "the root ancestor holds");
+        assert!(hold[parent], "the immediate parent holds");
+        assert!(!hold[starved], "the starved tile itself is not 'held'");
+        // A sibling subtree is unrelated screen area — it must be free to go.
+        let other = tiles_at_depth(&tree, 1)
+            .into_iter()
+            .find(|&c| c != parent)
+            .unwrap();
+        assert!(!hold[other], "an unrelated child does NOT hold");
+        for &l in &tree.nodes[other].children {
+            assert!(!hold[l], "an unrelated leaf does NOT hold");
+        }
+
+        // Starve the ROOT instead: now every descendant is the coverage.
+        let mut slots = vec![
+            TileSlot::Ready {
+                entity: Some(Entity::from_raw_u32(1).unwrap()),
+                bytes: TEST_TILE_BYTES,
+            };
+            tree.len()
+        ];
+        slots[0] = TileSlot::Ready {
+            entity: None,
+            bytes: TEST_TILE_BYTES,
+        };
+        let mut want = vec![false; tree.len()];
+        want[0] = true;
+        let (hold, _) = refinement_hold(&tree, &want, &slots);
+        assert!(
+            (1..tree.len()).all(|i| hold[i]),
+            "a starved root holds its whole subtree"
+        );
+    }
+
+    /// (c) A tile hidden across an ECEF origin rebase respawns against the
+    /// CURRENT origin, not the one it was first spawned at.
+    #[test]
+    fn respawn_places_against_the_current_ecef_origin() {
+        let mut app = despawn_test_app(test_config());
+        let o1 = DMat4::from_translation(DVec3::new(1000.0, 0.0, 0.0));
+        let o2 = DMat4::from_translation(DVec3::new(0.0, 0.0, -2000.0));
+        app.insert_resource(EcefOrigin {
+            world_from_ecef: Some(o1),
+        });
+        // Children carry no geometric error, so the cut stops at depth 1 and the
+        // root is the hidden tile under test.
+        let tree = synth_tree([100.0, 0.0, 0.0]);
+        let children = tiles_at_depth(&tree, 1);
+        let (_, cam, _) = install_set(
+            &mut app,
+            tree,
+            SetFrame::Ecef { built: None },
+            Vec3::new(1000.0, 0.0, 600.0),
+        );
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), children, "child cut at origin 1");
+        assert!(
+            matches!(
+                app.world().resource::<Tiles3dSets>().sets[0].slots[0],
+                TileSlot::Ready { entity: None, .. }
+            ),
+            "root is despawned-but-cached"
+        );
+
+        // Rebase the origin AND pull back so the root becomes the cut.
+        app.insert_resource(EcefOrigin {
+            world_from_ecef: Some(o2),
+        });
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 58_000.0));
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), vec![0], "root cut after the rebase");
+        let TileSlot::Ready {
+            entity: Some(root), ..
+        } = app.world().resource::<Tiles3dSets>().sets[0].slots[0]
+        else {
+            panic!("root respawned");
+        };
+        let t = app.world().get::<Transform>(root).unwrap();
+        assert!(
+            t.translation
+                .abs_diff_eq(Vec3::new(0.0, 0.0, -2000.0), 1e-3),
+            "respawned at the CURRENT origin, got {:?}",
+            t.translation
+        );
+    }
+
+    /// (d) `TileSseMultiplier` is the "ground tilesets don't need twin-grade
+    /// density" knob: the same tree and camera that refine to the leaf level at
+    /// 1.0 stop one level coarser at 2.0.
+    #[test]
+    fn sse_multiplier_coarsens_the_cut() {
+        let cut = |mult: Option<f32>| -> Vec<usize> {
+            let mut app = despawn_test_app(test_config());
+            let (anchor, _, _) = install_set(
+                &mut app,
+                synth_tree([100.0, 6.0, 0.0]),
+                SetFrame::Anchored,
+                Vec3::new(0.0, 0.0, 600.0),
+            );
+            if let Some(m) = mult {
+                app.world_mut()
+                    .entity_mut(anchor)
+                    .insert(TileSseMultiplier(m));
+            }
+            app.update();
+            app.update();
+            visible_tiles(&app)
+        };
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        assert_eq!(cut(None), tiles_at_depth(&tree, 2), "absent → leaf cut");
+        assert_eq!(cut(Some(1.0)), tiles_at_depth(&tree, 2), "1.0 == absent");
+        assert_eq!(
+            cut(Some(2.0)),
+            tiles_at_depth(&tree, 1),
+            "2.0 → the coarser child cut"
+        );
+    }
+
+    /// (e) A tile inside the eviction grace window is despawned-but-CACHED: its
+    /// slot stays `Ready`, it is never re-requested, and coming back into view
+    /// costs a spawn — the decode counter never moves.
+    #[test]
+    fn grace_tile_keeps_its_cache_and_never_re_decodes() {
+        let mut app = despawn_test_app(test_config());
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        let leaves = tiles_at_depth(&tree, 2);
+        let (_, cam, _) = install_set(
+            &mut app,
+            tree,
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), leaves, "leaf cut on screen");
+
+        // Out of the cut, well inside `grace_frames`.
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
+        app.update();
+        app.update();
+        {
+            let sets = app.world().resource::<Tiles3dSets>();
+            for &l in &leaves {
+                assert!(
+                    matches!(sets.sets[0].slots[l], TileSlot::Ready { entity: None, .. }),
+                    "grace tile {l} kept its Ready slot"
+                );
+                assert_eq!(sets.sets[0].caches[l].len(), 1, "tile {l} kept its cache");
+            }
+        }
+
+        // Back in: respawn only — no fetch was issued, nothing decoded.
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 600.0));
+        app.update();
+        app.update();
+        assert_eq!(visible_tiles(&app), leaves, "leaf cut back on screen");
+        let sets = app.world().resource::<Tiles3dSets>();
+        assert!(
+            !sets.sets[0]
+                .slots
+                .iter()
+                .any(|s| matches!(s, TileSlot::InFlight { .. } | TileSlot::NotLoaded)),
+            "re-entry re-requested nothing"
+        );
+        assert_eq!(
+            app.world().resource::<Tiles3dDecodeStats>().tiles,
+            0,
+            "no tile was decoded — re-entry is a spawn, not a decode"
+        );
     }
 
     /// Aborting a registered generation flips its handle; a triggered source

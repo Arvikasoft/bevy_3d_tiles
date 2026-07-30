@@ -226,6 +226,35 @@ impl Default for TilePriorityClass {
     }
 }
 
+/// Per-tileset screen-space-error **multiplier**, read live from the tileset's
+/// **anchor entity** — the same entity that carries [`TilePriorityClass`].
+///
+/// The effective refine threshold of the set becomes `threshold × multiplier`,
+/// so `>1.0` coarsens the cut (fewer, coarser tiles selected) and `<1.0`
+/// sharpens it. Absent, or ≤0 / non-finite, means `1.0`. Read once per set per
+/// frame — this is a per-SET knob, never per-tile.
+///
+/// This is the **"ground tilesets don't need twin-grade density"** knob. A cut
+/// tuned for a twin (texel≈pixel on a machine you are inspecting) is far too
+/// fine for ground context: measured 2026-07-30 on a settled close orbit, the
+/// ground layers alone put ~4.7 k meshes / 9 Mtri into the main pass, and draw
+/// submission — not triangles — was the frame cost. Stamp `TileSseMultiplier`
+/// (with `TilePriorityClass(0)`) on ground/background anchors to buy that back;
+/// the twins keep the sharp default.
+///
+/// Distinct from [`crate::Tiles3dAttach::sse_threshold_px`], which sets a set's
+/// absolute threshold once at attach. This is a live, relative dial a host can
+/// change per frame (a quality slider, a per-class policy) without re-attaching,
+/// and it composes with both that override and the memory-pressure valve.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct TileSseMultiplier(pub f32);
+
+impl Default for TileSseMultiplier {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
 /// Marker the host inserts on the camera the streamer uses for screen-space-error
 /// tile selection. Add it alongside your `Camera3d` (TurboTwin adds it next to
 /// the orbit camera). Replaces the former hard-coded `PanOrbitCamera` filter.
