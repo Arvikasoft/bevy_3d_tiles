@@ -1,6 +1,6 @@
 [package]
 name = "bevy_3d_tiles"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "OGC 3D Tiles 1.1 streaming renderer for Bevy — packed .3tz ranged reader, per-tile SSE traversal, glTF tile content, KTX2 + meshopt (+ Draco read), EXT_mesh_features picking, ECEF georeferencing, Google Photorealistic 3D Tiles. Native + WebGPU/wasm."
@@ -32,12 +32,17 @@ splats = ["dep:bevy_gaussian_splatting"]
 # the split; a host's Web Worker links the prepare crate ALONE (no bevy).
 # Version-lockstep: publish both crates together (see prepare/Cargo.toml).
 bevy_3d_tiles_prepare = { version = "0.1.0", path = "prepare" }
-# Caret, not exact-pin: the published lib must unify with consumers on any
-# 0.18.x (bevy-client keeps its own app-side `=0.18.1` pin). Minimal render
+# Exact-pin, in lockstep with bevy-client and bevy_pointcloud_x (which pins
+# `=0.19.0` per-subcrate), so no bevy patch release enters the tree without
+# someone deciding to. It is NOT what keeps `Assets<PointCloud>` typechecking
+# across the `points` boundary — cargo unifies caret ranges too, and that only
+# ever needed one *source* for bevy_pointcloud_x (see [patch] below). The cost
+# of the pin is real: a consumer on 0.19.1 cannot use this crate without
+# patching, which is why 0.1–0.2 used a caret. Revisit at 0.4. Minimal render
 # subset — the app/windowing stack (default_app, winit, x11, webgpu backend
 # selection, tonemapping LUTs) belongs to the consuming app; examples add it
 # back via [dev-dependencies].
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "=0.19.0", default-features = false, features = [
     "std",
     "multi_threaded",
     "async_executor",
@@ -71,8 +76,8 @@ thiserror = "2"
 # rlamarche/bevy_pointcloud (upstream is git-only — its potree/copc features
 # carry git deps crates.io forbids); the dep is ALIASED to `bevy_pointcloud`
 # so source imports stay upstream-compatible.
-bevy_pointcloud = { package = "bevy_pointcloud_x", version = "0.1.0", optional = true }
-bevy_gaussian_splatting = { version = "7", default-features = false, features = [
+bevy_pointcloud = { package = "bevy_pointcloud_x", version = "0.2.0", optional = true }
+bevy_gaussian_splatting = { version = "8", default-features = false, features = [
     "buffer_storage",
     "planar",
     "sh0",
@@ -106,14 +111,14 @@ web-sys = { version = "0.3", features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # bevy's basis transcoder is C++ (native only; won't build for wasm) — KTX2/UASTC
 # tile textures transcode via it on native, and via a JS shim on wasm.
-bevy = { version = "0.18", default-features = false, features = ["basis-universal"] }
+bevy = { version = "=0.19.0", default-features = false, features = ["basis-universal"] }
 # Native byte-range source (runs on a worker thread, never inside an async runtime).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 
 [dev-dependencies]
 base64 = "0.22"
 # Examples need the app/window/render stack the library itself doesn't pull.
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "=0.19.0", default-features = false, features = [
     "default_app",
     "default_font",
     "bevy_winit",
@@ -121,3 +126,4 @@ bevy = { version = "0.18", default-features = false, features = [
     "webgpu",
     "tonemapping_luts",
 ] }
+

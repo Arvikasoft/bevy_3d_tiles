@@ -2936,6 +2936,14 @@ mod tests {
             .add_message::<RequestRedraw>()
             .insert_resource(config)
             .add_plugins(Tiles3dPlugin);
+        // The heavy-renderer stores the host's render plugins normally own
+        // (`receive_tiles3d` takes them as `ResMut` under these features). Absent,
+        // param validation fails the whole system and every test here panics —
+        // which is what made `cargo test --all-features` red in 0.2.4.
+        #[cfg(feature = "points")]
+        app.init_resource::<Assets<PointCloud>>();
+        #[cfg(feature = "splats")]
+        app.init_resource::<Assets<PlanarGaussian3d>>();
         app
     }
 
@@ -3092,7 +3100,7 @@ mod tests {
         let mut frustum = Frustum::default();
         if away {
             frustum.half_spaces[0] =
-                bevy::camera::primitives::HalfSpace::new(Vec4::new(0.0, 0.0, 1.0, -1.0e9));
+                bevy::math::primitives::HalfSpace::new(Vec4::new(0.0, 0.0, 1.0, -1.0e9));
         }
         *app.world_mut().get_mut::<Frustum>(camera).unwrap() = frustum;
     }

@@ -152,11 +152,24 @@ attribution lines whenever tiles are visible, and bring your own API key
 
 | `bevy_3d_tiles` | Bevy |
 |---|---|
-| 0.1 | 0.18 |
-
-Bevy 0.19 support is planned for 0.2 (waiting on the render-crate ecosystem).
+| 0.3 | 0.19 |
+| 0.1 – 0.2 | 0.18 |
 
 ## Upgrading
+
+### 0.2.4 → 0.3.0
+
+- **Bevy 0.19** (wgpu 29). No `bevy_3d_tiles` API changed — every public type,
+  system set, resource, and component is identical to 0.2.4. The bump is the
+  whole release.
+- Optional-feature deps move with it: `points` → `bevy_pointcloud_x` 0.2,
+  `splats` → `bevy_gaussian_splatting` 8.
+- The bevy dependency is now **exact-pinned** (`=0.19.0`) where 0.1–0.2 used a
+  caret, matching the pin discipline of its consumers. Note this is *not* what
+  makes `Assets<PointCloud>` typecheck across the `points` boundary — cargo
+  unifies caret ranges too, and that only ever needed ONE source for
+  `bevy_pointcloud_x`. It is here so a bevy patch release cannot enter the tree
+  without someone deciding to. If you need `0.19.1`, patch or ask.
 
 ### 0.2.3 → 0.2.4
 
