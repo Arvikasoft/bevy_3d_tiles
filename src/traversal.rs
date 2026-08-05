@@ -580,14 +580,18 @@ pub fn select<F: Fn(usize) -> bool>(
 
 /// Priority tie-break key: distance, weighted away from the screen edge —
 /// `dist × (2 − cos θ)` where θ is the angle off the view axis. Center tiles
-/// load first among equals (§7.6).
+/// load first among equals (§7.6). When the camera is within the tile's
+/// bounding sphere the center direction says nothing about where its geometry
+/// is on screen (a screen-filling tile can have its center behind the camera),
+/// so the malus is floored there — otherwise such tiles starve in the queue
+/// and the coarse parent stays rendered at exactly those view angles.
 fn load_key<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, tile: usize, dist: f64) -> f64 {
-    let (center, _) = ctx.tree.nodes[tile].volume.bounding_sphere();
+    let (center, radius) = ctx.tree.nodes[tile].volume.bounding_sphere();
     let to = center - ctx.params.cam_pos;
-    let cos = if to.length_squared() > 1e-12 {
-        to.normalize().dot(ctx.params.cam_forward).clamp(-1.0, 1.0)
-    } else {
+    let cos = if to.length_squared() <= (radius * radius).max(1e-12) {
         1.0
+    } else {
+        to.normalize().dot(ctx.params.cam_forward).clamp(-1.0, 1.0)
     };
     dist * (2.0 - cos)
 }
@@ -884,6 +888,36 @@ mod tests {
         assert!((sse - 16.0 * k / 1000.0).abs() < 1e-9);
         assert_eq!(screen_space_error(16.0, 0.0, k), f64::INFINITY);
         assert_eq!(screen_space_error(0.0, 100.0, k), 0.0);
+    }
+
+    #[test]
+    fn load_key_floors_angular_malus_inside_bounding_sphere() {
+        let tree = fixture_tree();
+        let content = all(TileContent::Ready, tree.len());
+        let history = History {
+            rendered: vec![false; tree.len()],
+            refined: vec![false; tree.len()],
+        };
+        // Camera inside child 1's sphere (center (-10,0,-10), r 9), looking
+        // +X: child 1's center sits dead behind the view axis (cos −1), yet
+        // its geometry fills the view — the spin-coarse starvation case.
+        let mut p = params(DVec3::new(-6.0, 0.0, -10.0));
+        p.cam_forward = DVec3::X;
+        let ctx = Ctx {
+            tree: &tree,
+            content: &content,
+            history: &history,
+            culled: &no_cull,
+            params: p,
+        };
+        // No angular malus inside the sphere: same key as child 2, which is
+        // the same nominal distance but dead ON-axis (and outside its sphere).
+        assert_eq!(load_key(&ctx, 1, 7.0), 7.0);
+        assert_eq!(load_key(&ctx, 1, 7.0), load_key(&ctx, 2, 7.0));
+        // A genuinely off-axis tile outside its sphere keeps the §7.6
+        // screen-center malus: child 3 (center (-10,0,10)) is ~20 m away,
+        // well off the +X view axis.
+        assert!(load_key(&ctx, 3, 7.0) > 7.0);
     }
 
     #[test]
