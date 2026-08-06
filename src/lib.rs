@@ -254,7 +254,9 @@ impl Default for Tiles3dConfig {
 pub struct P3dtParams {
     /// Org's Map Tiles API key (client-visible by design, L-D4).
     pub api_key: String,
-    /// Hard per-day request stop; 0 = no client-side cap (D7 guardrail).
+    /// Hard per-day stop on billable session-opening (root) requests; 0 = no
+    /// client-side cap (D7 guardrail). Sessioned tile requests are unmetered
+    /// by Google and never charged against this.
     pub daily_request_cap: u32,
 }
 
@@ -2301,16 +2303,18 @@ fn drive_tiles3d(
                 *slot = TileSlot::NotLoaded;
             }
         }
-        // Budget guardrail (D7): a live set whose daily request cap is
-        // exhausted issues nothing more — hard stop, warn once.
+        // Budget guardrail (D7): the cap counts billable session-opening
+        // (root) requests. A set holding a live session keeps streaming —
+        // its tile requests are unmetered by Google — so the hard stop only
+        // applies when the cap is spent AND there is no session to ride.
         let budget_exhausted = match &set.source {
             TilesetSource::Live(live) => {
-                let exhausted = live.budget().exhausted();
+                let exhausted = live.budget().exhausted() && !live.has_session();
                 if exhausted && !set.budget_warned {
                     warn!(
-                        "tiles3d: {}: daily request cap reached ({} requests) — \
-                         P3DT streaming halted until tomorrow (org admins set the \
-                         cap on the layer entry)",
+                        "tiles3d: {}: daily root-request cap reached ({}) with \
+                         no live session — P3DT streaming halted until tomorrow \
+                         (org admins set the cap on the layer entry)",
                         set.label,
                         live.budget().cap(),
                     );
