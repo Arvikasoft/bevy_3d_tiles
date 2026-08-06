@@ -373,11 +373,15 @@ impl ByteSource {
 
 // ── Live sessioned sources (Google P3DT, T4) ─────────────────────────────────
 
-/// Per-day request budget for a live source. The denormalized
-/// `daily_request_cap` from the layer row is a HARD client-side stop
-/// (BEVY-3D-TILES D7 — the 2026-05-30 cost-incident lesson); `cap == 0`
-/// means no client-side limit. On wasm the count persists across reloads in
-/// `localStorage` under a UTC-date key, so "daily" survives a refresh.
+/// Per-day budget of **billable session-opening (root) requests** for a live
+/// source. Google meters Photorealistic 3D Tiles on root tileset requests
+/// only — requests carrying a `session` token are free and unmetered — so
+/// that is the unit counted here (charging every fetch tripped a 2000 cap in
+/// one world load, 2026-08-07). The denormalized `daily_request_cap` from the
+/// layer row is a HARD client-side stop (BEVY-3D-TILES D7 — the 2026-05-30
+/// cost-incident lesson); `cap == 0` means no client-side limit. On wasm the
+/// count persists across reloads in `localStorage` under a UTC-date key, so
+/// "daily" survives a refresh.
 #[derive(Debug)]
 pub struct BudgetCounter {
     used: std::sync::atomic::AtomicU32,
@@ -558,6 +562,14 @@ impl LiveSession {
     }
 }
 
+/// Whether a resolved request URL carries a `session` query parameter — the
+/// marker that Google serves it unmetered inside a root request's session.
+fn has_session_param(url: &str) -> bool {
+    url.split_once('?')
+        .map(|(_, q)| q.split('&').any(|p| p.starts_with("session=")))
+        .unwrap_or(false)
+}
+
 /// Extract the `session` query parameter from a (relative or absolute) URI.
 pub fn extract_session_param(uri: &str) -> Option<String> {
     let (_, query) = uri.split_once('?')?;
@@ -626,12 +638,18 @@ impl TilesetSource {
                     })
             }
             TilesetSource::Live(live) => {
-                live.budget
-                    .try_acquire()
-                    .map_err(FetchError::BudgetExhausted)?;
-                ByteSource::Http(live.entry_url(uri))
-                    .read_all_abortable(abort)
-                    .await
+                let url = live.entry_url(uri);
+                // Google meters P3DT on root tileset requests only; a request
+                // carrying a `session` token is served free within that root
+                // request's session. Charge the daily budget for
+                // session-opening requests alone, so the cap is denominated
+                // in the billable unit.
+                if !has_session_param(&url) {
+                    live.budget
+                        .try_acquire()
+                        .map_err(FetchError::BudgetExhausted)?;
+                }
+                ByteSource::Http(url).read_all_abortable(abort).await
             }
         }
     }
@@ -1150,7 +1168,8 @@ mod tests {
     }
 
     /// The CAS-bypass gate (D7): a Live source never produces a cache key,
-    /// and a budget-exhausted source refuses the request outright.
+    /// and a budget-exhausted source refuses a session-OPENING request
+    /// outright (no session adopted yet ⇒ the request would be billable).
     #[test]
     fn live_source_bypasses_cas_and_enforces_budget() {
         let live = Arc::new(LiveSession::new(
@@ -1166,6 +1185,34 @@ mod tests {
             matches!(res, Err(FetchError::BudgetExhausted(1))),
             "{res:?}"
         );
+    }
+
+    /// The budget charges the billable unit only: a URL that carries a
+    /// `session` token is unmetered by Google, so an exhausted budget must
+    /// not block it. The charge decision is `has_session_param(entry_url)`.
+    #[test]
+    fn exhausted_budget_spares_sessioned_requests() {
+        assert!(!has_session_param(
+            "https://tile.googleapis.com/v1/3dtiles/root.json?key=K"
+        ));
+        assert!(has_session_param(
+            "https://tile.googleapis.com/x.glb?key=K&session=S"
+        ));
+        assert!(has_session_param("https://t/x.json?session=S&key=K"));
+        // `session=` in the path is not a token.
+        assert!(!has_session_param("https://t/session=fake/x.glb"));
+
+        let live = Arc::new(LiveSession::new(
+            "https://tile.googleapis.com/v1/3dtiles/root.json",
+            "K".into(),
+            BudgetCounter::new(1, None),
+        ));
+        live.budget().try_acquire().unwrap(); // burn the budget
+        assert!(live.budget().exhausted());
+        live.set_session("S".into());
+        // Every entry now resolves sessioned ⇒ exempt from the charge.
+        assert!(has_session_param(&live.entry_url("x.glb")));
+        assert!(has_session_param(&live.entry_url("/v1/3dtiles/sub.json")));
     }
 
     #[test]
