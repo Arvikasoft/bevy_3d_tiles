@@ -143,7 +143,9 @@ All have inert defaults — a standalone viewer can ignore every one of them.
 
 The loader implements the session protocol, **never caches or persists
 Google tiles**, aggregates per-tile copyright into `TilesetCredits`, and
-enforces a client-side `daily_request_cap`. What remains YOUR job under
+enforces a client-side `daily_request_cap` (counted in billable
+root/session-opening requests — sessioned tile traffic is unmetered by
+Google and never charged). What remains YOUR job under
 Google's Map Tiles API terms: show the Google logo + the aggregated
 attribution lines whenever tiles are visible, and bring your own API key
 (requests are billed to it). See `examples/google_p3dt.rs`.
