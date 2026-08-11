@@ -828,12 +828,52 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
         .ok()
 }
 
+/// Total size from an **explicit** 1-byte range (`bytes=0-0` → `206` with
+/// `Content-Range: bytes 0-0/TOTAL`).
+///
+/// 🔴 Not HEAD, and no longer a suffix probe. HEAD is out because some CDN/CORS
+/// configs omit `Content-Length` on it while still sending `Content-Range` on a
+/// 206. The suffix probe is out because a suffix range is the ONE range form an
+/// origin may legally decline, and how it declines is not portable:
+///
+/// * Azure Blob answers `200` + the FULL body, immediately — recoverable, and
+///   what [`http_suffix`]'s cancel-and-re-ask was built for.
+/// * Azure **Front Door** in front of that same blob answers **nothing at all**
+///   — no status, no headers, the request just hangs (measured 2026-08-11:
+///   `bytes=-1024` hung >30 s with zero bytes, while `bytes=0-0` on the same
+///   URL returned 206 in 0.5 s). There is no status to react to, so the
+///   fallback never fires and `.send().await` waits forever.
+///
+/// An explicit range is answered correctly by every origin and CDN we have
+/// measured, so asking only ever in that form removes the whole class.
 #[cfg(target_arch = "wasm32")]
 async fn http_size(url: &str) -> Result<u64, FetchError> {
-    // Suffix-range probe instead of HEAD: some CDN/CORS configs omit
-    // Content-Length on HEAD but must send Content-Range on a 206.
-    let (_, total) = http_suffix(url, 1).await?;
-    Ok(total)
+    let resp = gloo_net::http::Request::get(url)
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| FetchError::Http(e.to_string()))?;
+    match resp.status() {
+        206 => resp
+            .headers()
+            .get("content-range")
+            .as_deref()
+            .and_then(parse_content_range_total)
+            .ok_or_else(|| {
+                FetchError::Http(format!(
+                    "206 without a parseable Content-Range for {url} — \
+                     is Content-Range in the CORS ExposedHeaders?"
+                ))
+            }),
+        // A server that ignores ranges entirely (dev fixtures) hands back the
+        // whole body; its length IS the total.
+        200 => Ok(resp
+            .binary()
+            .await
+            .map_err(|e| FetchError::Http(e.to_string()))?
+            .len() as u64),
+        s => Err(FetchError::Http(format!("status {s} for size probe {url}"))),
+    }
 }
 
 /// Map a gloo fetch error, recognizing user-triggered aborts.
@@ -883,67 +923,27 @@ async fn http_range(
     }
 }
 
+/// The last `n` bytes, and the total size.
+///
+/// 🔴 Asks with an EXPLICIT range only, never `bytes=-n`. A suffix range is the
+/// one form an origin may decline, and Azure Front Door declines it by never
+/// answering at all — no status, no headers (measured 2026-08-11: >30 s, zero
+/// bytes, while `bytes=0-0` on the same URL returned 206 in 0.5 s). The old
+/// cancel-and-re-ask fallback only triggers on a `200`, so a silent origin left
+/// `.send().await` hanging and every `.3tz` open stalled before its first tile.
+///
+/// Costs one extra small request against origins that DO honour suffix ranges.
+/// That is the right trade: Azure never honoured them anyway (it answers 200 +
+/// full body), so this path already cost two requests everywhere we deploy.
 #[cfg(target_arch = "wasm32")]
 async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
-    // The probe gets its own AbortController: a server that doesn't support
-    // suffix ranges answers 200 + FULL body (Azure Blob does exactly this —
-    // verified live; only explicit ranges get a 206), and the transfer must
-    // be cancelled after the headers, not drained.
-    let probe_abort = AbortHandle::new();
-    let resp = gloo_net::http::Request::get(url)
-        .header("Range", &format!("bytes=-{n}"))
-        .abort_signal(Some(&probe_abort.signal()))
-        .send()
-        .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
-    match resp.status() {
-        206 => {
-            let total = resp
-                .headers()
-                .get("content-range")
-                .as_deref()
-                .and_then(parse_content_range_total)
-                .ok_or_else(|| {
-                    FetchError::Http(format!(
-                        "206 without a parseable Content-Range for {url} — \
-                         is Content-Range in the CORS ExposedHeaders?"
-                    ))
-                })?;
-            let bytes = resp
-                .binary()
-                .await
-                .map_err(|e| FetchError::Http(e.to_string()))?;
-            Ok((bytes, total))
-        }
-        200 => {
-            // Suffix range unsupported. With a Content-Length we cancel the
-            // full-body transfer and re-ask for the explicit tail range; only
-            // a length-less response (dev servers) gets drained whole.
-            let total = resp
-                .headers()
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
-            match total {
-                Some(total) if total > 0 => {
-                    probe_abort.trigger();
-                    drop(resp);
-                    let n = n.min(total);
-                    let bytes = http_range(url, total - n, n, None).await?;
-                    Ok((bytes, total))
-                }
-                _ => {
-                    let body = resp
-                        .binary()
-                        .await
-                        .map_err(|e| FetchError::Http(e.to_string()))?;
-                    let total = body.len() as u64;
-                    let n = n.min(total) as usize;
-                    Ok((body[body.len() - n..].to_vec(), total))
-                }
-            }
-        }
-        s => Err(FetchError::Http(format!("status {s} for suffix GET {url}"))),
+    let total = http_size(url).await?;
+    if total == 0 {
+        return Ok((Vec::new(), 0));
     }
+    let n = n.min(total);
+    let bytes = http_range(url, total - n, n, None).await?;
+    Ok((bytes, total))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -964,10 +964,32 @@ async fn http_get_all(url: &str, abort: Option<&AbortHandle>) -> Result<Vec<u8>,
 
 // Native HTTP: blocking reqwest on the worker thread `spawn_io` already runs
 // us on (dev/test convenience — production tile streaming is the wasm path).
+/// Native twin of the wasm [`http_size`] — explicit 1-byte range, never a
+/// suffix probe. See the wasm one for why.
 #[cfg(not(target_arch = "wasm32"))]
 async fn http_size(url: &str) -> Result<u64, FetchError> {
-    let (_, total) = http_suffix(url, 1).await?;
-    Ok(total)
+    let resp = reqwest::blocking::Client::new()
+        .get(url)
+        .header("Range", "bytes=0-0")
+        .send()
+        .map_err(|e| FetchError::Http(e.to_string()))?;
+    let status = resp.status().as_u16();
+    let content_range = resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    match status {
+        206 => content_range
+            .as_deref()
+            .and_then(parse_content_range_total)
+            .ok_or_else(|| FetchError::Http(format!("206 without Content-Range for {url}"))),
+        200 => Ok(resp
+            .bytes()
+            .map_err(|e| FetchError::Http(e.to_string()))?
+            .len() as u64),
+        s => Err(FetchError::Http(format!("status {s} for size probe {url}"))),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1000,47 +1022,27 @@ async fn http_range(
     }
 }
 
+/// The last `n` bytes, and the total size.
+///
+/// 🔴 Asks with an EXPLICIT range only, never `bytes=-n`. A suffix range is the
+/// one form an origin may decline, and Azure Front Door declines it by never
+/// answering at all — no status, no headers (measured 2026-08-11: >30 s, zero
+/// bytes, while `bytes=0-0` on the same URL returned 206 in 0.5 s). The old
+/// cancel-and-re-ask fallback only triggers on a `200`, so a silent origin left
+/// `.send().await` hanging and every `.3tz` open stalled before its first tile.
+///
+/// Costs one extra small request against origins that DO honour suffix ranges.
+/// That is the right trade: Azure never honoured them anyway (it answers 200 +
+/// full body), so this path already cost two requests everywhere we deploy.
 #[cfg(not(target_arch = "wasm32"))]
 async fn http_suffix(url: &str, n: u64) -> Result<(Vec<u8>, u64), FetchError> {
-    let resp = reqwest::blocking::Client::new()
-        .get(url)
-        .header("Range", format!("bytes=-{n}"))
-        .send()
-        .map_err(|e| FetchError::Http(e.to_string()))?;
-    let status = resp.status().as_u16();
-    let content_range = resp
-        .headers()
-        .get("content-range")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    // Suffix range unsupported (Azure Blob: 200 + full body) → drop the
-    // response after the headers (closes the connection mid-transfer) and
-    // re-ask for the explicit tail range. Only a length-less 200 is drained.
-    if status == 200 {
-        let total = resp.content_length().filter(|&t| t > 0);
-        if let Some(total) = total {
-            drop(resp);
-            let n = n.min(total);
-            let bytes = http_range(url, total - n, n, None).await?;
-            return Ok((bytes, total));
-        }
+    let total = http_size(url).await?;
+    if total == 0 {
+        return Ok((Vec::new(), 0));
     }
-    let body = resp.bytes().map_err(|e| FetchError::Http(e.to_string()))?;
-    match status {
-        206 => {
-            let total = content_range
-                .as_deref()
-                .and_then(parse_content_range_total)
-                .ok_or_else(|| FetchError::Http(format!("206 without Content-Range for {url}")))?;
-            Ok((body.to_vec(), total))
-        }
-        200 => {
-            let total = body.len() as u64;
-            let n = n.min(total) as usize;
-            Ok((body[body.len() - n..].to_vec(), total))
-        }
-        s => Err(FetchError::Http(format!("status {s} for suffix GET {url}"))),
-    }
+    let n = n.min(total);
+    let bytes = http_range(url, total - n, n, None).await?;
+    Ok((bytes, total))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
