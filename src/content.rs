@@ -68,7 +68,7 @@ use bevy_3d_tiles_prepare::read_accessor;
 use bevy_3d_tiles_prepare::{
     DracoPrim, FeatureCtx, Marks, PreparedFeatures, assemble_glb, buffer_view_slice,
     decode_meshopt_views, extract_planetary_root_offset, find_draco_prims, preprocess_basisu,
-    split_glb, strip_handled_extensions, tile_rtc_to_content_frame, unwrap_b3dm,
+    splice_draco, split_glb, strip_handled_extensions, tile_rtc_to_content_frame, unwrap_b3dm,
 };
 // `lib.rs` sniffs external tilesets with it (`looks_like_external_tileset`).
 pub(crate) use bevy_3d_tiles_prepare::memmem;
@@ -758,150 +758,11 @@ impl FeatSource {
     }
 }
 
-// ── Draco splice (T4 — Google P3DT content; decode shim is main-side) ───────
-
-/// Splice already-decoded Draco primitives into the document: decoded data
-/// appended to the BIN chunk behind fresh accessors, the per-primitive Draco
-/// extension removed. Returns the NEW BIN chunk — the caller rebuilds the GLB
-/// container once, after every other rewrite pass. The document-level
-/// extension strip is [`strip_handled_extensions`] (it must also run for
-/// content that declares Draco/RTC without a usable primitive).
-fn splice_draco(
-    json: &mut serde_json::Value,
-    bin: Option<&[u8]>,
-    prims: &[DracoPrim],
-    decoded: Vec<draco::DracoMesh>,
-) -> Result<Vec<u8>, String> {
-    let mut new_bin: Vec<u8> = bin.unwrap_or_default().to_vec();
-
-    for (prim, dm) in prims.iter().zip(decoded) {
-        // Indices.
-        while !new_bin.len().is_multiple_of(4) {
-            new_bin.push(0);
-        }
-        let idx_offset = new_bin.len();
-        for i in &dm.indices {
-            new_bin.extend_from_slice(&i.to_le_bytes());
-        }
-        let idx_view = push_json(
-            json,
-            "bufferViews",
-            serde_json::json!({
-                "buffer": 0, "byteOffset": idx_offset, "byteLength": dm.indices.len() * 4,
-            }),
-        );
-        let idx_accessor = serde_json::json!({
-            "bufferView": idx_view, "componentType": 5125,
-            "count": dm.indices.len(), "type": "SCALAR",
-        });
-        // Draco primitives reference accessors WITHOUT bufferViews (count/
-        // type only). Overwrite those in place — leaving them orphaned fails
-        // the gltf crate's "Missing data" validation.
-        set_or_push_accessor(json, prim, None, idx_accessor);
-
-        // Attributes (already dequantized to f32 by the decoder).
-        for (semantic, uid) in &prim.attributes {
-            let (_, components, data) = dm
-                .attributes
-                .iter()
-                .find(|(id, _, _)| id == uid)
-                .ok_or_else(|| format!("draco decoder returned no attribute {uid}"))?;
-            let type_str = match components {
-                1 => "SCALAR",
-                2 => "VEC2",
-                3 => "VEC3",
-                4 => "VEC4",
-                n => return Err(format!("draco attribute with {n} components")),
-            };
-            let count = data.len() / components;
-            let offset = new_bin.len();
-            for v in data {
-                new_bin.extend_from_slice(&v.to_le_bytes());
-            }
-            let view = push_json(
-                json,
-                "bufferViews",
-                serde_json::json!({
-                    "buffer": 0, "byteOffset": offset, "byteLength": data.len() * 4,
-                }),
-            );
-            let mut accessor = serde_json::json!({
-                "bufferView": view, "componentType": 5126,
-                "count": count, "type": type_str,
-            });
-            if semantic == "POSITION" {
-                // Spec mandates min/max on POSITION accessors.
-                let mut lo = [f32::INFINITY; 3];
-                let mut hi = [f32::NEG_INFINITY; 3];
-                for chunk in data.chunks_exact(3) {
-                    for c in 0..3 {
-                        lo[c] = lo[c].min(chunk[c]);
-                        hi[c] = hi[c].max(chunk[c]);
-                    }
-                }
-                accessor["min"] = serde_json::json!(lo);
-                accessor["max"] = serde_json::json!(hi);
-            }
-            set_or_push_accessor(json, prim, Some(semantic), accessor);
-        }
-
-        let p = &mut json["meshes"][prim.mesh]["primitives"][prim.prim];
-        if let Some(ext) = p.get_mut("extensions").and_then(|e| e.as_object_mut()) {
-            ext.remove("KHR_draco_mesh_compression");
-            if ext.is_empty() {
-                p.as_object_mut().unwrap().remove("extensions");
-            }
-        }
-    }
-
-    if json["buffers"][0].is_object() {
-        json["buffers"][0]["byteLength"] = serde_json::json!(new_bin.len());
-    } else if !new_bin.is_empty() {
-        json["buffers"] = serde_json::json!([{ "byteLength": new_bin.len() }]);
-    }
-    Ok(new_bin)
-}
-
-/// Point a primitive slot (`indices` when `semantic` is `None`, else
-/// `attributes[semantic]`) at `accessor`: overwrite the accessor the slot
-/// already references — Draco primitives carry bufferView-less accessors
-/// that fail validation if left orphaned — or append it and link the slot.
-fn set_or_push_accessor(
-    json: &mut serde_json::Value,
-    prim: &DracoPrim,
-    semantic: Option<&str>,
-    accessor: serde_json::Value,
-) {
-    let slot = {
-        let p = &json["meshes"][prim.mesh]["primitives"][prim.prim];
-        match semantic {
-            Some(s) => p["attributes"][s].as_u64(),
-            None => p["indices"].as_u64(),
-        }
-    };
-    match slot {
-        Some(existing) => json["accessors"][existing as usize] = accessor,
-        None => {
-            let ix = push_json(json, "accessors", accessor);
-            let p = &mut json["meshes"][prim.mesh]["primitives"][prim.prim];
-            match semantic {
-                Some(s) => p["attributes"][s] = serde_json::json!(ix),
-                None => p["indices"] = serde_json::json!(ix),
-            }
-        }
-    }
-}
-
-/// Append `value` to the top-level array `key` (created when absent),
-/// returning its index.
-fn push_json(json: &mut serde_json::Value, key: &str, value: serde_json::Value) -> usize {
-    if !json[key].is_array() {
-        json[key] = serde_json::json!([]);
-    }
-    let arr = json[key].as_array_mut().unwrap();
-    arr.push(value);
-    arr.len() - 1
-}
+// ── Draco splice: moved to `bevy_3d_tiles_prepare` (0.2.1) ──────────────────
+// `splice_draco` + its accessor helpers live in the prepare crate now, so a
+// host worker that owns its own Draco decoder can splice off-thread
+// (`draco_requests` → decode → `prepare_tile_extracting_with_draco`). The
+// inline path imports them above; the decode shim itself stays in `draco.rs`.
 
 /// Resolve a glTF buffer: GLB BIN chunk only (tiles are self-contained).
 fn resolve_buffer<'b>(buffer: &gltf::Buffer<'_>, blob: Option<&'b [u8]>) -> Option<&'b [u8]> {

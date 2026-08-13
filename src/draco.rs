@@ -12,13 +12,9 @@
 
 use crate::content::DecodeError;
 
-/// One decoded Draco mesh: triangle indices + dequantized float attributes,
-/// in the same order as the requested glTF attribute unique ids.
-pub struct DracoMesh {
-    pub indices: Vec<u32>,
-    /// `(unique_id, components_per_element, dequantized values)`.
-    pub attributes: Vec<(u32, usize, Vec<f32>)>,
-}
+// Moved to the prepare crate (0.2.1) so a host worker can splice its own
+// decoded meshes; re-exported here so `draco::DracoMesh` keeps working.
+pub use bevy_3d_tiles_prepare::DracoMesh;
 
 #[cfg(target_arch = "wasm32")]
 pub async fn decode(compressed: &[u8], attr_ids: &[u32]) -> Result<DracoMesh, DecodeError> {

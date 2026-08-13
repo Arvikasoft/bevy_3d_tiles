@@ -9,10 +9,16 @@
 //! same functions (moved here, never copied — the meshopt codec in
 //! [`meshopt`] is documented byte-lossless and must exist exactly once).
 //!
-//! What deliberately does NOT live here: anything needing a platform decoder
-//! (Draco's JS shim, splat renderers) — [`prepare_tile`] returns `Ok(None)`
-//! for those and the caller decodes inline — and anything producing bevy
-//! types (`Mesh`/`Image` assembly, KTX2 transcode).
+//! What deliberately does NOT live here: the platform decoders themselves
+//! (Draco's JS shim, splat renderers) — and anything producing bevy types
+//! (`Mesh`/`Image` assembly, KTX2 transcode). Draco *around* the decoder DOES
+//! live here since 0.2.1: a host that owns a decoder in its own realm (a Web
+//! Worker's JS shim) slices the compressed payloads out with
+//! [`draco_requests`], decodes them itself, and hands the results to
+//! [`prepare_tile_extracting_with_draco`], which splices them in
+//! ([`splice_draco`]) and continues the normal pipeline. A host without one
+//! keeps the old behaviour: [`prepare_tile`] returns `Ok(None)` and the
+//! caller decodes inline.
 
 use std::collections::HashMap;
 
@@ -404,6 +410,196 @@ pub fn buffer_view_slice<'b>(
     bin.ok_or("draco bufferView references the BIN chunk but the GLB has none")?
         .get(offset..offset + len)
         .ok_or_else(|| "draco bufferView out of BIN bounds".into())
+}
+
+/// One decoded Draco mesh: triangle indices + dequantized float attributes,
+/// keyed by glTF attribute unique id. Produced by a platform decoder —
+/// `bevy_3d_tiles::draco` (the main-thread JS shim) or a host worker's own —
+/// and consumed by [`splice_draco`].
+pub struct DracoMesh {
+    pub indices: Vec<u32>,
+    /// `(unique_id, components_per_element, dequantized values)`.
+    pub attributes: Vec<(u32, usize, Vec<f32>)>,
+}
+
+/// The compressed payload of one [`DracoPrim`], sliced and OWNED so a host can
+/// hand it to a platform decoder in another realm (a Web Worker's JS shim,
+/// across a `postMessage` boundary).
+pub struct DracoRequest {
+    /// glTF attribute unique ids, in [`DracoPrim::attributes`] order.
+    pub attr_ids: Vec<u32>,
+    pub compressed: Vec<u8>,
+}
+
+/// Slice every Draco primitive's compressed payload out of a tile. `[]` = no
+/// Draco content, answered from one marker scan (non-Draco tiles pay no JSON
+/// parse). Order matches [`find_draco_prims`] on the same document, which is
+/// the order [`prepare_tile_extracting_with_draco`] expects its decoded
+/// meshes in — decode the requests in order and hand the results back as-is.
+pub fn draco_requests(bytes: &[u8]) -> Result<Vec<DracoRequest>, DecodeError> {
+    let b3dm = unwrap_b3dm(bytes)?;
+    let bytes = match &b3dm {
+        Some(b) => b.glb,
+        None => bytes,
+    };
+    let (json_chunk, bin) = split_glb(bytes)?;
+    if !Marks::scan(json_chunk).draco {
+        return Ok(Vec::new());
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(json_chunk).map_err(|e| format!("tile json: {e}"))?;
+    find_draco_prims(&json)
+        .iter()
+        .map(|prim| {
+            Ok(DracoRequest {
+                attr_ids: prim.attributes.iter().map(|(_, id)| *id).collect(),
+                compressed: buffer_view_slice(&json, bin, prim.buffer_view)?.to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// Splice already-decoded Draco primitives into the document: decoded data
+/// appended to the BIN chunk behind fresh accessors, the per-primitive Draco
+/// extension removed. Returns the NEW BIN chunk — the caller rebuilds the GLB
+/// container once, after every other rewrite pass. The document-level
+/// extension strip is [`strip_handled_extensions`] (it must also run for
+/// content that declares Draco/RTC without a usable primitive).
+pub fn splice_draco(
+    json: &mut serde_json::Value,
+    bin: Option<&[u8]>,
+    prims: &[DracoPrim],
+    decoded: Vec<DracoMesh>,
+) -> Result<Vec<u8>, String> {
+    let mut new_bin: Vec<u8> = bin.unwrap_or_default().to_vec();
+
+    for (prim, dm) in prims.iter().zip(decoded) {
+        // Indices.
+        while !new_bin.len().is_multiple_of(4) {
+            new_bin.push(0);
+        }
+        let idx_offset = new_bin.len();
+        for i in &dm.indices {
+            new_bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let idx_view = push_json(
+            json,
+            "bufferViews",
+            serde_json::json!({
+                "buffer": 0, "byteOffset": idx_offset, "byteLength": dm.indices.len() * 4,
+            }),
+        );
+        let idx_accessor = serde_json::json!({
+            "bufferView": idx_view, "componentType": 5125,
+            "count": dm.indices.len(), "type": "SCALAR",
+        });
+        // Draco primitives reference accessors WITHOUT bufferViews (count/
+        // type only). Overwrite those in place — leaving them orphaned fails
+        // the gltf crate's "Missing data" validation.
+        set_or_push_accessor(json, prim, None, idx_accessor);
+
+        // Attributes (already dequantized to f32 by the decoder).
+        for (semantic, uid) in &prim.attributes {
+            let (_, components, data) = dm
+                .attributes
+                .iter()
+                .find(|(id, _, _)| id == uid)
+                .ok_or_else(|| format!("draco decoder returned no attribute {uid}"))?;
+            let type_str = match components {
+                1 => "SCALAR",
+                2 => "VEC2",
+                3 => "VEC3",
+                4 => "VEC4",
+                n => return Err(format!("draco attribute with {n} components")),
+            };
+            let count = data.len() / components;
+            let offset = new_bin.len();
+            for v in data {
+                new_bin.extend_from_slice(&v.to_le_bytes());
+            }
+            let view = push_json(
+                json,
+                "bufferViews",
+                serde_json::json!({
+                    "buffer": 0, "byteOffset": offset, "byteLength": data.len() * 4,
+                }),
+            );
+            let mut accessor = serde_json::json!({
+                "bufferView": view, "componentType": 5126,
+                "count": count, "type": type_str,
+            });
+            if semantic == "POSITION" {
+                // Spec mandates min/max on POSITION accessors.
+                let mut lo = [f32::INFINITY; 3];
+                let mut hi = [f32::NEG_INFINITY; 3];
+                for chunk in data.chunks_exact(3) {
+                    for c in 0..3 {
+                        lo[c] = lo[c].min(chunk[c]);
+                        hi[c] = hi[c].max(chunk[c]);
+                    }
+                }
+                accessor["min"] = serde_json::json!(lo);
+                accessor["max"] = serde_json::json!(hi);
+            }
+            set_or_push_accessor(json, prim, Some(semantic), accessor);
+        }
+
+        let p = &mut json["meshes"][prim.mesh]["primitives"][prim.prim];
+        if let Some(ext) = p.get_mut("extensions").and_then(|e| e.as_object_mut()) {
+            ext.remove("KHR_draco_mesh_compression");
+            if ext.is_empty() {
+                p.as_object_mut().unwrap().remove("extensions");
+            }
+        }
+    }
+
+    if json["buffers"][0].is_object() {
+        json["buffers"][0]["byteLength"] = serde_json::json!(new_bin.len());
+    } else if !new_bin.is_empty() {
+        json["buffers"] = serde_json::json!([{ "byteLength": new_bin.len() }]);
+    }
+    Ok(new_bin)
+}
+
+/// Point a primitive slot (`indices` when `semantic` is `None`, else
+/// `attributes[semantic]`) at `accessor`: overwrite the accessor the slot
+/// already references — Draco primitives carry bufferView-less accessors
+/// that fail validation if left orphaned — or append it and link the slot.
+fn set_or_push_accessor(
+    json: &mut serde_json::Value,
+    prim: &DracoPrim,
+    semantic: Option<&str>,
+    accessor: serde_json::Value,
+) {
+    let slot = {
+        let p = &json["meshes"][prim.mesh]["primitives"][prim.prim];
+        match semantic {
+            Some(s) => p["attributes"][s].as_u64(),
+            None => p["indices"].as_u64(),
+        }
+    };
+    match slot {
+        Some(existing) => json["accessors"][existing as usize] = accessor,
+        None => {
+            let ix = push_json(json, "accessors", accessor);
+            let p = &mut json["meshes"][prim.mesh]["primitives"][prim.prim];
+            match semantic {
+                Some(s) => p["attributes"][s] = serde_json::json!(ix),
+                None => p["indices"] = serde_json::json!(ix),
+            }
+        }
+    }
+}
+
+/// Append `value` to the top-level array `key` (created when absent),
+/// returning its index.
+fn push_json(json: &mut serde_json::Value, key: &str, value: serde_json::Value) -> usize {
+    if !json[key].is_array() {
+        json[key] = serde_json::json!([]);
+    }
+    let arr = json[key].as_array_mut().unwrap();
+    arr.push(value);
+    arr.len() - 1
 }
 
 // ── EXT_meshopt_compression preprocessing (T6 — our emitted geometry) ────────
@@ -853,6 +1049,20 @@ pub fn prepare_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
 /// properties), so those tiles still pay one wasted round trip each. Catching
 /// them means parsing the JSON twice, which costs more than the trip saves.
 pub fn extract_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
+    extract_triage(bytes, georeferenced, false)
+}
+
+/// [`extract_would_decline`] for a host whose worker owns a Draco decoder and
+/// prepares via [`prepare_tile_extracting_with_draco`]: Draco tiles ARE worth
+/// dispatching there (the decode itself moves off-thread), so only splats and
+/// the unextractable-vanilla case still decline. A Google P3DT layer is Draco
+/// (and textured) on every tile, so under this predicate its tiles round-trip
+/// as S4 prepared GLBs with the Draco decode + splice done worker-side.
+pub fn extract_would_decline_with_draco(bytes: &[u8], georeferenced: bool) -> bool {
+    extract_triage(bytes, georeferenced, true)
+}
+
+fn extract_triage(bytes: &[u8], georeferenced: bool, draco_ok: bool) -> bool {
     let bytes = match unwrap_b3dm(bytes) {
         Ok(Some(b)) => b.glb,
         Ok(None) => bytes,
@@ -868,7 +1078,12 @@ pub fn extract_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
     let unextractable = memmem(json_chunk, b"\"images\"")
         || memmem(json_chunk, b"\"textures\"")
         || memmem(json_chunk, b"\"extensionsRequired\"");
-    declines(&marks, georeferenced) && (unextractable || marks.draco || marks.splat)
+    let undecodable = if draco_ok {
+        marks.splat
+    } else {
+        marks.draco || marks.splat
+    };
+    (undecodable || (!georeferenced && marks.vanilla())) && (unextractable || undecodable)
 }
 
 /// The predicate [`prepare_tile`] opens with, in ONE place — an off-thread
@@ -893,7 +1108,7 @@ pub fn prepare_tile(
     bytes: &[u8],
     georeferenced: bool,
 ) -> Result<Option<PreparedTile>, DecodeError> {
-    prepare_tile_inner(bytes, georeferenced, false)
+    prepare_tile_inner(bytes, georeferenced, false, None)
 }
 
 /// [`prepare_tile`] plus geometry extraction (offthread-decode plan S5): the
@@ -911,13 +1126,28 @@ pub fn prepare_tile_extracting(
     bytes: &[u8],
     georeferenced: bool,
 ) -> Result<Option<PreparedTile>, DecodeError> {
-    prepare_tile_inner(bytes, georeferenced, true)
+    prepare_tile_inner(bytes, georeferenced, true, None)
+}
+
+/// [`prepare_tile_extracting`] for a caller that already decoded this tile's
+/// Draco primitives (via [`draco_requests`] + its own platform decoder):
+/// the decoded meshes are spliced in ([`splice_draco`]) after the meshopt
+/// pass, the extension is stripped, and the rest of the pipeline runs
+/// unchanged. `decoded` must be in [`draco_requests`] order — one mesh per
+/// request, a mismatch is an error, never a silent truncation.
+pub fn prepare_tile_extracting_with_draco(
+    bytes: &[u8],
+    georeferenced: bool,
+    decoded: Vec<DracoMesh>,
+) -> Result<Option<PreparedTile>, DecodeError> {
+    prepare_tile_inner(bytes, georeferenced, true, Some(decoded))
 }
 
 fn prepare_tile_inner(
     bytes: &[u8],
     georeferenced: bool,
     extract: bool,
+    draco: Option<Vec<DracoMesh>>,
 ) -> Result<Option<PreparedTile>, DecodeError> {
     // Legacy b3dm containers unwrap to their embedded glb FIRST — a b3dm is
     // not glTF magic, so split_glb would misread it as bare JSON.
@@ -928,13 +1158,15 @@ fn prepare_tile_inner(
     };
     let (json_chunk, bin) = split_glb(bytes)?;
     let marks = Marks::scan(json_chunk);
-    if marks.draco || marks.splat {
-        return Ok(None); // needs a platform decoder this crate has not got
+    if marks.splat || (marks.draco && draco.is_none()) {
+        return Ok(None); // needs a platform decoder/renderer the caller has not got
     }
     // Vanilla and not georeferenced: no rewrite, nothing to extract from the
     // JSON side-band. Without S5 there is no reason to parse it at all; WITH
     // S5 the geometry is the whole point of the trip, so it falls through.
-    if !extract && declines(&marks, georeferenced) {
+    // `!marks.draco` guards the echo: `declines` counts the Draco mark, but a
+    // tile arriving WITH decoded meshes must splice below, never echo.
+    if !extract && !marks.draco && declines(&marks, georeferenced) {
         return Ok(Some(PreparedTile {
             glb: bytes.to_vec(),
             meshes: None,
@@ -982,17 +1214,38 @@ fn prepare_tile_inner(
 
     // Same pass order as the inline path: meshopt first (it REBUILDS the BIN,
     // so every later pass reads decoded bytes; buffer-view indices preserved).
-    let new_bin: Option<Vec<u8>> = if marks.meshopt {
+    let mut new_bin: Option<Vec<u8>> = if marks.meshopt {
         Some(decode_meshopt_views(&mut json, bin).map_err(DecodeError::meshopt)?)
     } else {
         None
     };
+    // Caller-decoded Draco splices exactly where the inline path splices its
+    // shim-decoded meshes: after meshopt, before basisu.
+    if marks.draco
+        && let Some(decoded) = draco
+    {
+        let prims = find_draco_prims(&json);
+        if prims.len() != decoded.len() {
+            return Err(DecodeError::draco(format!(
+                "{} draco primitives but {} decoded meshes — decode draco_requests in order",
+                prims.len(),
+                decoded.len()
+            )));
+        }
+        new_bin = Some(splice_draco(
+            &mut json,
+            new_bin.as_deref().or(bin),
+            &prims,
+            decoded,
+        )?);
+    }
     if marks.basisu {
         preprocess_basisu(&mut json);
     }
-    // Runs on the MARKER, like inline (`marks.draco` is impossible here —
-    // declined above).
-    let stripped = marks.rtc;
+    // Runs on the MARKER, like inline — a document can declare Draco/RTC
+    // without a usable primitive and the gltf crate still hard-rejects the
+    // unknown `extensionsRequired` entry.
+    let stripped = marks.rtc || marks.draco;
     if stripped {
         strip_handled_extensions(&mut json);
     }
@@ -1106,6 +1359,80 @@ mod tests {
         // Not a legacy container: pass-through for the glb/bare-JSON path.
         assert!(unwrap_b3dm(b"glTF....").unwrap().is_none());
         assert!(unwrap_b3dm(br#"{"a":1}"#).unwrap().is_none());
+    }
+
+    /// The worker-side Draco flow end to end: slice requests out, decode them
+    /// "elsewhere" (a fabricated mesh stands in for the platform decoder),
+    /// hand them back — the pipeline splices, strips, and the triage
+    /// predicates route a Draco tile to the worker only when it can decode.
+    #[test]
+    fn draco_requests_then_prepare_with_decoded_meshes() {
+        let fake_compressed = vec![0xAAu8; 16];
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "extensionsUsed": ["KHR_draco_mesh_compression"],
+            "extensionsRequired": ["KHR_draco_mesh_compression"],
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{
+                "attributes": { "POSITION": 0 },
+                "mode": 4,
+                "extensions": { "KHR_draco_mesh_compression": {
+                    "bufferView": 0,
+                    "attributes": { "POSITION": 0 }
+                }}
+            }]}],
+            "accessors": [
+                { "componentType": 5126, "count": 3, "type": "VEC3",
+                  "min": [0,0,0], "max": [1,1,0] }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": fake_compressed.len() }
+            ],
+            "buffers": [{ "byteLength": fake_compressed.len() }]
+        });
+        let glb = assemble_glb(&serde_json::to_vec(&json).unwrap(), &fake_compressed);
+
+        // Triage: undecodable without a decoder, dispatchable with one.
+        assert!(extract_would_decline(&glb, false));
+        assert!(!extract_would_decline_with_draco(&glb, false));
+        // Without decoded meshes the pipeline still declines to the caller.
+        assert!(prepare_tile_extracting(&glb, false).unwrap().is_none());
+
+        let reqs = draco_requests(&glb).expect("requests");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].attr_ids, vec![0]);
+        assert_eq!(reqs[0].compressed, fake_compressed);
+        // Non-Draco bytes answer [] from the marker scan alone.
+        assert!(
+            draco_requests(br#"{"asset":{"version":"2.0"}}"#)
+                .unwrap()
+                .is_empty()
+        );
+
+        let decoded = vec![DracoMesh {
+            indices: vec![0, 1, 2],
+            attributes: vec![(0, 3, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0])],
+        }];
+        let p = prepare_tile_extracting_with_draco(&glb, false, decoded)
+            .expect("prepare")
+            .expect("prepared, not declined");
+        // Whichever route extraction picked, no Draco survives the output.
+        match &p.meshes {
+            Some(m) => {
+                assert_eq!(m.primitives.len(), 1);
+                assert_eq!(m.primitives[0].positions.len(), 3);
+            }
+            None => {
+                assert!(!p.glb.is_empty());
+                let (j, _) = split_glb(&p.glb).unwrap();
+                assert!(!memmem(j, b"KHR_draco_mesh_compression"));
+            }
+        }
+
+        // A count mismatch is an error, never a silent truncation.
+        assert!(prepare_tile_extracting_with_draco(&glb, false, Vec::new()).is_err());
     }
 
     #[test]
