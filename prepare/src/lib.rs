@@ -952,10 +952,12 @@ fn prepare_tile_inner(
     // bare-glb CESIUM_RTC is already content-frame (see [`B3dm`]).
     let mut rtc_center = b3dm_rtc
         .or_else(|| {
-            json["extensions"]["CESIUM_RTC"]["center"].as_array().and_then(|c| {
-                let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
-                <[f64; 3]>::try_from(v).ok()
-            })
+            json["extensions"]["CESIUM_RTC"]["center"]
+                .as_array()
+                .and_then(|c| {
+                    let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
+                    <[f64; 3]>::try_from(v).ok()
+                })
         })
         .map(|c| {
             if b3dm.is_some() {
@@ -1079,12 +1081,17 @@ mod tests {
         let p = prepare_tile(&b, true).expect("prepare").expect("prepared");
         assert_eq!(p.rtc_center, Some([1.0, 3.0, -2.0]));
 
-        let p = prepare_tile(inner, true).expect("prepare").expect("prepared");
+        let p = prepare_tile(inner, true)
+            .expect("prepare")
+            .expect("prepared");
         assert_eq!(p.rtc_center, Some([1.0, 2.0, 3.0]));
 
         // Draco b3dm (the real swisstopo/PLATEAU tiles) still declines to the
         // platform decoder, and the off-thread triage agrees.
-        let draco = b3dm("{}", br#"{"extensionsUsed":["KHR_draco_mesh_compression"]}"#);
+        let draco = b3dm(
+            "{}",
+            br#"{"extensionsUsed":["KHR_draco_mesh_compression"]}"#,
+        );
         assert!(prepare_tile(&draco, true).unwrap().is_none());
         assert!(prepare_would_decline(&draco, true));
     }
