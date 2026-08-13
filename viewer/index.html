@@ -58,7 +58,11 @@
   </div>
 
   <script>
-    if (!navigator.gpu) document.getElementById('no-webgpu').hidden = false;
+    (async () => {
+      const gpu = navigator.gpu;
+      const adapter = gpu && await gpu.requestAdapter().catch(() => null);
+      if (!adapter) document.getElementById('no-webgpu').hidden = false;
+    })();
 
     // Verified-open datasets. lat/lon/elev/dist hand-picked per dataset;
     // attribution is a license requirement, keep it visible.
