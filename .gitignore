@@ -1,3 +1,5 @@
 /target
 /prepare/target
 Cargo.lock
+/viewer/target
+/viewer/dist

@@ -1,0 +1,34 @@
+# The web viewer — the live demo at https://www.arvikasoft.se/bevy-3d-tiles
+# and the smallest real integration of the crate (one tileset, one camera).
+# Not published; build with `trunk serve` / `trunk build --release` here.
+[package]
+name = "tiles3d_viewer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy_3d_tiles = { path = ".." }
+# The app/window/render stack the library deliberately doesn't pull.
+# No tonemapping_luts: ~4 MB of embedded KTX2 LUTs; the camera uses a
+# non-LUT tonemapper instead.
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "default_app",
+    "bevy_winit",
+    "webgpu",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["Window", "Location", "UrlSearchParams"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = ["x11"] }
+
+# Size first: the whole point is a small wire download.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"

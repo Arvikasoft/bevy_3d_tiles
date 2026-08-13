@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>bevy_3d_tiles viewer</title>
+  <link data-trunk rel="rust" data-wasm-opt="0" />
+  <link data-trunk rel="copy-file" href="../wasm/shims.js" />
+  <link data-trunk rel="copy-file" href="../wasm/libktx_read.js" />
+  <link data-trunk rel="copy-file" href="../wasm/libktx_read.wasm" />
+  <link data-trunk rel="copy-dir" href="../assets/fixtures/tiles3d-demo" />
+  <script src="shims.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #d9e2ec; font: 14px/1.4 system-ui, sans-serif; }
+    #wrap { position: fixed; inset: 0; }
+    canvas { display: block; width: 100%; height: 100%; outline: none; }
+    #panel {
+      position: fixed; top: 12px; left: 12px; z-index: 10;
+      background: rgba(255,255,255,.92); border-radius: 8px; padding: 10px 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,.15); display: flex; flex-direction: column; gap: 8px;
+      max-width: min(420px, calc(100vw - 24px));
+    }
+    #panel .row { display: flex; gap: 6px; }
+    select, input, button { font: inherit; padding: 5px 8px; border: 1px solid #bbb; border-radius: 5px; background: #fff; }
+    select { flex: 1; min-width: 0; }
+    input { flex: 1; min-width: 0; }
+    button { cursor: pointer; background: #1a3a5c; color: #fff; border-color: #1a3a5c; }
+    #attribution {
+      position: fixed; bottom: 8px; right: 10px; z-index: 10;
+      background: rgba(255,255,255,.85); border-radius: 5px; padding: 2px 8px; font-size: 12px;
+    }
+    #attribution a { color: inherit; }
+    #hint { color: #556; font-size: 12px; }
+    #no-webgpu {
+      position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
+      background: #d9e2ec; padding: 24px; text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="tiles3d-canvas"></canvas></div>
+
+  <div id="panel">
+    <div class="row"><select id="dataset"></select></div>
+    <div class="row">
+      <input id="custom" type="url" placeholder="…or paste a tileset.json / .3tz URL" spellcheck="false" />
+      <button id="load">Load</button>
+    </div>
+    <div id="hint">drag&nbsp;·&nbsp;orbit&nbsp;&nbsp;wheel&nbsp;·&nbsp;zoom&nbsp;&nbsp;right-drag&nbsp;·&nbsp;pan</div>
+  </div>
+  <div id="attribution"></div>
+
+  <div id="no-webgpu" hidden>
+    <p><strong>This viewer needs WebGPU.</strong><br/>
+    Use a current Chrome, Edge, Firefox, or Safari release.</p>
+  </div>
+
+  <script>
+    if (!navigator.gpu) document.getElementById('no-webgpu').hidden = false;
+
+    // Verified-open datasets. lat/lon/elev/dist hand-picked per dataset;
+    // attribution is a license requirement, keep it visible.
+    const DATASETS = [
+      { name: 'Demo tileset (bundled)', url: 'tiles3d-demo/tileset.json', dist: 120,
+        attribution: 'bevy_3d_tiles demo fixture' },
+      { name: 'Switzerland — swissBUILDINGS3D (Bern)', lat: 46.948, lon: 7.4474, elev: 550, dist: 2500,
+        url: 'https://3d.geo.admin.ch/ch.swisstopo.swissbuildings3d.3d/v1/tileset.json',
+        attribution: '© <a href="https://www.swisstopo.admin.ch/en/switzerland-in-3d" target="_blank" rel="noopener">swisstopo</a>' },
+      { name: 'Tokyo — PLATEAU buildings (Chiyoda)', lat: 35.694, lon: 139.7536, elev: 30, dist: 3000,
+        url: 'https://assets.cms.plateau.reearth.io/assets/0e/e5948a-e95c-4e31-be85-1f8c066ed996/13101_chiyoda-ku_pref_2023_citygml_1_op_bldg_3dtiles_13101_chiyoda-ku_lod1/tileset.json',
+        attribution: '© <a href="https://www.mlit.go.jp/plateau/en/" target="_blank" rel="noopener">MLIT Japan, Project PLATEAU</a> (CC BY 4.0)' },
+    ];
+
+    const q = new URLSearchParams(location.search);
+    const sel = document.getElementById('dataset');
+    DATASETS.forEach((d, i) => sel.add(new Option(d.name, i)));
+    sel.add(new Option('Custom URL', 'custom'));
+
+    const current = q.get('tileset') || DATASETS[0].url;
+    const knownIdx = DATASETS.findIndex(d => d.url === current);
+    sel.value = knownIdx >= 0 ? knownIdx : 'custom';
+    if (knownIdx < 0 && q.get('tileset')) document.getElementById('custom').value = current;
+    document.getElementById('attribution').innerHTML =
+      knownIdx >= 0 ? DATASETS[knownIdx].attribution : '';
+
+    function open(params) {
+      location.search = new URLSearchParams(params).toString();
+    }
+
+    sel.onchange = () => {
+      const d = DATASETS[sel.value];
+      if (d) open({ tileset: d.url, lat: d.lat ?? '', lon: d.lon ?? '', elev: d.elev ?? '', dist: d.dist ?? '' });
+    };
+
+    // WGS84 ECEF -> geodetic (Bowring), for centering on pasted tilesets.
+    function ecefToGeodetic(x, y, z) {
+      const a = 6378137, f = 1 / 298.257223563, b = a * (1 - f), e2 = f * (2 - f), ep2 = (a * a - b * b) / (b * b);
+      const p = Math.hypot(x, y), th = Math.atan2(a * z, b * p);
+      const lat = Math.atan2(z + ep2 * b * Math.sin(th) ** 3, p - e2 * a * Math.cos(th) ** 3);
+      const N = a / Math.sqrt(1 - e2 * Math.sin(lat) ** 2);
+      return [lat * 180 / Math.PI, Math.atan2(y, x) * 180 / Math.PI, p / Math.cos(lat) - N];
+    }
+
+    // Pasted URL: sniff the root bounding volume so georeferenced tilesets get
+    // an anchor + sane camera distance. Failures (CORS, .3tz, no region) just
+    // load anchored at the origin — the viewer still works for local-frame sets.
+    async function loadCustom() {
+      const url = document.getElementById('custom').value.trim();
+      if (!url) return;
+      const params = { tileset: url };
+      try {
+        const t = await (await fetch(url, { mode: 'cors' })).json();
+        const root = t.root ?? {};
+        const r = root.boundingVolume?.region;
+        const deg = x => x * 180 / Math.PI;
+        if (r) {
+          const lat = deg((r[1] + r[3]) / 2);
+          const extent = Math.max((r[2] - r[0]) * 6378137 * Math.cos(lat * Math.PI / 180), (r[3] - r[1]) * 6378137);
+          Object.assign(params, {
+            lat: lat.toFixed(6), lon: deg((r[0] + r[2]) / 2).toFixed(6),
+            elev: Math.round((r[4] + r[5]) / 2),
+            dist: Math.round(Math.min(Math.max(extent * 0.8, 200), 20000)),
+          });
+        } else {
+          const box = root.boundingVolume?.box;
+          const m = root.transform;
+          let c = box ? box.slice(0, 3) : [0, 0, 0];
+          if (m) c = [m[12] + c[0], m[13] + c[1], m[14] + c[2]]; // translation-only compose, fine for centering
+          if (Math.hypot(...c) > 6e6) { // planetary magnitude = ECEF-georeferenced
+            const [lat, lon, elev] = ecefToGeodetic(...c);
+            const extent = box ? 2 * Math.max(Math.hypot(box[3], box[4], box[5]), Math.hypot(box[6], box[7], box[8]), Math.hypot(box[9], box[10], box[11])) : 2000;
+            Object.assign(params, {
+              lat: lat.toFixed(6), lon: lon.toFixed(6), elev: Math.round(elev),
+              dist: Math.round(Math.min(Math.max(extent * 0.8, 200), 20000)),
+            });
+          } else if (box) {
+            params.dist = Math.round(Math.min(Math.max(2 * Math.hypot(box[3], box[4], box[5]) * 2, 50), 20000));
+          }
+        }
+      } catch (e) {
+        console.warn('tileset sniff failed (CORS or not JSON) — loading anchored at origin', e);
+      }
+      open(params);
+    }
+    document.getElementById('load').onclick = loadCustom;
+    document.getElementById('custom').addEventListener('keydown', e => { if (e.key === 'Enter') loadCustom(); });
+  </script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Demo pages embed the viewer from a different origin (arvikasoft.se serves
+# the built files itself, so this only matters for `trunk serve` dev).
+public_url = "./"
+
+[watch]
+ignore = ["./dist"]
+
+[serve]
+address = "127.0.0.1"
+port = 5180
+open = false
+
+# Post-build size pass. Trunk's built-in wasm-opt is disabled via
+# data-wasm-opt="0" in index.html (it takes no extra args); -O2 lands within a
+# few % of -Oz gzipped at a fraction of the runtime (measured on bevy wasm).
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+    "-c",
+    "command -v wasm-opt >/dev/null 2>&1 || { echo '[trunk] wasm-opt not on PATH; skipping'; exit 0; }; for f in \"$TRUNK_STAGING_DIR\"/*_bg.wasm; do [ -f \"$f\" ] || continue; before=$(wc -c < \"$f\"); wasm-opt --all-features -O2 -o \"$f.tmp\" \"$f\" && mv \"$f.tmp\" \"$f\"; echo \"[trunk] wasm-opt: $before -> $(wc -c < \"$f\") bytes\"; done",
+]

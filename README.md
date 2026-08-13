@@ -9,6 +9,10 @@ Extracted from [TurboTwin](https://turbotwin.cloud)'s production digital-twin
 viewer, where it streams multi-hundred-MB site meshes, LiDAR point clouds,
 and gaussian-splat captures in the browser.
 
+**[▶ Live demo](https://www.arvikasoft.se/bevy-3d-tiles)** — the [`viewer/`](viewer/)
+example compiled to wasm, streaming Swiss federal buildings and Tokyo's
+PLATEAU model; paste any CORS-enabled tileset URL to view your own.
+
 **Community:** [Discord — #bevy-3d-tiles](https://discord.gg/SPqnj4pdAE) for
 questions and dev chat · [GitHub issues](https://github.com/Arvikasoft/bevy_3d_tiles/issues)
 for bugs and feature requests.
@@ -48,13 +52,18 @@ for bugs and feature requests.
   [`geodesy::world_from_ecef`]) — including **Google Photorealistic 3D
   Tiles** with the full session protocol, attribution aggregation, cache
   bypass, and a client-side daily request cap (see the ToS note below).
+- **Legacy `b3dm` containers** — unwrapped to their embedded glTF with
+  feature-table `RTC_CENTER`/`CESIUM_RTC` placement, because the big open
+  fleets (swisstopo's swissBUILDINGS3D, Japan's PLATEAU) still serve 1.0
+  tilesets. Batch tables are not surfaced (no per-feature picking on b3dm).
 
 ## What it deliberately does not do
 
 Raster overlays, quantized-mesh terrain, vector/voxel tiles, time-dynamic
 tiles, Cesium ion / iTwin clients, implicit tiling (explicit tilesets are
-fine to ~100M points), legacy `b3dm`/`pnts`/`i3dm` content (deprecated in
-1.1). If you need those, [cesium-native](https://github.com/CesiumGS/cesium-native)
+fine to ~100M points), legacy `pnts`/`i3dm`/`cmpt` content (deprecated in
+1.1; plain `b3dm` IS supported, see above). If you need those,
+[cesium-native](https://github.com/CesiumGS/cesium-native)
 is the reference implementation.
 
 ## Quickstart
@@ -95,6 +104,7 @@ Try it now — a small fixture tileset ships in the repo:
 cargo run --example local_tileset                 # bundled 3-level demo tileset
 cargo run --example local_tileset -- <path-or-url>
 GOOGLE_MAPS_API_KEY=… cargo run --example google_p3dt   # photorealistic Earth
+(cd viewer && trunk serve)                        # the web viewer (live-demo source)
 ```
 
 Dev trigger (works in any host app): `TT_TILES3D=fixture|<path>|<url>` on
