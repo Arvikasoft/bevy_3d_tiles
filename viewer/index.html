@@ -35,6 +35,8 @@
       position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
       background: #d9e2ec; padding: 24px; text-align: center;
     }
+    /* display:flex above would otherwise beat the UA's [hidden]{display:none} */
+    #no-webgpu[hidden] { display: none; }
   </style>
 </head>
 <body>
