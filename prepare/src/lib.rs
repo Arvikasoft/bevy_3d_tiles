@@ -1083,7 +1083,11 @@ fn extract_triage(bytes: &[u8], georeferenced: bool, draco_ok: bool) -> bool {
     } else {
         marks.draco || marks.splat
     };
-    (undecodable || (!georeferenced && marks.vanilla())) && (unextractable || undecodable)
+    // Minimal form of `(undecodable || vanilla-echo) && (unextractable ||
+    // undecodable)`: undecodable content always declines; the vanilla
+    // non-georeferenced echo declines only when it is also unextractable
+    // (the S5 relaxation — see `extract_would_decline`'s doc).
+    undecodable || (!georeferenced && marks.vanilla() && unextractable)
 }
 
 /// The predicate [`prepare_tile`] opens with, in ONE place — an off-thread
