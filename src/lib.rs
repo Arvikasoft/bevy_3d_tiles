@@ -2568,6 +2568,16 @@ mod tests {
     use super::*;
     use bevy::tasks::block_on;
 
+    /// Pins `tile_rtc_to_content_frame` (prepare crate, bevy-free) to the real
+    /// `YUP_TO_ZUP`: rtc composes innermost — `… × YUP_TO_ZUP × T(rtc)` — so a
+    /// tile-frame b3dm `RTC_CENTER` must round-trip through the rotation.
+    #[test]
+    fn b3dm_tile_rtc_rotation_is_yup_to_zup_inverse() {
+        let c = DVec3::new(4_350_777.09, 778_467.08, 4_582_990.75); // real swisstopo RTC_CENTER
+        let stored = DVec3::from_array(prepare::tile_rtc_to_content_frame(c.to_array()));
+        assert_eq!(traversal::YUP_TO_ZUP.transform_point3(stored), c);
+    }
+
     /// The host-override contract (see [`Tiles3dConfig`] + [`Tiles3dPlugin`]
     /// docs): a config inserted before the plugin survives `add_plugins`, because
     /// `build` registers it with `init_resource` (never overwrites). The TurboTwin

@@ -133,6 +133,67 @@ impl Marks {
     }
 }
 
+/// A legacy 3D Tiles 1.0 `b3dm` container, unwrapped to its embedded GLB
+/// (the format the open-data fleets — swisstopo, PLATEAU — still serve).
+///
+/// `rtc_center` is the feature table's `RTC_CENTER`, in the TILE frame
+/// (z-up tileset axes). The tile compose applies rtc offsets innermost — in
+/// the glTF y-up content frame — so callers rotate it (and any `CESIUM_RTC`
+/// in the embedded glb, which the b3dm pipeline defines in the same tile
+/// frame) through [`tile_rtc_to_content_frame`] before storing it. A bare-glb
+/// `CESIUM_RTC` (offline Google P3DT content) is already content-frame and
+/// must NOT be rotated — the container is what decides.
+#[derive(Debug)]
+pub struct B3dm<'a> {
+    pub glb: &'a [u8],
+    pub rtc_center: Option<[f64; 3]>,
+}
+
+/// Unwrap a `b3dm` container. `Ok(None)` = not a b3dm — hand the bytes to
+/// [`split_glb`] as before. The other 1.0 containers error by name (`cmpt`
+/// composites and point/instanced tiles have no decoder here).
+pub fn unwrap_b3dm(bytes: &[u8]) -> Result<Option<B3dm<'_>>, String> {
+    match bytes.get(0..4) {
+        Some(b"b3dm") => {}
+        Some(m @ (b"i3dm" | b"pnts" | b"cmpt")) => {
+            return Err(format!(
+                "legacy 3D Tiles 1.0 '{}' content unsupported (only b3dm)",
+                String::from_utf8_lossy(m)
+            ));
+        }
+        _ => return Ok(None),
+    }
+    if bytes.len() < 28 {
+        return Err("b3dm truncated before header end".into());
+    }
+    let u = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let (byte_len, ftj, ftb, btj, btb) = (u(8), u(12), u(16), u(20), u(24));
+    let glb = bytes
+        .get(28 + ftj + ftb + btj + btb..byte_len.min(bytes.len()))
+        .filter(|g| !g.is_empty())
+        .ok_or("b3dm tables overrun the buffer")?;
+    // Feature table: only RTC_CENTER matters to placement (BATCH_LENGTH and
+    // the per-feature semantics have no consumer here).
+    let mut rtc_center = None;
+    if ftj > 0 {
+        let ft: serde_json::Value = serde_json::from_slice(&bytes[28..28 + ftj])
+            .map_err(|e| format!("b3dm feature table: {e}"))?;
+        rtc_center = ft["RTC_CENTER"].as_array().and_then(|c| {
+            let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
+            <[f64; 3]>::try_from(v).ok()
+        });
+    }
+    Ok(Some(B3dm { glb, rtc_center }))
+}
+
+/// Rotate a tile-frame (z-up) rtc offset into the glTF content frame the tile
+/// compose applies rtc in: the inverse of the tiles-spec y-up→z-up content
+/// rotation. Pinned against the real `YUP_TO_ZUP` constant by a test in the
+/// main crate.
+pub fn tile_rtc_to_content_frame(c: [f64; 3]) -> [f64; 3] {
+    [c[0], c[2], -c[1]]
+}
+
 /// Split a GLB container into its JSON chunk and optional BIN chunk. Bytes
 /// without the `glTF` magic are treated as a bare JSON glTF (no buffer).
 pub fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
@@ -737,7 +798,9 @@ pub struct PreparedTile {
     /// either because extraction was not asked for ([`prepare_tile`]) or
     /// because [`extract_tile_meshes`] declined this tile's content.
     pub meshes: Option<ExtractedMeshes>,
-    /// `CESIUM_RTC` center or extracted planetary root offset (ECEF metres).
+    /// Rtc offset (ECEF metres) the consumer composes innermost, in the glTF
+    /// content frame: `CESIUM_RTC` center, extracted planetary root offset,
+    /// or a b3dm feature-table `RTC_CENTER` (rotated from the tile frame).
     pub rtc_center: Option<[f64; 3]>,
     /// glTF `asset.copyright` (attribution overlay side-band).
     pub copyright: Option<String>,
@@ -759,6 +822,11 @@ pub struct PreparedTile {
 /// Bytes that are not a container at all answer `false` — let [`prepare_tile`]
 /// produce the error rather than mirroring its parsing here.
 pub fn prepare_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
+    let bytes = match unwrap_b3dm(bytes) {
+        Ok(Some(b)) => b.glb,
+        Ok(None) => bytes,
+        Err(_) => return false,
+    };
     let Ok((json_chunk, _)) = split_glb(bytes) else {
         return false;
     };
@@ -785,6 +853,11 @@ pub fn prepare_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
 /// properties), so those tiles still pay one wasted round trip each. Catching
 /// them means parsing the JSON twice, which costs more than the trip saves.
 pub fn extract_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
+    let bytes = match unwrap_b3dm(bytes) {
+        Ok(Some(b)) => b.glb,
+        Ok(None) => bytes,
+        Err(_) => return false,
+    };
     let Ok((json_chunk, _)) = split_glb(bytes) else {
         return false;
     };
@@ -846,6 +919,13 @@ fn prepare_tile_inner(
     georeferenced: bool,
     extract: bool,
 ) -> Result<Option<PreparedTile>, DecodeError> {
+    // Legacy b3dm containers unwrap to their embedded glb FIRST — a b3dm is
+    // not glTF magic, so split_glb would misread it as bare JSON.
+    let b3dm = unwrap_b3dm(bytes)?;
+    let (bytes, b3dm_rtc) = match &b3dm {
+        Some(b) => (b.glb, b.rtc_center),
+        None => (bytes, None),
+    };
     let (json_chunk, bin) = split_glb(bytes)?;
     let marks = Marks::scan(json_chunk);
     if marks.draco || marks.splat {
@@ -858,7 +938,7 @@ fn prepare_tile_inner(
         return Ok(Some(PreparedTile {
             glb: bytes.to_vec(),
             meshes: None,
-            rtc_center: None,
+            rtc_center: b3dm_rtc.map(tile_rtc_to_content_frame),
             copyright: None,
             features: None,
         }));
@@ -867,11 +947,22 @@ fn prepare_tile_inner(
     let mut json: serde_json::Value =
         serde_json::from_slice(json_chunk).map_err(|e| format!("tile json: {e}"))?;
     let copyright = json["asset"]["copyright"].as_str().map(str::to_string);
-    let mut rtc_center = json["extensions"]["CESIUM_RTC"]["center"]
-        .as_array()
-        .and_then(|c| {
-            let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
-            <[f64; 3]>::try_from(v).ok()
+    // b3dm rtc offsets (feature-table RTC_CENTER first, else CESIUM_RTC in
+    // the embedded glb) are tile-frame and rotate into the content frame; a
+    // bare-glb CESIUM_RTC is already content-frame (see [`B3dm`]).
+    let mut rtc_center = b3dm_rtc
+        .or_else(|| {
+            json["extensions"]["CESIUM_RTC"]["center"].as_array().and_then(|c| {
+                let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
+                <[f64; 3]>::try_from(v).ok()
+            })
+        })
+        .map(|c| {
+            if b3dm.is_some() {
+                tile_rtc_to_content_frame(c)
+            } else {
+                c
+            }
         });
 
     // Google P3DT bakes ECEF positions into node MATRICES instead of
@@ -955,6 +1046,60 @@ fn prepare_tile_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a b3dm container: header + feature-table JSON + payload.
+    fn b3dm(ft_json: &str, payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"b3dm");
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&((28 + ft_json.len() + payload.len()) as u32).to_le_bytes());
+        b.extend_from_slice(&(ft_json.len() as u32).to_le_bytes());
+        for _ in 0..3 {
+            b.extend_from_slice(&0u32.to_le_bytes()); // ft bin, bt json, bt bin
+        }
+        b.extend_from_slice(ft_json.as_bytes());
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// The two real-world b3dm rtc shapes, minus their Draco payloads:
+    /// swisstopo carries a feature-table `RTC_CENTER`, PLATEAU a `CESIUM_RTC`
+    /// inside the embedded glTF. Both are tile-frame and get the z-up→y-up
+    /// rotation; a bare-glb `CESIUM_RTC` (offline P3DT) stays untouched.
+    #[test]
+    fn b3dm_unwraps_and_rotates_tile_frame_rtc() {
+        let inner = br#"{"asset":{"version":"2.0"}}"#;
+        let b = b3dm(r#"{"BATCH_LENGTH":1,"RTC_CENTER":[1.0,2.0,3.0]}"#, inner);
+        let p = prepare_tile(&b, true).expect("prepare").expect("prepared");
+        assert_eq!(p.glb, inner);
+        assert_eq!(p.rtc_center, Some([1.0, 3.0, -2.0]));
+
+        let inner = br#"{"extensions":{"CESIUM_RTC":{"center":[1.0,2.0,3.0]}}}"#;
+        let b = b3dm("{}", inner);
+        let p = prepare_tile(&b, true).expect("prepare").expect("prepared");
+        assert_eq!(p.rtc_center, Some([1.0, 3.0, -2.0]));
+
+        let p = prepare_tile(inner, true).expect("prepare").expect("prepared");
+        assert_eq!(p.rtc_center, Some([1.0, 2.0, 3.0]));
+
+        // Draco b3dm (the real swisstopo/PLATEAU tiles) still declines to the
+        // platform decoder, and the off-thread triage agrees.
+        let draco = b3dm("{}", br#"{"extensionsUsed":["KHR_draco_mesh_compression"]}"#);
+        assert!(prepare_tile(&draco, true).unwrap().is_none());
+        assert!(prepare_would_decline(&draco, true));
+    }
+
+    #[test]
+    fn b3dm_malformed_and_sibling_containers_error() {
+        assert!(unwrap_b3dm(b"cmpt....").unwrap_err().contains("cmpt"));
+        assert!(unwrap_b3dm(b"b3dm").is_err()); // truncated header
+        let mut overrun = b3dm("{}", b"x");
+        overrun[12] = 255; // feature-table length far past the buffer end
+        assert!(unwrap_b3dm(&overrun).is_err());
+        // Not a legacy container: pass-through for the glb/bare-JSON path.
+        assert!(unwrap_b3dm(b"glTF....").unwrap().is_none());
+        assert!(unwrap_b3dm(br#"{"a":1}"#).unwrap().is_none());
+    }
 
     #[test]
     fn declines_draco_and_splat_markers() {

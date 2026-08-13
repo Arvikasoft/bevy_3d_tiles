@@ -68,7 +68,7 @@ use bevy_3d_tiles_prepare::read_accessor;
 use bevy_3d_tiles_prepare::{
     DracoPrim, FeatureCtx, Marks, PreparedFeatures, assemble_glb, buffer_view_slice,
     decode_meshopt_views, extract_planetary_root_offset, find_draco_prims, preprocess_basisu,
-    split_glb, strip_handled_extensions,
+    split_glb, strip_handled_extensions, tile_rtc_to_content_frame, unwrap_b3dm,
 };
 // `lib.rs` sniffs external tilesets with it (`looks_like_external_tileset`).
 pub(crate) use bevy_3d_tiles_prepare::memmem;
@@ -428,6 +428,15 @@ async fn decode_prepared(
 async fn decode_tile_inline(bytes: &[u8], georeferenced: bool) -> Result<DecodedTile, DecodeError> {
     let mut stage_ms = [0f32; 4];
     let t = Instant::now();
+    // Legacy b3dm containers (swisstopo, PLATEAU) unwrap to their embedded
+    // glb FIRST — b3dm is not glTF magic, split_glb would misread it as bare
+    // JSON. Their rtc offsets are tile-frame (see [`B3dm`]) and rotate into
+    // the content frame the compose applies rtc in.
+    let b3dm = unwrap_b3dm(bytes)?;
+    let (bytes, b3dm_rtc) = match &b3dm {
+        Some(b) => (b.glb, b.rtc_center),
+        None => (bytes, None),
+    };
     let (json_chunk, bin) = split_glb(bytes)?;
     let marks = Marks::scan(json_chunk);
     stage_ms[0] += span_ms(t);
@@ -440,7 +449,7 @@ async fn decode_tile_inline(bytes: &[u8], georeferenced: bool) -> Result<Decoded
         return Ok(DecodedTile {
             items,
             content_bytes: bytes.len() as u64,
-            rtc_center: None,
+            rtc_center: b3dm_rtc.map(|c| DVec3::from_array(tile_rtc_to_content_frame(c))),
             copyright: None,
             stage_ms,
         });
@@ -451,12 +460,23 @@ async fn decode_tile_inline(bytes: &[u8], georeferenced: bool) -> Result<Decoded
         serde_json::from_slice(json_chunk).map_err(|e| format!("tile json: {e}"))?;
     stage_ms[0] += span_ms(t);
     let copyright = json["asset"]["copyright"].as_str().map(str::to_string);
-    let mut rtc_center = json["extensions"]["CESIUM_RTC"]["center"]
-        .as_array()
-        .and_then(|c| {
-            let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
-            <[f64; 3]>::try_from(v).ok().map(DVec3::from_array)
-        });
+    let mut rtc_center = b3dm_rtc
+        .or_else(|| {
+            json["extensions"]["CESIUM_RTC"]["center"]
+                .as_array()
+                .and_then(|c| {
+                    let v: Vec<f64> = c.iter().filter_map(|x| x.as_f64()).collect();
+                    <[f64; 3]>::try_from(v).ok()
+                })
+        })
+        .map(|c| {
+            if b3dm.is_some() {
+                tile_rtc_to_content_frame(c)
+            } else {
+                c
+            }
+        })
+        .map(DVec3::from_array);
 
     #[cfg(feature = "splats")]
     if marks.splat {
