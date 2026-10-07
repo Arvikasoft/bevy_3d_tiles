@@ -208,6 +208,11 @@ pub struct TileGeometry {
 /// — the same owner string the per-feature submeshes used to carry in their
 /// [`TileOwner`] tags.
 ///
+/// Ordinals are PRISTINE and never renumbered: a feature hidden through
+/// [`crate::HiddenTileFeatures`] keeps its triangles at their ordinals —
+/// degenerate on the GPU, skipped by [`crate::TilePickMesh`]'s walk — so a hit
+/// ordinal from the pick copy always indexes `feature_of_triangle` directly.
+///
 /// Both tables are shared `Arc` slices (since 0.5): every primitive of a tile
 /// shares ONE owner table (the [`TileFeatureResolver`] runs once per tile), and
 /// a respawned tile shares its cached tables, so cloning this component is two

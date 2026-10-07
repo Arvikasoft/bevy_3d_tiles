@@ -64,5 +64,6 @@ fn setup(
         p3dt: None,
         // Per-set SSE override; None = the app-global Tiles3dConfig default.
         sse_threshold_px: None,
+        ..default()
     });
 }

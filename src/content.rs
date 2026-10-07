@@ -251,39 +251,43 @@ impl Default for DecodedMaterial {
     }
 }
 
-/// Decoded main-world CPU cost of a tile's items, in bytes: mesh vertex
-/// attributes + indices (kept `MAIN_WORLD` for the host's raycasts), plus
-/// point/splat buffers. Textures are NOT counted — images upload
-/// `RENDER_WORLD`-only, so their CPU copy is transient decode traffic, not
-/// resident cost. This is what `TileSlot::Ready.bytes` stores and the
-/// memory-pressure valve sums. (0.2.0; ≤0.1.x summed the RAW compressed
-/// content bytes, undercounting resident cost by the meshopt/draco expansion
-/// factor of roughly 3–10×.)
+/// Decoded geometry cost of a tile's items, in bytes: mesh vertex attributes +
+/// indices, plus point/splat buffers. Textures are NOT counted — images upload
+/// `RENDER_WORLD`-only, so their CPU copy is transient decode traffic. This is
+/// what `TileSlot::Ready.bytes` stores and the memory-pressure valve sums.
+/// (0.2.0; ≤0.1.x summed the RAW compressed content bytes, undercounting by the
+/// meshopt/draco expansion factor of roughly 3–10×.) Unchanged in 0.5 although
+/// tile meshes no longer stay in the main world, so the same scene budgets the
+/// same cut; `Tiles3dSets::resident_cpu_bytes` reports the heap figure.
 pub fn resident_cost_bytes(items: &[DecodedItem]) -> u64 {
-    let mut total = 0u64;
-    for item in items {
-        match item {
-            DecodedItem::Mesh(prim) => {
-                for (_, values) in prim.mesh.attributes() {
-                    total += values.get_bytes().len() as u64;
-                }
-                total += match prim.mesh.indices() {
+    items.iter().map(item_cost_bytes).sum()
+}
+
+/// [`resident_cost_bytes`] of one item.
+pub(crate) fn item_cost_bytes(item: &DecodedItem) -> u64 {
+    match item {
+        DecodedItem::Mesh(prim) => {
+            let attributes: u64 = prim
+                .mesh
+                .attributes()
+                .map(|(_, values)| values.get_bytes().len() as u64)
+                .sum();
+            attributes
+                + match prim.mesh.indices() {
                     Some(Indices::U16(v)) => (v.len() * 2) as u64,
                     Some(Indices::U32(v)) => (v.len() * 4) as u64,
                     None => 0,
-                };
-            }
-            #[cfg(feature = "points")]
-            DecodedItem::Points { points, .. } => {
-                total += (points.len() * std::mem::size_of::<PointCloudData>()) as u64;
-            }
-            #[cfg(feature = "splats")]
-            DecodedItem::Splat { gaussians, .. } => {
-                total += (gaussians.len() * std::mem::size_of::<Gaussian3d>()) as u64;
-            }
+                }
+        }
+        #[cfg(feature = "points")]
+        DecodedItem::Points { points, .. } => {
+            (points.len() * std::mem::size_of::<PointCloudData>()) as u64
+        }
+        #[cfg(feature = "splats")]
+        DecodedItem::Splat { gaussians, .. } => {
+            (gaussians.len() * std::mem::size_of::<Gaussian3d>()) as u64
         }
     }
-    total
 }
 
 /// A fully decoded tile: renderable items plus the side-band data T4 needs.
@@ -870,9 +874,9 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
     let has_uv0 = p.uvs.is_some();
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
-        // MAIN_WORLD + RENDER_WORLD: the camera-focus/selection raycasts read
-        // mesh vertices on the main world (the basemap panic lesson). The CPU
-        // copy is a T2 memory-budget follow-up, not a T0 risk.
+        // MAIN_WORLD + RENDER_WORLD while it is a decoded item: the spawn
+        // step copies the pick geometry out of it, then (since 0.5) flips it
+        // to RENDER_WORLD unless the set keeps main-world meshes.
         RenderAssetUsages::default(),
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, std::mem::take(&mut p.positions));
@@ -1300,7 +1304,7 @@ fn decode_splat_primitive(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Minimal deterministic GLB: one triangle with COLOR_0, no normals.
@@ -1847,7 +1851,7 @@ mod tests {
     /// (vertices `3t..3t+3` are triangle `t`). `with_ids = false` also drops the
     /// primitive's `EXT_mesh_features`, leaving the tile-level table: the
     /// control for "only FEATURE primitives get synthesized indices".
-    fn non_indexed_feature_fixture(with_ids: bool) -> Vec<u8> {
+    pub(crate) fn non_indexed_feature_fixture(with_ids: bool) -> Vec<u8> {
         feature_glb(false, with_ids)
     }
 
@@ -2015,6 +2019,47 @@ mod tests {
                 assert_eq!(indices_u32(&p.mesh), Some((0..6).collect()), "{route}");
                 let f = p.features.as_ref().expect(route);
                 assert_eq!(f.feature_of_triangle, vec![0, 1], "{route}");
+            }
+        }
+    }
+
+    /// The hidden-feature GPU write (`index_writes`) writes 4-byte elements over
+    /// the mesh's index slot, so every tile mesh with indices must carry U32 —
+    /// whatever the glTF stored — and every FEATURE mesh must have indices. On
+    /// every decode route.
+    #[test]
+    fn tile_meshes_are_always_u32_indexed_feature_meshes() {
+        use bevy::tasks::block_on;
+        // (fixture, is a feature mesh): u16 source indices, u32, non-indexed.
+        let fixtures = [
+            (tiny_glb(), false),
+            (nested_transform_fixture(), false),
+            (feature_fixture(), true),
+            (non_indexed_feature_fixture(true), true),
+        ];
+        for (glb, feature) in fixtures {
+            for (route, tile) in [
+                ("inline", block_on(decode_tile(&glb, false))),
+                (
+                    "prepared glb",
+                    block_on(decode_tile_with(&glb, false, Some(&canned_hook()))),
+                ),
+                (
+                    "extracted",
+                    block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook()))),
+                ),
+            ] {
+                for item in tile.expect(route).items {
+                    let DecodedItem::Mesh(p) = item else {
+                        continue;
+                    };
+                    assert_eq!(p.features.is_some(), feature, "{route}");
+                    assert!(
+                        matches!(p.mesh.indices(), Some(Indices::U32(_))),
+                        "{route}: {:?}",
+                        p.mesh.indices().map(|i| i.len())
+                    );
+                }
             }
         }
     }

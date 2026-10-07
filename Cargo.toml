@@ -70,6 +70,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 crossbeam-channel = "0.5"
 # FetchError / archive errors.
 thiserror = "2"
+# `&[u32]` → `&[u8]` for the hidden-feature index write (already in bevy's tree).
+bytemuck = "1"
 
 # Heavy tile-content renderers — optional, gated by the `points` / `splats`
 # features. Both are crates.io deps, so every feature combination is

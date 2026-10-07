@@ -119,6 +119,8 @@ optional seams wire it into a host app:
 | `Tiles3dCamera` (marker) | tag the camera SSE selection follows |
 | `TileOwner` (Component) | read it back — every spawned tile entity carries the attach's `owner_id`, so selection/highlight map to your domain |
 | `TileFeatureResolver` (Resource) | map `EXT_mesh_features` node paths to your own sub-entity ids |
+| `TilePickMesh` (Component) | read it back — the CPU geometry of every tile mesh entity (positions, visible triangles with stable ordinals, `raycast()`), since tile meshes are `RENDER_WORLD`-only |
+| `HiddenTileFeatures` (Resource) | hide `EXT_mesh_features` features by resolved owner id; affected tiles are re-cut on the GPU in place |
 | `TileSseMultiplier` (Component) | per-set refine-threshold dial on the anchor — coarsen ground/background sets without touching the twins |
 | `PointTileMaterial` (Resource, `points`) | own the point material (sizing/shading) |
 
@@ -172,6 +174,17 @@ attribution lines whenever tiles are visible, and bring your own API key
 A performance release for large multi-tileset scenes (measured on a large
 mining site with ~450 resident tiles). Breaking changes:
 
+- **Every tile mesh entity spawns with `Aabb` + `NoAutoAabb`**, computed at
+  decode, so `calculate_bounds` never recomputes tile bounds. Don't rely on it
+  to (re)compute them.
+- **Hide features with `HiddenTileFeatures`, not by editing tile meshes.** Insert
+  the resolved owner ids (`TileFeaturePick::owner_of_feature` strings) to hide;
+  every feature primitive drops those features' triangles — degenerate in place
+  on the GPU (one index-only buffer write per affected primitive, under any
+  material and in every pass), skipped by `TilePickMesh` — and triangle ordinals
+  never change, so `TileFeaturePick` lookups stay valid. Hiding a whole
+  featureless tile is still yours (remove its `Mesh3d`).
+
 - **The `TilePrepareHook` closure receives `&[u8]`, not `Vec<u8>`.**
   `TilePrepareFn` is `for<'a> Fn(&'a [u8], bool) -> Pin<Box<dyn Future<…> + 'a>>`
   (plus `Send`/`Sync` on native): the future may borrow the fetched bytes, which
@@ -220,9 +233,11 @@ mining site with ~450 resident tiles). Breaking changes:
 Behavioral:
 
 - `Tiles3dSets::resident_content_bytes()` keeps its meaning (decoded geometry
-  bytes) and is now O(1): the figure as of the end of the last
-  `Tiles3dSet::Drive`. A reader ordered before Drive sees the previous frame's
-  value.
+  bytes, so the same scene budgets the same cut) and is now O(1): the figure as
+  of the end of the last `Tiles3dSet::Drive`. A reader ordered before Drive sees
+  the previous frame's value. The new `resident_cpu_bytes()` reports what tile
+  geometry costs in CPU memory now (pick copies, plus full meshes for
+  `main_world_meshes` sets).
 - The per-cut, per-graft and per-tileset-open log lines moved from `info` to
   `debug` (a moving camera changes the cut most frames, and on wasm every
   `info` line is a console write). Filter `bevy_3d_tiles=debug` to see them.

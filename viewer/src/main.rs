@@ -122,6 +122,7 @@ fn setup(mut commands: Commands, params: Res<Params>, mut attach: MessageWriter<
         label: "web viewer".into(),
         p3dt: None,
         sse_threshold_px: None,
+        ..default()
     });
 }
 

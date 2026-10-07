@@ -44,7 +44,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bevy::camera::Projection;
-use bevy::camera::primitives::{Frustum, Sphere};
+use bevy::camera::primitives::{Aabb, Frustum, Sphere};
+use bevy::camera::visibility::NoAutoAabb;
 use bevy::math::{DMat4, DVec3, Vec3A};
 use bevy::prelude::*;
 use bevy::window::RequestRedraw;
@@ -56,9 +57,11 @@ pub mod draco;
 pub mod fetch;
 pub mod geo;
 pub mod geodesy;
+mod index_writes;
 // wasm-only KTX2 transcode shim binding (T7); native uses bevy basis-universal.
 #[cfg(target_arch = "wasm32")]
 pub mod ktx2;
+pub mod pick;
 pub mod schema;
 pub mod traversal;
 
@@ -75,10 +78,13 @@ pub use api::{
     EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, TilePrepareFn,
     TilePrepareHook, TilePriorityClass, TileSseMultiplier, Tiles3dCamera, Tiles3dSet,
 };
+pub use pick::{HiddenTileFeatures, TilePickMesh};
 
 use archive::Archive3tz;
 use content::{DecodedItem, DecodedPrimitive, DecodedTile};
 use fetch::{BudgetCounter, ByteSource, ExplodedBase, LiveSession, TilesetSource};
+use index_writes::TileIndexQueue;
+use pick::FeatureOwners;
 use traversal::{History, SelectParams, TileContent, TileTree, TreeFrame, ZUP_TO_BEVY};
 
 use geodesy::WGS84_EQUATORIAL_RADIUS_M;
@@ -159,7 +165,7 @@ pub struct Tiles3dConfig {
     /// per-frame O(tree) pass. The compactor drops whole grafted subtrees that
     /// have been out of view past the grace window; revisiting re-grafts them.
     pub tree_compact_min: usize,
-    /// Memory-pressure valve: when the **decoded main-world bytes** of all
+    /// Memory-pressure valve: when the **decoded geometry bytes** of all
     /// resident tiles (summed across tilesets — mesh attributes + indices,
     /// see `content::resident_cost_bytes`) exceed this budget, the effective
     /// SSE threshold inflates by the overshoot ratio (clamped ×8) — the cut
@@ -286,6 +292,20 @@ pub struct Tiles3dAttach {
     /// resident triangles for no visible gain. Raise it (e.g. 24) for such sets
     /// while the basemap keeps the sharp global default.
     pub sse_threshold_px: Option<f64>,
+    /// Keep this set's tile meshes in the MAIN world too (`MAIN_WORLD |
+    /// RENDER_WORLD`, the ≤0.4 behaviour). Default `false`: tile meshes are
+    /// `RENDER_WORLD`-only, so after their first upload `Assets<Mesh>` holds no
+    /// vertex data for them and `Mesh::attribute()`/`indices()`/
+    /// `morph_targets()` panic on them. Every tile mesh entity carries a
+    /// [`TilePickMesh`] for CPU raycasts either way.
+    ///
+    /// Set it for a set whose meshes something must read in full: an outline
+    /// extracted with [`build_submesh`] (it needs real normals), a physics proxy,
+    /// bevy_picking's mesh backend, or a bevy_mod_outline `OutlineVolume` on a
+    /// bevy_mod_outline ≤ 0.13 (its pipeline key reads `morph_targets()`). The
+    /// main-world indices stay PRISTINE while [`HiddenTileFeatures`] cuts the GPU
+    /// copy, so pick through [`TilePickMesh`] even then.
+    pub main_world_meshes: bool,
 }
 
 /// Everything empty / `None`, anchored to `Entity::PLACEHOLDER`: set `anchor`
@@ -301,6 +321,7 @@ impl Default for Tiles3dAttach {
             label: String::new(),
             p3dt: None,
             sse_threshold_px: None,
+            main_world_meshes: false,
         }
     }
 }
@@ -341,10 +362,13 @@ enum TileSlot {
         /// (0.2.4 hidden-tile despawn — see [`CachedItem`]). Re-entry respawns
         /// from the cache; only eviction drops the assets.
         entity: Option<Entity>,
-        /// Decoded main-world CPU bytes (`content::resident_cost_bytes`) —
-        /// what the memory-pressure valve sums; see
+        /// Decoded geometry bytes (`content::resident_cost_bytes`) — what the
+        /// memory-pressure valve sums; see
         /// [`Tiles3dConfig::memory_budget_bytes`].
         bytes: u64,
+        /// What the tile costs in CPU memory now (pick copies, plus full meshes
+        /// for a `main_world_meshes` set) — [`Tiles3dSets::resident_cpu_bytes`].
+        cpu_bytes: u64,
     },
     /// Terminal fetch/decode failure — never re-queued this session.
     Failed,
@@ -370,6 +394,14 @@ enum CachedItem {
         material: Handle<StandardMaterial>,
         transform: Transform,
         pick: Option<TileFeaturePick>,
+        /// Decode-time bounds (`None` only for a mesh with no positions);
+        /// spawned with `NoAutoAabb`, so `calculate_bounds` never visits tiles.
+        aabb: Option<Aabb>,
+        /// The CPU pick copy, shared by every entity spawned from this item.
+        pick_mesh: TilePickMesh,
+        /// Local feature id → interned owner ordinal (`FeatureOwners`), for
+        /// feature primitives; one `Arc` per tile.
+        owner_ix: Option<Arc<[u32]>>,
     },
     #[cfg(feature = "points")]
     Points {
@@ -440,6 +472,8 @@ pub struct ActiveTileset {
     /// [`Tiles3dAttach::sse_threshold_px`]; `None` falls back to the app-global
     /// [`Tiles3dConfig::sse_threshold_px`] in the traversal.
     sse_threshold_px: Option<f64>,
+    /// [`Tiles3dAttach::main_world_meshes`].
+    main_world_meshes: bool,
     /// Whether the anchor's placeholder cube has been stripped yet.
     placeholder_cleared: bool,
     /// Last logged render-cut shape `(tiles, min_depth, max_depth)` —
@@ -636,18 +670,35 @@ pub struct Tiles3dSets {
     /// the slots each frame (minus that frame's evictions), never tracked
     /// across frames, so it cannot drift.
     resident_bytes: u64,
+    /// [`Tiles3dSets::resident_cpu_bytes`], kept exactly like `resident_bytes`.
+    resident_cpu: u64,
+    /// Feature owner ids interned at tile build (`build_tile_cache`).
+    owners: FeatureOwners,
+    /// Feature primitives decoded since the last `apply_feature_visibility`,
+    /// which gives them their hidden mask in their spawn frame.
+    fresh: Vec<FreshFeatureItem>,
 }
 
-/// Ready (resident) decoded bytes across `sets` — the slow sum the cache
-/// replaces, kept for Drive's rare early-return path.
-fn ready_bytes(sets: &[ActiveTileset]) -> u64 {
+/// A feature primitive that landed this frame. Self-contained (no tile index),
+/// so nothing Drive renumbers or evicts in between can make it point elsewhere.
+struct FreshFeatureItem {
+    mesh: AssetId<Mesh>,
+    pick_mesh: TilePickMesh,
+    owner_ix: Arc<[u32]>,
+    main_world: bool,
+}
+
+/// Ready (resident) `(decoded, cpu)` bytes across `sets` — the slow sum the
+/// cache replaces, kept for Drive's rare early-return path.
+fn ready_bytes(sets: &[ActiveTileset]) -> (u64, u64) {
     sets.iter()
         .flat_map(|s| s.slots.iter())
-        .map(|slot| match slot {
-            TileSlot::Ready { bytes, .. } => *bytes,
-            _ => 0,
+        .fold((0, 0), |(b, c), slot| match slot {
+            TileSlot::Ready {
+                bytes, cpu_bytes, ..
+            } => (b + bytes, c + cpu_bytes),
+            _ => (b, c),
         })
-        .sum()
 }
 
 impl Tiles3dSets {
@@ -659,8 +710,9 @@ impl Tiles3dSets {
             || self.sets.iter().any(|s| s.anchor == Some(anchor))
     }
 
-    /// Decoded main-world bytes of every resident tile across all sets — the
-    /// same sum the memory-pressure valve uses. For the host's global memory
+    /// Decoded geometry bytes of every resident tile across all sets — the
+    /// same sum the memory-pressure valve uses (what sits in CPU memory is
+    /// [`Tiles3dSets::resident_cpu_bytes`]). For the host's global memory
     /// ledger (feed the overshoot back as
     /// [`Tiles3dConfig::external_pressure`]).
     ///
@@ -670,6 +722,16 @@ impl Tiles3dSets {
     /// reader ordered before Drive sees the previous frame's figure.
     pub fn resident_content_bytes(&self) -> u64 {
         self.resident_bytes
+    }
+
+    /// What resident tile geometry costs in CPU memory NOW, across all sets:
+    /// [`TilePickMesh`] copies (positions + pristine indices), plus the full
+    /// meshes of sets attached with [`Tiles3dAttach::main_world_meshes`], plus
+    /// point/splat buffers. Same "as of the last Drive", O(1) contract as
+    /// [`Tiles3dSets::resident_content_bytes`], which keeps its meaning (decoded
+    /// geometry bytes, what the memory valve budgets) so the cut is unchanged.
+    pub fn resident_cpu_bytes(&self) -> u64 {
+        self.resident_cpu
     }
 
     /// Root-volume bounding sphere of the tileset anchored to `anchor`, in
@@ -725,6 +787,7 @@ struct AttachTarget {
     local: Transform,
     owner_id: Option<String>,
     sse_threshold_px: Option<f64>,
+    main_world_meshes: bool,
 }
 
 /// What one tile's content fetch produced.
@@ -786,6 +849,8 @@ impl Plugin for Tiles3dPlugin {
             .init_resource::<TilesetCredits>()
             .init_resource::<Tiles3dDecodeStats>()
             .init_resource::<TileMaterialCache>()
+            .init_resource::<HiddenTileFeatures>()
+            .init_resource::<TileIndexQueue>()
             // Host-supplied seams (defaults are inert: no origin, no resolver,
             // no prepare hook). The host overwrites these via its own adapter
             // systems (or pre-inserts them); a standalone viewer leaves them
@@ -796,6 +861,7 @@ impl Plugin for Tiles3dPlugin {
             .add_message::<Tiles3dAttach>()
             .add_message::<Tiles3dDetach>()
             .add_systems(Startup, (latch_compressed_formats, init_dev_tileset))
+            .add_systems(First, index_writes::clear_tile_index_queue)
             // The public ordering seam: hosts order against `Tiles3dSet`
             // (Receive → Drive), e.g. a memory ledger between the two.
             .configure_sets(Update, (Tiles3dSet::Receive, Tiles3dSet::Drive).chain())
@@ -805,7 +871,7 @@ impl Plugin for Tiles3dPlugin {
                     (apply_attach_detach, receive_tiles3d)
                         .chain()
                         .in_set(Tiles3dSet::Receive),
-                    (drive_tiles3d, update_google_logo)
+                    (drive_tiles3d, apply_feature_visibility, update_google_logo)
                         .chain()
                         .in_set(Tiles3dSet::Drive),
                 ),
@@ -813,6 +879,12 @@ impl Plugin for Tiles3dPlugin {
         // The shared point material the host sets before any POINTS tile spawns.
         #[cfg(feature = "points")]
         app.init_resource::<PointTileMaterial>();
+    }
+
+    /// The render half of [`HiddenTileFeatures`], in `finish` so it works
+    /// whatever order the host adds this plugin and the render plugins in.
+    fn finish(&self, app: &mut App) {
+        index_writes::register_render(app);
     }
 }
 
@@ -903,6 +975,7 @@ fn apply_attach_detach(
                 local: msg.local,
                 owner_id: msg.owner_id.clone(),
                 sse_threshold_px: msg.sse_threshold_px,
+                main_world_meshes: msg.main_world_meshes,
             }),
             channel.tx.clone(),
         );
@@ -1164,6 +1237,9 @@ fn receive_tiles3d(
                                 root_entity,
                                 anchor: attach.as_ref().map(|a| a.anchor),
                                 sse_threshold_px: attach.as_ref().and_then(|a| a.sse_threshold_px),
+                                main_world_meshes: attach
+                                    .as_ref()
+                                    .is_some_and(|a| a.main_world_meshes),
                                 owner_id: attach.and_then(|a| a.owner_id),
                                 placeholder_cleared: false,
                                 last_cut: None,
@@ -1194,7 +1270,13 @@ fn receive_tiles3d(
                 generation,
                 result,
             } => {
-                let Some(set) = sets.sets.iter_mut().find(|s| s.id == set_id) else {
+                let Tiles3dSets {
+                    sets: active,
+                    owners,
+                    fresh,
+                    ..
+                } = &mut *sets;
+                let Some(set) = active.iter_mut().find(|s| s.id == set_id) else {
                     continue;
                 };
                 // Resolve the slot by GENERATION, never the message's captured
@@ -1307,11 +1389,10 @@ fn receive_tiles3d(
                             splats: &mut splats,
                             _marker: std::marker::PhantomData,
                         };
-                        // Resident cost = decoded main-world bytes, measured
-                        // from the actual buffers (not the raw content len —
-                        // see `content::resident_cost_bytes`).
-                        let resident_cost = content::resident_cost_bytes(&items);
-                        let cache = build_tile_cache(
+                        // Resident cost = decoded geometry bytes, measured from
+                        // the actual buffers (not the raw content len — see
+                        // `content::resident_cost_bytes`).
+                        let (cache, resident_cost, cpu_bytes) = build_tile_cache(
                             &mut meshes,
                             &mut materials,
                             &mut material_cache,
@@ -1320,6 +1401,8 @@ fn receive_tiles3d(
                             &resolver,
                             set,
                             items,
+                            owners,
+                            fresh,
                         );
                         // Spawned HIDDEN; `drive_tiles3d` flips it visible in
                         // this same frame if the cut selects it (the documented
@@ -1338,6 +1421,7 @@ fn receive_tiles3d(
                         set.slots[tile] = TileSlot::Ready {
                             entity: Some(entity),
                             bytes: resident_cost,
+                            cpu_bytes,
                         };
                     }
                     Err(e) => {
@@ -1468,9 +1552,15 @@ fn resolve_owners(
 }
 
 /// Decode-side half: insert one tile's decoded items into the asset stores
-/// ONCE and return the [`CachedItem`] spawn recipe. The returned handles are
-/// what keep the tile resident across hidden-tile despawns — dropping them
-/// (eviction) is what actually reclaims the memory.
+/// ONCE and return the [`CachedItem`] spawn recipe, with the tile's decoded
+/// geometry bytes and its CPU bytes (see [`TileSlot::Ready`]). The returned
+/// handles are what keep the tile resident across hidden-tile despawns —
+/// dropping them (eviction) is what actually reclaims the memory.
+///
+/// Each mesh gets its [`TilePickMesh`] copied BEFORE `meshes.add` (one memcpy
+/// of positions + indices per decode, none per respawn), and goes
+/// `RENDER_WORLD`-only unless the set opted out. Feature primitives are queued
+/// on `fresh` so `apply_feature_visibility` cuts them in their spawn frame.
 #[allow(clippy::too_many_arguments)]
 // `renderers` is only read by the cfg-gated point/splat arms; with neither
 // feature it's unused. Scope the allow to that config so a genuinely unused
@@ -1488,7 +1578,9 @@ fn build_tile_cache(
     resolver: &TileFeatureResolver,
     set: &ActiveTileset,
     items: Vec<DecodedItem>,
-) -> Vec<CachedItem> {
+    owners: &mut FeatureOwners,
+    fresh: &mut Vec<FreshFeatureItem>,
+) -> (Vec<CachedItem>, u64, u64) {
     let anchor = set.owner_id.as_deref();
     // T8 highlight: a feature tile under an owner resolves its feature paths to
     // host sub-owners via the host [`TileFeatureResolver`], so the host's
@@ -1497,23 +1589,27 @@ fn build_tile_cache(
     // the anchor anyway.
     let has_resolver = anchor.is_some() && resolver.0.is_some();
     let mut cache = Vec::with_capacity(items.len());
-    // Resolved owners, memoised by the `node_of_feature` table they came from.
-    // Decode builds ONE table per tile and shares it across the tile's
-    // primitives, so the resolver runs once per tile and every primitive's pick
-    // shares one owner `Arc`. The memo holds the source `Arc` itself, so the
-    // pointer it compares can never be a freed-and-reused address.
-    type OwnersOf = (Arc<Vec<String>>, Arc<[String]>);
-    let mut owners: Option<OwnersOf> = None;
+    let (mut resident, mut cpu) = (0u64, 0u64);
+    // Resolved owners (and their interned ordinals), memoised by the
+    // `node_of_feature` table they came from. Decode builds ONE table per tile
+    // and shares it across the tile's primitives, so the resolver runs once per
+    // tile and every primitive's pick shares one owner `Arc`. The memo holds
+    // the source `Arc` itself, so the pointer it compares can never be a
+    // freed-and-reused address.
+    type OwnersOf = (Arc<Vec<String>>, Arc<[String]>, Arc<[u32]>);
+    let mut tile_owners: Option<OwnersOf> = None;
 
     for item in items {
+        let cost = content::item_cost_bytes(&item);
+        resident += cost;
         match item {
             DecodedItem::Mesh(prim) => {
                 let DecodedPrimitive {
                     transform: ptf,
-                    mesh,
+                    mut mesh,
                     material,
                     features,
-                    bounds: _,
+                    bounds,
                 } = *prim;
                 let prim_transform = Transform::from_matrix(ptf);
                 // Untextured: the one shared material for these factors.
@@ -1537,11 +1633,13 @@ fn build_tile_cache(
                 // micro-stuttered. Per-feature hover highlight moves to
                 // render-state (a feature-id tint — Phase B); selection
                 // correctness is carried entirely by the pick table.
-                let pick = match (features, has_resolver) {
+                let (pick, owner_ix) = match (features, has_resolver) {
                     (Some(f), true) => {
-                        let owner_of_feature = match &owners {
-                            Some((table, resolved)) if Arc::ptr_eq(table, &f.node_of_feature) => {
-                                Arc::clone(resolved)
+                        let (owner_of_feature, owner_ix) = match &tile_owners {
+                            Some((table, resolved, ix))
+                                if Arc::ptr_eq(table, &f.node_of_feature) =>
+                            {
+                                (Arc::clone(resolved), Arc::clone(ix))
                             }
                             _ => {
                                 let resolved = resolve_owners(
@@ -1549,26 +1647,48 @@ fn build_tile_cache(
                                     anchor.unwrap_or(""),
                                     &f.node_of_feature,
                                 );
-                                owners = Some((f.node_of_feature, Arc::clone(&resolved)));
-                                resolved
+                                let ix: Arc<[u32]> =
+                                    resolved.iter().map(|o| owners.intern(o)).collect();
+                                tile_owners = Some((
+                                    f.node_of_feature,
+                                    Arc::clone(&resolved),
+                                    Arc::clone(&ix),
+                                ));
+                                (resolved, ix)
                             }
                         };
-                        Some(TileFeaturePick {
+                        let pick = TileFeaturePick {
                             feature_of_triangle: f.feature_of_triangle.into(),
                             owner_of_feature,
-                        })
+                        };
+                        (Some(pick), Some(owner_ix))
                     }
-                    _ => None,
+                    _ => (None, None),
                 };
+                let (pick_mesh, aabb) = pick_copy(&mut mesh, bounds, pick.as_ref());
+                cpu += pick_mesh.cpu_bytes() + if set.main_world_meshes { cost } else { 0 };
+                let mesh = meshes.add(mesh);
+                if let Some(owner_ix) = &owner_ix {
+                    fresh.push(FreshFeatureItem {
+                        mesh: mesh.id(),
+                        pick_mesh: pick_mesh.clone(),
+                        owner_ix: Arc::clone(owner_ix),
+                        main_world: set.main_world_meshes,
+                    });
+                }
                 cache.push(CachedItem::Mesh {
-                    mesh: meshes.add(mesh),
+                    mesh,
                     material: mat_handle,
                     transform: prim_transform,
                     pick,
+                    aabb,
+                    pick_mesh,
+                    owner_ix,
                 });
             }
             #[cfg(feature = "points")]
             DecodedItem::Points { transform, points } => {
+                cpu += cost;
                 cache.push(CachedItem::Points {
                     cloud: renderers.clouds.add(PointCloud { points }),
                     transform: Transform::from_matrix(transform),
@@ -1579,6 +1699,7 @@ fn build_tile_cache(
                 transform,
                 gaussians,
             } => {
+                cpu += cost;
                 cache.push(CachedItem::Splat {
                     cloud: renderers.splats.add(PlanarGaussian3d::from(gaussians)),
                     transform: Transform::from_matrix(transform),
@@ -1586,7 +1707,39 @@ fn build_tile_cache(
             }
         }
     }
-    cache
+    (cache, resident, cpu)
+}
+
+/// A decoded tile mesh's [`TilePickMesh`] and decode-time [`Aabb`] (the
+/// decode's `bounds`, or the positions' when a route lacks them — exactly what
+/// `calculate_bounds` would compute).
+fn pick_copy(
+    mesh: &mut Mesh,
+    bounds: Option<[[f32; 3]; 2]>,
+    pick: Option<&TileFeaturePick>,
+) -> (TilePickMesh, Option<Aabb>) {
+    use bevy::mesh::{Indices, VertexAttributeValues as Vav};
+    let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+        Some(Vav::Float32x3(p)) => p.clone(),
+        _ => Vec::new(),
+    };
+    // The GPU index rewrite (`index_writes`) writes 4-byte elements. Every
+    // decode route already emits U32 (`content::mesh_from_buffers`); widen
+    // anything else so that holds by construction.
+    let indices: Option<Arc<[u32]>> = match mesh.indices() {
+        Some(Indices::U32(v)) => Some(v.as_slice().into()),
+        Some(Indices::U16(v)) => {
+            let wide: Vec<u32> = v.iter().map(|&i| u32::from(i)).collect();
+            mesh.insert_indices(Indices::U32(wide.clone()));
+            Some(wide.into())
+        }
+        None => None,
+    };
+    let aabb = bounds
+        .or_else(|| prepare::bounds_of(&positions))
+        .map(|[lo, hi]| Aabb::from_min_max(lo.into(), hi.into()));
+    let features = pick.map(|p| Arc::clone(&p.feature_of_triangle));
+    (TilePickMesh::new(positions, indices, features), aabb)
 }
 
 /// Spawn one tile's cached content under a tile-root entity, at `visibility`
@@ -1636,14 +1789,25 @@ fn spawn_tile_entities(
                 material,
                 transform,
                 pick,
+                aabb,
+                pick_mesh,
+                owner_ix: _,
             } => {
+                // `NoAutoAabb` + the decode-time `Aabb`: `calculate_bounds`
+                // skips tile entities at the archetype level, so a respawn or a
+                // `RENDER_WORLD` mesh with no CPU positions never needs it.
                 let mut e = commands.spawn((
                     Mesh3d(mesh.clone()),
                     MeshMaterial3d(material.clone()),
                     *transform,
                     ChildOf(tile_root),
                     content_tag,
+                    pick_mesh.clone(),
+                    NoAutoAabb,
                 ));
+                if let Some(aabb) = aabb {
+                    e.insert(*aabb);
+                }
                 if let Some(pick) = pick {
                     e.insert(pick.clone());
                 }
@@ -1680,39 +1844,41 @@ fn spawn_tile_entities(
 /// Build a sub-mesh from a subset of `mesh`'s triangles (by triangle ordinal),
 /// remapped to a compact vertex range — splits a feature tile into per-section-
 /// twin pieces at spawn (T8 highlight). Copies POSITION plus whatever of
-/// NORMAL/UV0/COLOR the source carries; `MAIN_WORLD` usage so the pick raycast
-/// can read it.
+/// NORMAL/UV0/COLOR the source carries; `MAIN_WORLD | RENDER_WORLD` usage.
 /// Public since 0.1.9: the lazy-extraction seam for hosts. Per-feature render
 /// styling is a material concern ([`TileFeaturePick`] + the UV1 feature ids),
 /// but effects that need REAL per-feature geometry — a selection outline pass,
 /// a physics proxy, an export — extract just the wanted triangles on demand
 /// (e.g. once per click), which is why the eager per-feature split of ≤0.1.5
 /// is gone: this is its surviving, on-demand half.
+///
+/// It reads the source mesh's MAIN-world data, so the source must come from a
+/// set attached with [`Tiles3dAttach::main_world_meshes`] (0.5): a
+/// `RENDER_WORLD` tile mesh has none after its first upload, and gets an EMPTY
+/// mesh back rather than a panic.
 pub fn build_submesh(mesh: &Mesh, tris: &[usize]) -> Mesh {
     use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues as Vav};
     let mut out = Mesh::new(
         PrimitiveTopology::TriangleList,
         bevy::asset::RenderAssetUsages::default(),
     );
-    let Some(positions) = mesh
-        .attribute(Mesh::ATTRIBUTE_POSITION)
-        .and_then(|a| a.as_float3())
-    else {
+    // `try_*`: an extracted (`RENDER_WORLD`) source errs instead of panicking.
+    let attr = |id| mesh.try_attribute_option(id).ok().flatten();
+    let Some(positions) = attr(Mesh::ATTRIBUTE_POSITION).and_then(|a| a.as_float3()) else {
         return out;
     };
-    let normals = mesh
-        .attribute(Mesh::ATTRIBUTE_NORMAL)
-        .and_then(|a| a.as_float3());
-    let uvs = match mesh.attribute(Mesh::ATTRIBUTE_UV_0) {
+    let normals = attr(Mesh::ATTRIBUTE_NORMAL).and_then(|a| a.as_float3());
+    let uvs = match attr(Mesh::ATTRIBUTE_UV_0) {
         Some(Vav::Float32x2(v)) => Some(v.as_slice()),
         _ => None,
     };
-    let colors = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+    let colors = match attr(Mesh::ATTRIBUTE_COLOR) {
         Some(Vav::Float32x4(v)) => Some(v.as_slice()),
         _ => None,
     };
+    let indices = mesh.try_indices_option().ok().flatten();
     let vertex_of = |t: usize, k: usize| -> Option<usize> {
-        match mesh.indices() {
+        match indices {
             Some(Indices::U32(v)) => v.get(t * 3 + k).map(|&i| i as usize),
             Some(Indices::U16(v)) => v.get(t * 3 + k).map(|&i| i as usize),
             None => Some(t * 3 + k),
@@ -1954,6 +2120,7 @@ fn drive_tiles3d(
         frame,
         next_generation,
         resident_bytes: resident_cache,
+        resident_cpu: cpu_cache,
         ..
     } = &mut *sets;
     *frame += 1;
@@ -1979,9 +2146,11 @@ fn drive_tiles3d(
     });
     // `resident_cache` (what `resident_content_bytes()` returns) is written on
     // EVERY exit path below: 0 here, a direct re-sum on the camera-less return,
-    // and the slot pass minus this frame's evictions on the normal path.
+    // and the slot pass minus this frame's evictions on the normal path. So is
+    // its CPU twin `cpu_cache`.
     if sets.is_empty() {
         *resident_cache = 0;
+        *cpu_cache = 0;
         if *credits != TilesetCredits::default() {
             *credits = TilesetCredits::default();
         }
@@ -1989,7 +2158,7 @@ fn drive_tiles3d(
     }
     let Ok((cam, cam_gt, proj, frustum)) = camera.single() else {
         // Rare (no streaming camera yet), so the O(slots) sum is fine here.
-        *resident_cache = ready_bytes(sets);
+        (*resident_cache, *cpu_cache) = ready_bytes(sets);
         return;
     };
 
@@ -2017,17 +2186,25 @@ fn drive_tiles3d(
     // pressure (its global memory ledger) folds into the same product.
     // Quality degradation beats "memory access out of bounds"
     // (see Tiles3dConfig::memory_budget_bytes).
-    let mut resident_bytes: u64 = 0;
+    let (mut resident_bytes, mut cpu_bytes): (u64, u64) = (0, 0);
     let mut in_flight_total: usize = 0;
     for slot in sets.iter().flat_map(|s| s.slots.iter()) {
         match slot {
-            TileSlot::Ready { bytes, .. } => resident_bytes += *bytes,
+            TileSlot::Ready {
+                bytes,
+                cpu_bytes: c,
+                ..
+            } => {
+                resident_bytes += *bytes;
+                cpu_bytes += *c;
+            }
             TileSlot::InFlight { .. } => in_flight_total += 1,
             _ => {}
         }
     }
     // The evictions below subtract from it, so it ends the frame exact.
     *resident_cache = resident_bytes;
+    *cpu_cache = cpu_bytes;
     let pressure = (memory_pressure_factor(resident_bytes, config.memory_budget_bytes)
         * f64::from(config.external_pressure.max(1.0)))
     .min(8.0);
@@ -2337,7 +2514,7 @@ fn drive_tiles3d(
         };
         let mut hide: Vec<usize> = Vec::new();
         for (i, &want) in want_visible.iter().enumerate() {
-            let TileSlot::Ready { entity, bytes } = set.slots[i] else {
+            let TileSlot::Ready { entity, .. } = set.slots[i] else {
                 continue;
             };
             match (want, entity) {
@@ -2388,10 +2565,9 @@ fn drive_tiles3d(
                         &set.caches[i],
                         visibility,
                     );
-                    set.slots[i] = TileSlot::Ready {
-                        entity: Some(e),
-                        bytes,
-                    };
+                    if let TileSlot::Ready { entity, .. } = &mut set.slots[i] {
+                        *entity = Some(e);
+                    }
                 }
                 // Held tiles keep BOTH their entity and their visibility: they
                 // are the coverage a starved tile has not provided yet.
@@ -2400,20 +2576,13 @@ fn drive_tiles3d(
             }
         }
         for i in hide {
-            let TileSlot::Ready {
-                entity: Some(e),
-                bytes,
-            } = set.slots[i]
-            else {
-                continue;
-            };
-            commands.entity(e).despawn();
             // Slot stays Ready — the assets (and the ledger bytes) are
             // deliberately still resident; only eviction reclaims them.
-            set.slots[i] = TileSlot::Ready {
-                entity: None,
-                bytes,
-            };
+            if let TileSlot::Ready { entity, .. } = &mut set.slots[i]
+                && let Some(e) = entity.take()
+            {
+                commands.entity(e).despawn();
+            }
         }
         if starved {
             // Keep the reactive loop ticking until the pending respawns have
@@ -2546,7 +2715,12 @@ fn drive_tiles3d(
             evict.extend(extras.iter().take(over).map(|(i, _)| *i));
         }
         for i in evict {
-            if let TileSlot::Ready { entity, bytes } = set.slots[i] {
+            if let TileSlot::Ready {
+                entity,
+                bytes,
+                cpu_bytes,
+            } = set.slots[i]
+            {
                 if let Some(e) = entity {
                     commands.entity(e).despawn();
                 }
@@ -2555,6 +2729,7 @@ fn drive_tiles3d(
                 set.caches[i] = Vec::new();
                 set.slots[i] = TileSlot::NotLoaded;
                 *resident_cache = resident_cache.saturating_sub(bytes);
+                *cpu_cache = cpu_cache.saturating_sub(cpu_bytes);
             }
         }
 
@@ -2661,6 +2836,61 @@ fn drive_tiles3d(
     // in the asset loader).
     if any_in_flight || pending_respawns {
         redraw.write(RequestRedraw);
+    }
+}
+
+/// Give feature primitives their [`HiddenTileFeatures`] mask: on a set change,
+/// EVERY resident feature primitive (spawned or despawned-but-cached, so a
+/// respawn never needs work); otherwise only the ones decoded this frame, in
+/// their spawn frame. A primitive whose mask actually changed updates its
+/// [`TilePickMesh`] (shared by every entity of it) and queues one index-only
+/// GPU write (`index_writes`). No queries, so no B0001 surface.
+fn apply_feature_visibility(
+    hidden: Res<HiddenTileFeatures>,
+    mut sets: ResMut<Tiles3dSets>,
+    mut queue: ResMut<TileIndexQueue>,
+) {
+    let changed = hidden.is_changed();
+    if !changed && sets.fresh.is_empty() {
+        return;
+    }
+    let Tiles3dSets {
+        sets,
+        owners,
+        fresh,
+        ..
+    } = &mut *sets;
+    owners.sync(&hidden.0, changed);
+    let mut refresh = |mesh: AssetId<Mesh>, pick: &TilePickMesh, owner_ix: &[u32], main_world| {
+        let Some(gpu) = pick.set_hidden(owners.mask(owner_ix)) else {
+            return;
+        };
+        // Only a main-world mesh can re-upload pristine data over a cut.
+        let cut = !pick
+            .pristine_indices()
+            .is_some_and(|p| Arc::ptr_eq(p, &gpu));
+        queue.0.push((mesh, gpu, main_world && cut));
+    };
+    if changed {
+        // Every resident item is covered here, this frame's fresh ones included.
+        fresh.clear();
+        for set in sets.iter() {
+            for item in set.caches.iter().flatten() {
+                if let CachedItem::Mesh {
+                    mesh,
+                    pick_mesh,
+                    owner_ix: Some(owner_ix),
+                    ..
+                } = item
+                {
+                    refresh(mesh.id(), pick_mesh, owner_ix, set.main_world_meshes);
+                }
+            }
+        }
+    } else {
+        for f in fresh.drain(..) {
+            refresh(f.mesh, &f.pick_mesh, &f.owner_ix, f.main_world);
+        }
     }
 }
 
@@ -3199,6 +3429,9 @@ mod tests {
                     material: Handle::default(),
                     transform: Transform::IDENTITY,
                     pick: None,
+                    aabb: None,
+                    pick_mesh: TilePickMesh::new(Vec::new(), None, None),
+                    owner_ix: None,
                 }]
             })
             .collect();
@@ -3214,6 +3447,7 @@ mod tests {
                 TileSlot::Ready {
                     entity: None,
                     bytes: TEST_TILE_BYTES,
+                    cpu_bytes: TEST_TILE_BYTES,
                 };
                 n
             ],
@@ -3226,6 +3460,7 @@ mod tests {
             anchor: Some(anchor),
             owner_id: None,
             sse_threshold_px: None,
+            main_world_meshes: false,
             placeholder_cleared: true,
             last_cut: None,
             frame,
@@ -3307,7 +3542,8 @@ mod tests {
                     sets.sets[0].slots[l],
                     TileSlot::Ready {
                         entity: None,
-                        bytes: TEST_TILE_BYTES
+                        bytes: TEST_TILE_BYTES,
+                        ..
                     }
                 ),
                 "leaf {l} despawned but still Ready"
@@ -3475,12 +3711,14 @@ mod tests {
             TileSlot::Ready {
                 entity: Some(Entity::from_raw_u32(1).unwrap()),
                 bytes: TEST_TILE_BYTES,
+                cpu_bytes: TEST_TILE_BYTES,
             };
             tree.len()
         ];
         slots[starved] = TileSlot::Ready {
             entity: None,
             bytes: TEST_TILE_BYTES,
+            cpu_bytes: TEST_TILE_BYTES,
         };
         let mut want = vec![false; tree.len()];
         want[starved] = true;
@@ -3505,12 +3743,14 @@ mod tests {
             TileSlot::Ready {
                 entity: Some(Entity::from_raw_u32(1).unwrap()),
                 bytes: TEST_TILE_BYTES,
+                cpu_bytes: TEST_TILE_BYTES,
             };
             tree.len()
         ];
         slots[0] = TileSlot::Ready {
             entity: None,
             bytes: TEST_TILE_BYTES,
+            cpu_bytes: TEST_TILE_BYTES,
         };
         let mut want = vec![false; tree.len()];
         want[0] = true;
@@ -3985,22 +4225,33 @@ mod tests {
     /// One indexed triangle carrying feature 0, sharing `node_of_feature` with
     /// its tile's other primitives (one `FeatSource` per tile, as decode does).
     fn feature_prim(node_of_feature: &Arc<Vec<String>>) -> DecodedItem {
+        features_prim(node_of_feature, &[0])
+    }
+
+    /// One indexed triangle per entry of `feature_of_triangle` (triangle `t` is
+    /// vertices `3t..3t+3`, at x = t), as decode builds them.
+    fn features_prim(
+        node_of_feature: &Arc<Vec<String>>,
+        feature_of_triangle: &[u32],
+    ) -> DecodedItem {
         use bevy::mesh::{Indices, PrimitiveTopology};
+        let n = feature_of_triangle.len() * 3;
         let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
             bevy::asset::RenderAssetUsages::default(),
         );
-        mesh.insert_attribute(
-            Mesh::ATTRIBUTE_POSITION,
-            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        );
-        mesh.insert_indices(Indices::U32(vec![0, 1, 2]));
+        let corner = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let positions: Vec<[f32; 3]> = (0..n)
+            .map(|v| [(v / 3) as f32 + corner[v % 3][0], corner[v % 3][1], 0.0])
+            .collect();
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        mesh.insert_indices(Indices::U32((0..n as u32).collect()));
         DecodedItem::Mesh(Box::new(DecodedPrimitive {
             transform: Mat4::IDENTITY,
             mesh,
             material: content::DecodedMaterial::default(),
             features: Some(content::TileFeatures {
-                feature_of_triangle: vec![0],
+                feature_of_triangle: feature_of_triangle.to_vec(),
                 node_of_feature: node_of_feature.clone(),
             }),
             bounds: None,
@@ -4151,6 +4402,357 @@ mod tests {
         assert!(
             debug > 0,
             "the cut change is still logged, at DEBUG (and the counter is wired)"
+        );
+    }
+
+    // ── RENDER_WORLD meshes, the pick copy, feature hiding (0.5) ─────────────
+
+    /// A leaf of `synth_tree`, in the cut of a camera at z = 600.
+    const LEAF: usize = 2;
+
+    /// `install_set` at the leaf cut, settled, owned by `"anchor"`, with a
+    /// resolver that maps node path `p` to owner `"owner:p"`.
+    fn feature_app() -> App {
+        let mut app = despawn_test_app(test_config());
+        install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.world_mut().resource_mut::<Tiles3dSets>().sets[0].owner_id = Some("anchor".into());
+        app.insert_resource(TileFeatureResolver(Some(Arc::new(
+            |_: &str, paths: &[&str]| paths.iter().map(|p| format!("owner:{p}")).collect(),
+        ))));
+        app.update();
+        app.update();
+        app
+    }
+
+    fn ab() -> Arc<Vec<String>> {
+        Arc::new(vec!["a".to_string(), "b".to_string()])
+    }
+
+    fn hide(app: &mut App, owners: &[&str]) {
+        app.world_mut().resource_mut::<HiddenTileFeatures>().0 =
+            owners.iter().map(|o| o.to_string()).collect();
+    }
+
+    /// This frame's queued GPU index writes.
+    fn queued(app: &App) -> Vec<(AssetId<Mesh>, Vec<u32>, bool)> {
+        app.world()
+            .resource::<TileIndexQueue>()
+            .0
+            .iter()
+            .map(|(id, ix, reapply)| (*id, ix.to_vec(), *reapply))
+            .collect()
+    }
+
+    /// Mesh handle + pick copy of item `k` cached for `tile` of set 0.
+    fn mesh_item(app: &App, tile: usize, k: usize) -> (Handle<Mesh>, TilePickMesh) {
+        match &app.world().resource::<Tiles3dSets>().sets[0].caches[tile][k] {
+            CachedItem::Mesh {
+                mesh, pick_mesh, ..
+            } => (mesh.clone(), pick_mesh.clone()),
+            #[allow(unreachable_patterns)]
+            _ => panic!("not a mesh item"),
+        }
+    }
+
+    #[test]
+    fn hiding_a_feature_queues_one_index_write_and_updates_the_pick_mask() {
+        let mut app = feature_app();
+        land_tile(&mut app, LEAF, vec![features_prim(&ab(), &[0, 1, 0])]);
+        app.update();
+        assert!(queued(&app).is_empty(), "nothing hidden, nothing to write");
+        let (mesh, pick) = mesh_item(&app, LEAF, 0);
+        assert_eq!(pick.triangle_count(), 3);
+
+        hide(&mut app, &["owner:b"]);
+        app.update();
+        assert_eq!(
+            queued(&app),
+            vec![(mesh.id(), vec![0, 1, 2, 3, 3, 3, 6, 7, 8], false)],
+            "one index-only write: feature b's triangle degenerates in place"
+        );
+        assert_eq!(pick.triangle_count(), 2, "the pick mask follows");
+        let spawned = app
+            .world_mut()
+            .query_filtered::<&TilePickMesh, With<TileFeaturePick>>()
+            .iter(app.world())
+            .map(TilePickMesh::triangle_count)
+            .collect::<Vec<_>>();
+        assert_eq!(spawned, vec![2], "every entity shares the cached pick copy");
+        assert!(
+            app.world().resource::<Assets<Mesh>>().get(&mesh).is_some(),
+            "the mesh asset itself is untouched"
+        );
+
+        hide(&mut app, &[]);
+        app.update();
+        assert_eq!(
+            queued(&app),
+            vec![(mesh.id(), (0..9).collect(), false)],
+            "un-hide writes the pristine buffer back"
+        );
+        assert_eq!(pick.triangle_count(), 3);
+    }
+
+    #[test]
+    fn unchanged_mask_queues_nothing() {
+        let mut app = feature_app();
+        land_tile(&mut app, LEAF, vec![features_prim(&ab(), &[0, 1])]);
+        app.update();
+        hide(&mut app, &["owner:nobody"]);
+        app.update();
+        assert!(
+            queued(&app).is_empty(),
+            "an owner no tile has changes no mask"
+        );
+        hide(&mut app, &["owner:a"]);
+        app.update();
+        assert_eq!(queued(&app).len(), 1);
+        hide(&mut app, &["owner:a", "owner:nobody"]);
+        app.update();
+        assert!(queued(&app).is_empty(), "same mask, no write");
+        app.update();
+        assert!(queued(&app).is_empty(), "the queue is per frame");
+    }
+
+    #[test]
+    fn respawn_after_a_change_while_despawned_needs_no_write() {
+        let mut app = feature_app();
+        // The root is out of the leaf cut: it lands, then gives up its entity.
+        land_tile(&mut app, 0, vec![features_prim(&ab(), &[0, 1])]);
+        app.update();
+        assert!(matches!(
+            app.world().resource::<Tiles3dSets>().sets[0].slots[0],
+            TileSlot::Ready { entity: None, .. }
+        ));
+        let (mesh, pick) = mesh_item(&app, 0, 0);
+        hide(&mut app, &["owner:a"]);
+        app.update();
+        assert_eq!(
+            queued(&app),
+            vec![(mesh.id(), vec![0, 0, 0, 3, 4, 5], false)],
+            "despawned-but-cached tiles are cut eagerly"
+        );
+
+        // Pull back: the root becomes the cut and respawns from its cache.
+        let cam = app
+            .world_mut()
+            .query_filtered::<Entity, With<Tiles3dCamera>>()
+            .single(app.world())
+            .unwrap();
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
+        app.update();
+        assert!(matches!(
+            app.world().resource::<Tiles3dSets>().sets[0].slots[0],
+            TileSlot::Ready {
+                entity: Some(_),
+                ..
+            }
+        ));
+        assert!(queued(&app).is_empty(), "a respawn writes nothing");
+        assert_eq!(pick.triangle_count(), 1);
+    }
+
+    #[test]
+    fn fresh_tile_under_a_hidden_set_is_cut_in_its_spawn_frame() {
+        let mut app = feature_app();
+        // `owner:b` is already interned before the set change.
+        land_tile(&mut app, LEAF, vec![features_prim(&ab(), &[1])]);
+        app.update();
+        hide(&mut app, &["owner:b"]);
+        app.update();
+        land_tile(&mut app, LEAF + 1, vec![features_prim(&ab(), &[0, 1])]);
+        app.update();
+        let (mesh, pick) = mesh_item(&app, LEAF + 1, 0);
+        assert_eq!(
+            queued(&app),
+            vec![(mesh.id(), vec![0, 1, 2, 3, 3, 3], false)],
+            "cut in the frame it lands, the same submit as its first upload"
+        );
+        assert_eq!(pick.triangle_count(), 1);
+    }
+
+    #[test]
+    fn owner_interned_after_the_set_change_is_still_hidden() {
+        let mut app = feature_app();
+        // No tile has carried `owner:b` yet when the set changes.
+        hide(&mut app, &["owner:b"]);
+        app.update();
+        land_tile(&mut app, LEAF, vec![features_prim(&ab(), &[1, 0])]);
+        app.update();
+        let (mesh, _) = mesh_item(&app, LEAF, 0);
+        assert_eq!(
+            queued(&app),
+            vec![(mesh.id(), vec![0, 0, 0, 3, 4, 5], false)]
+        );
+    }
+
+    #[test]
+    fn non_indexed_feature_primitive_is_hidden_after_a_set_change() {
+        let mut app = feature_app();
+        let glb = content::tests::non_indexed_feature_fixture(true);
+        let tile = block_on(content::decode_tile(&glb, false)).expect("decode");
+        land_tile(&mut app, LEAF, tile.items);
+        app.update();
+        hide(&mut app, &["owner:BetaModule/sub"]);
+        app.update();
+        let (mesh, pick) = mesh_item(&app, LEAF, 0);
+        assert_eq!(
+            queued(&app),
+            vec![(mesh.id(), vec![0, 1, 2, 3, 3, 3], false)],
+            "the synthesized 0..n indices make a non-indexed feature hideable"
+        );
+        assert_eq!(
+            (pick.triangle_count(), pick.pristine_triangle_count()),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn reapply_flag_set_only_for_main_world_mesh_sets() {
+        for main_world in [false, true] {
+            let mut app = feature_app();
+            app.world_mut().resource_mut::<Tiles3dSets>().sets[0].main_world_meshes = main_world;
+            land_tile(&mut app, LEAF, vec![features_prim(&ab(), &[0, 1])]);
+            app.update();
+            hide(&mut app, &["owner:a"]);
+            app.update();
+            let reapply: Vec<bool> = queued(&app).iter().map(|q| q.2).collect();
+            assert_eq!(reapply, vec![main_world], "a cut, main_world={main_world}");
+            hide(&mut app, &[]);
+            app.update();
+            let reapply: Vec<bool> = queued(&app).iter().map(|q| q.2).collect();
+            assert_eq!(reapply, vec![false], "pristine never reapplies");
+        }
+    }
+
+    #[test]
+    fn main_world_meshes_opt_out_keeps_full_mesh() {
+        let mut app = feature_app();
+        app.world_mut().resource_mut::<Tiles3dSets>().sets[0].main_world_meshes = true;
+        land_tile(&mut app, LEAF, vec![features_prim(&ab(), &[0, 1])]);
+        app.update();
+        let (mesh, pick) = mesh_item(&app, LEAF, 0);
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let m = meshes.get(&mesh).unwrap();
+        assert_eq!(m.asset_usage, bevy::asset::RenderAssetUsages::default());
+        assert_eq!(m.count_vertices(), 6);
+        assert_eq!(pick.pristine_triangle_count(), 2, "and the pick copy too");
+    }
+
+    /// `Option<&Aabb>` would let `calculate_bounds` recompute it on respawn;
+    /// the decode-time box plus `NoAutoAabb` keeps tiles out of it entirely.
+    #[test]
+    fn spawned_tile_has_decode_time_aabb_and_no_auto_aabb() {
+        use bevy::camera::primitives::MeshAabb;
+        let mut app = feature_app();
+        let items = || {
+            // Irrefutable with neither `points` nor `splats` (one variant).
+            #[allow(irrefutable_let_patterns)]
+            let DecodedItem::Mesh(mut with_bounds) = features_prim(&ab(), &[0, 1, 0]) else {
+                unreachable!()
+            };
+            with_bounds.bounds = Some([[0.0, 0.0, 0.0], [3.0, 1.0, 0.0]]);
+            vec![DecodedItem::Mesh(with_bounds), features_prim(&ab(), &[1])]
+        };
+        let want: Vec<Aabb> = items()
+            .iter()
+            .map(|i| match i {
+                DecodedItem::Mesh(p) => p.mesh.compute_aabb().unwrap(),
+                #[allow(unreachable_patterns)]
+                _ => unreachable!(),
+            })
+            .collect();
+        land_tile(&mut app, LEAF, items());
+        app.update();
+        let mut got: Vec<(Aabb, bool)> = app
+            .world_mut()
+            .query::<(&Aabb, Has<NoAutoAabb>, &TilePickMesh)>()
+            .iter(app.world())
+            .map(|(a, no_auto, _)| (*a, no_auto))
+            .collect();
+        got.sort_by(|a, b| a.0.half_extents.x.total_cmp(&b.0.half_extents.x));
+        let mut want: Vec<(Aabb, bool)> = want.into_iter().map(|a| (a, true)).collect();
+        want.sort_by(|a, b| a.0.half_extents.x.total_cmp(&b.0.half_extents.x));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn resident_content_bytes_unchanged_by_render_world_flip() {
+        let items = || {
+            vec![
+                features_prim(&ab(), &[0, 1]),
+                plain_prim(Default::default()),
+            ]
+        };
+        let decoded = content::resident_cost_bytes(&items());
+        for main_world in [false, true] {
+            let mut app = feature_app();
+            app.world_mut().resource_mut::<Tiles3dSets>().sets[0].main_world_meshes = main_world;
+            land_tile(&mut app, LEAF, items());
+            app.update();
+            let TileSlot::Ready { bytes, .. } =
+                app.world().resource::<Tiles3dSets>().sets[0].slots[LEAF]
+            else {
+                panic!("landed");
+            };
+            assert_eq!(
+                bytes, decoded,
+                "the valve budgets the same bytes either way"
+            );
+            assert_eq!(ledger(&app), slot_sum(&app));
+        }
+    }
+
+    #[test]
+    fn resident_cpu_bytes_counts_pick_copies() {
+        // 2 triangles = 6 vertices: positions 72 B + indices 24 B.
+        let pick_bytes = 6 * 12 + 6 * 4;
+        for main_world in [false, true] {
+            let mut app = feature_app();
+            app.world_mut().resource_mut::<Tiles3dSets>().sets[0].main_world_meshes = main_world;
+            land_tile(&mut app, LEAF, vec![features_prim(&ab(), &[0, 1])]);
+            app.update();
+            let sets = app.world().resource::<Tiles3dSets>();
+            let TileSlot::Ready {
+                bytes, cpu_bytes, ..
+            } = sets.sets[0].slots[LEAF]
+            else {
+                panic!("landed");
+            };
+            let want = pick_bytes + if main_world { bytes } else { 0 };
+            assert_eq!(cpu_bytes, want, "main_world={main_world}");
+            let cpu_sum: u64 = sets.sets[0]
+                .slots
+                .iter()
+                .map(|s| match s {
+                    TileSlot::Ready { cpu_bytes, .. } => *cpu_bytes,
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(sets.resident_cpu_bytes(), cpu_sum, "Drive's O(1) figure");
+        }
+    }
+
+    #[test]
+    fn build_submesh_on_extracted_mesh_does_not_panic() {
+        use bevy::mesh::{Indices, PrimitiveTopology};
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::RENDER_WORLD,
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; 3]);
+        mesh.insert_indices(Indices::U32(vec![0, 1, 2]));
+        // What render extraction does to a RENDER_WORLD mesh.
+        let _ = mesh.take_gpu_data().unwrap();
+        let sub = build_submesh(&mesh, &[0]);
+        assert!(
+            sub.attribute(Mesh::ATTRIBUTE_POSITION).is_none(),
+            "empty, no panic"
         );
     }
 
