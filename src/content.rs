@@ -363,13 +363,16 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
 /// A returned [`PreparedTile`] is consumed WITHOUT re-parsing its JSON: the
 /// feature side-band ([`PreparedFeatures`]) replaces the `FeatureCtx` rebuild
 /// (main-thread parse count for feature tiles drops from 2 to 1).
+///
+/// The hook BORROWS `bytes` (no copy): they have to outlive the hook anyway,
+/// because every fallback above decodes them inline.
 pub async fn decode_tile_with(
     bytes: &[u8],
     georeferenced: bool,
     hook: Option<&Arc<TilePrepareFn>>,
 ) -> Result<DecodedTile, DecodeError> {
     if let Some(hook) = hook {
-        match hook(bytes.to_vec(), georeferenced).await {
+        match hook(bytes, georeferenced).await {
             Ok(Some(prepared)) => return decode_prepared(prepared, bytes.len() as u64).await,
             Ok(None) => {} // declined (Draco/splat) — the inline path handles those
             Err(e) => warn_prepare_hook_once(&e.to_string()),
@@ -1417,8 +1420,8 @@ mod tests {
         let b = block_on(decode_tile(&tiny_glb(), false)).expect("decode b");
 
         let mut stats = crate::Tiles3dDecodeStats::default();
-        stats.record(a.stage_ms);
-        stats.record(b.stage_ms);
+        stats.record(&a);
+        stats.record(&b);
 
         assert_eq!(stats.tiles, 2);
         for i in 0..4 {
@@ -2024,7 +2027,7 @@ mod tests {
     /// Canned in-process prepare hook — exactly what the real worker does
     /// minus the postMessage: `bevy_3d_tiles_prepare::prepare_tile`.
     fn canned_hook() -> Arc<crate::api::TilePrepareFn> {
-        Arc::new(|bytes, geo| Box::pin(async move { prepare_tile(&bytes, geo) }))
+        Arc::new(|bytes, geo| Box::pin(async move { prepare_tile(bytes, geo) }))
     }
 
     fn indices_u32(mesh: &Mesh) -> Option<Vec<u32>> {
@@ -2168,7 +2171,7 @@ mod tests {
     /// Canned in-process S5 hook: `prepare_tile_extracting` — prep AND
     /// geometry extraction, the pair the real worker runs in its own wasm.
     fn canned_extract_hook() -> Arc<crate::api::TilePrepareFn> {
-        Arc::new(|bytes, geo| Box::pin(async move { prepare_tile_extracting(&bytes, geo) }))
+        Arc::new(|bytes, geo| Box::pin(async move { prepare_tile_extracting(bytes, geo) }))
     }
 
     /// A THREE-deep node chain — TRS with a real rotation + non-uniform scale,
@@ -2430,6 +2433,29 @@ mod tests {
         assert!(!bevy_3d_tiles_prepare::extract_would_decline(
             vanilla, false
         ));
+    }
+
+    /// The prepare hook BORROWS the fetched tile: the caller keeps the bytes
+    /// alive for the inline fallback anyway, so handing the hook its own copy
+    /// was a full-tile allocation + memcpy on the frame thread per request.
+    #[test]
+    fn hook_borrows_the_fetched_bytes() {
+        use bevy::tasks::block_on;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let record = seen.clone();
+        let hook: Arc<crate::api::TilePrepareFn> = Arc::new(move |bytes, _| {
+            record.store(bytes.as_ptr() as usize, Ordering::SeqCst);
+            Box::pin(async { Ok::<_, DecodeError>(None) })
+        });
+        let glb = tiny_glb();
+        block_on(decode_tile_with(&glb, false, Some(&hook))).expect("declined → inline decode");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            glb.as_ptr() as usize,
+            "the hook saw the caller's buffer, not a copy of it"
+        );
     }
 
     /// An erroring hook warns once and falls back inline — never fatal.

@@ -159,12 +159,6 @@ pub struct Tiles3dConfig {
     /// per-frame O(tree) pass. The compactor drops whole grafted subtrees that
     /// have been out of view past the grace window; revisiting re-grafts them.
     pub tree_compact_min: usize,
-    /// VESTIGIAL since 0.1.6 (kept for struct-literal compatibility): tiles no
-    /// longer split into per-feature submeshes at all — every primitive spawns
-    /// as one mesh and features resolve at pick time via [`TileFeaturePick`]
-    /// (the Cesium model). The split, even capped, cost seconds of
-    /// main-thread hang per refine wave.
-    pub max_feature_submeshes: usize,
     /// Memory-pressure valve: when the **decoded main-world bytes** of all
     /// resident tiles (summed across tilesets — mesh attributes + indices,
     /// see `content::resident_cost_bytes`) exceed this budget, the effective
@@ -236,10 +230,6 @@ impl Default for Tiles3dConfig {
             // compacting tiny trees. Re-grafting a reclaimed area is a real
             // re-fetch (P3DT is never CAS-cached), so don't set it too tight.
             tree_compact_min: 16_384,
-            // Generous for real part hierarchies (a valve skid is dozens of
-            // features); far below the pathological hundreds-of-export-parts
-            // case the cap exists for.
-            max_feature_submeshes: 64,
             // Off by default — native address space is effectively unbounded.
             // wasm hosts should set a budget (see the field docs).
             memory_budget_bytes: 0,
@@ -296,6 +286,23 @@ pub struct Tiles3dAttach {
     /// resident triangles for no visible gain. Raise it (e.g. 24) for such sets
     /// while the basemap keeps the sharp global default.
     pub sse_threshold_px: Option<f64>,
+}
+
+/// Everything empty / `None`, anchored to `Entity::PLACEHOLDER`: set `anchor`
+/// and `url`, and fill the rest with `..default()` so a field added later does
+/// not break the literal.
+impl Default for Tiles3dAttach {
+    fn default() -> Self {
+        Self {
+            anchor: Entity::PLACEHOLDER,
+            url: String::new(),
+            local: Transform::IDENTITY,
+            owner_id: None,
+            label: String::new(),
+            p3dt: None,
+            sse_threshold_px: None,
+        }
+    }
 }
 
 /// Tear down any tileset anchored to this entity (rebind / mode switch).
@@ -493,6 +500,13 @@ pub struct Tiles3dDecodeStats {
     pub stage_ms: [f64; 4],
     /// Worst single-tile total decode ms.
     pub worst_ms: f32,
+    /// Mesh primitives decoded (each becomes one tile mesh entity and one draw).
+    pub primitives: u64,
+    /// The subset of `primitives` with a base-color texture.
+    pub textured_primitives: u64,
+    /// Distinct untextured PBR factor sets per decoded tile, summed over tiles:
+    /// how many untextured materials the decoded tiles actually needed.
+    pub material_keys: u64,
 }
 
 impl Tiles3dDecodeStats {
@@ -502,12 +516,51 @@ impl Tiles3dDecodeStats {
         self.stage_ms.map(|s| s / n)
     }
 
-    pub(crate) fn record(&mut self, stage_ms: [f32; 4]) {
+    pub(crate) fn record(&mut self, tile: &DecodedTile) {
+        let stage_ms = tile.stage_ms;
         self.tiles += 1;
         for (acc, s) in self.stage_ms.iter_mut().zip(stage_ms) {
             *acc += f64::from(s);
         }
         self.worst_ms = self.worst_ms.max(stage_ms.iter().sum());
+        let mut keys = std::collections::HashSet::new();
+        for item in &tile.items {
+            // Irrefutable with neither `points` nor `splats` (one variant).
+            #[allow(irrefutable_let_patterns)]
+            let DecodedItem::Mesh(p) = item else {
+                continue;
+            };
+            self.primitives += 1;
+            if p.material.base_color_image.is_some() {
+                self.textured_primitives += 1;
+            } else {
+                keys.insert(MaterialKey::of(&p.material));
+            }
+        }
+        self.material_keys += keys.len() as u64;
+    }
+}
+
+/// Every PBR factor the crate sets on an UNTEXTURED tile material, bit-exact.
+/// Two untextured primitives with equal keys need the same `StandardMaterial`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct MaterialKey {
+    base_color: [u32; 4],
+    metallic: u32,
+    roughness: u32,
+    unlit: bool,
+    double_sided: bool,
+}
+
+impl MaterialKey {
+    fn of(m: &content::DecodedMaterial) -> Self {
+        Self {
+            base_color: m.base_color.map(f32::to_bits),
+            metallic: m.metallic.to_bits(),
+            roughness: m.roughness.to_bits(),
+            unlit: m.unlit,
+            double_sided: m.double_sided,
+        }
     }
 }
 
@@ -527,6 +580,23 @@ pub struct Tiles3dSets {
     frame: u64,
     next_set_id: u64,
     next_generation: u64,
+    /// [`Tiles3dSets::resident_content_bytes`] as of the end of the last
+    /// Drive. Written on EVERY exit path of `drive_tiles3d` and re-summed from
+    /// the slots each frame (minus that frame's evictions), never tracked
+    /// across frames, so it cannot drift.
+    resident_bytes: u64,
+}
+
+/// Ready (resident) decoded bytes across `sets` — the slow sum the cache
+/// replaces, kept for Drive's rare early-return path.
+fn ready_bytes(sets: &[ActiveTileset]) -> u64 {
+    sets.iter()
+        .flat_map(|s| s.slots.iter())
+        .map(|slot| match slot {
+            TileSlot::Ready { bytes, .. } => *bytes,
+            _ => 0,
+        })
+        .sum()
 }
 
 impl Tiles3dSets {
@@ -542,15 +612,13 @@ impl Tiles3dSets {
     /// same sum the memory-pressure valve uses. For the host's global memory
     /// ledger (feed the overshoot back as
     /// [`Tiles3dConfig::external_pressure`]).
+    ///
+    /// **As of the end of the last [`Tiles3dSet::Drive`]**, and O(1) (since
+    /// 0.5; it walked every slot of every set before). Tiles that land in a
+    /// frame's [`Tiles3dSet::Receive`] count from that frame's Drive on, so a
+    /// reader ordered before Drive sees the previous frame's figure.
     pub fn resident_content_bytes(&self) -> u64 {
-        self.sets
-            .iter()
-            .flat_map(|s| s.slots.iter())
-            .map(|slot| match slot {
-                TileSlot::Ready { bytes, .. } => *bytes,
-                _ => 0,
-            })
-            .sum()
+        self.resident_bytes
     }
 
     /// Root-volume bounding sphere of the tileset anchored to `anchor`, in
@@ -1021,7 +1089,7 @@ fn receive_tiles3d(
                             let root_entity = root.id();
                             let mut history = History::default();
                             history.resize(n);
-                            info!(
+                            debug!(
                                 "tiles3d: {label}: {n} tiles{}",
                                 if georef {
                                     " (georeferenced — ECEF frame)"
@@ -1136,7 +1204,7 @@ fn receive_tiles3d(
                                         uri,
                                     });
                                 }
-                                info!(
+                                debug!(
                                     "tiles3d: {}: external tileset grafted at tile {tile} \
                                      (tree now {n} tiles)",
                                     set.label
@@ -1153,14 +1221,14 @@ fn receive_tiles3d(
                     }
                     Ok(TileOutput::Content(decoded)) => {
                         spawned += 1;
+                        decode_stats.record(&decoded);
                         let DecodedTile {
                             items,
                             content_bytes: _,
                             rtc_center,
                             copyright,
-                            stage_ms,
+                            stage_ms: _,
                         } = *decoded;
-                        decode_stats.record(stage_ms);
                         set.rtc_centers[tile] = rtc_center;
                         if let Some(c) = copyright {
                             for frag in c.split(';') {
@@ -1327,6 +1395,24 @@ struct ContentRenderers<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
+/// One tile's feature owners: ALL of its node paths in one resolver call (so a
+/// host builds its per-anchor lookup once per tile), with unresolved (empty)
+/// ids falling back to the anchor rather than dropping picks.
+fn resolve_owners(
+    resolver: &TileFeatureResolver,
+    anchor: &str,
+    node_of_feature: &[String],
+) -> Arc<[String]> {
+    let paths: Vec<&str> = node_of_feature.iter().map(String::as_str).collect();
+    let mut owners = resolver.resolve(anchor, &paths);
+    for owner in &mut owners {
+        if owner.is_empty() {
+            *owner = anchor.to_string();
+        }
+    }
+    owners.into()
+}
+
 /// Decode-side half: insert one tile's decoded items into the asset stores
 /// ONCE and return the [`CachedItem`] spawn recipe. The returned handles are
 /// what keep the tile resident across hidden-tile despawns — dropping them
@@ -1356,6 +1442,13 @@ fn build_tile_cache(
     // the anchor anyway.
     let has_resolver = anchor.is_some() && resolver.0.is_some();
     let mut cache = Vec::with_capacity(items.len());
+    // Resolved owners, memoised by the `node_of_feature` table they came from.
+    // Decode builds ONE table per tile and shares it across the tile's
+    // primitives, so the resolver runs once per tile and every primitive's pick
+    // shares one owner `Arc`. The memo holds the source `Arc` itself, so the
+    // pointer it compares can never be a freed-and-reused address.
+    type OwnersOf = (Arc<Vec<String>>, Arc<[String]>);
+    let mut owners: Option<OwnersOf> = None;
 
     for item in items {
         match item {
@@ -1401,23 +1494,22 @@ fn build_tile_cache(
                 // correctness is carried entirely by the pick table.
                 let pick = match (features, has_resolver) {
                     (Some(f), true) => {
-                        let fallback = anchor.unwrap_or("");
-                        // Resolve ALL of the tile's feature paths in one call
-                        // so the host builds its per-anchor lookup once per
-                        // tile, not once per feature.
-                        let paths: Vec<&str> =
-                            f.node_of_feature.iter().map(String::as_str).collect();
-                        let mut owner_of_feature = resolver.resolve(fallback, &paths);
-                        // Out-of-range/unresolved ids fall back to the anchor
-                        // rather than dropping picks (matches the old split's
-                        // per-triangle fallback).
-                        for owner in &mut owner_of_feature {
-                            if owner.is_empty() {
-                                *owner = fallback.to_string();
+                        let owner_of_feature = match &owners {
+                            Some((table, resolved)) if Arc::ptr_eq(table, &f.node_of_feature) => {
+                                Arc::clone(resolved)
                             }
-                        }
+                            _ => {
+                                let resolved = resolve_owners(
+                                    resolver,
+                                    anchor.unwrap_or(""),
+                                    &f.node_of_feature,
+                                );
+                                owners = Some((f.node_of_feature, Arc::clone(&resolved)));
+                                resolved
+                            }
+                        };
                         Some(TileFeaturePick {
-                            feature_of_triangle: f.feature_of_triangle,
+                            feature_of_triangle: f.feature_of_triangle.into(),
                             owner_of_feature,
                         })
                     }
@@ -1816,6 +1908,7 @@ fn drive_tiles3d(
         sets,
         frame,
         next_generation,
+        resident_bytes: resident_cache,
         ..
     } = &mut *sets;
     *frame += 1;
@@ -1839,13 +1932,19 @@ fn drive_tiles3d(
         }
         false
     });
+    // `resident_cache` (what `resident_content_bytes()` returns) is written on
+    // EVERY exit path below: 0 here, a direct re-sum on the camera-less return,
+    // and the slot pass minus this frame's evictions on the normal path.
     if sets.is_empty() {
+        *resident_cache = 0;
         if *credits != TilesetCredits::default() {
             *credits = TilesetCredits::default();
         }
         return;
     }
     let Ok((cam, cam_gt, proj, frustum)) = camera.single() else {
+        // Rare (no streaming camera yet), so the O(slots) sum is fine here.
+        *resident_cache = ready_bytes(sets);
         return;
     };
 
@@ -1882,6 +1981,8 @@ fn drive_tiles3d(
             _ => {}
         }
     }
+    // The evictions below subtract from it, so it ends the frame exact.
+    *resident_cache = resident_bytes;
     let pressure = (memory_pressure_factor(resident_bytes, config.memory_budget_bytes)
         * f64::from(config.external_pressure.max(1.0)))
     .min(8.0);
@@ -1931,7 +2032,7 @@ fn drive_tiles3d(
     // after the loop under the global pool (cross-set fairness).
     let mut candidates: Vec<LoadCandidate> = Vec::new();
     // Hidden-tile respawn budget, GLOBAL across sets like `max_concurrent_loads`
-    // — per set it multiplied by tileset count (23 on a large site).
+    // — per set it multiplied by tileset count (23 on a large mining site).
     // ponytail: earlier sets in iteration order drain it first; that only delays
     // a later set's refill (its hold keeps the coverage), so the round-robin
     // machinery below is not worth spending on it until a scene actually starves.
@@ -2295,12 +2396,23 @@ fn drive_tiles3d(
         for req in &sel.loads {
             wanted[req.tile] = true;
         }
+        // The ONE per-set slot pass after selection: abort, and gather what the
+        // scheduler and eviction below need (nothing between here and the
+        // eviction changes a slot's Ready/InFlight state).
+        let mut has_ready = false;
+        let mut resident: Vec<(usize, u64)> = Vec::new();
         for (i, slot) in set.slots.iter_mut().enumerate() {
-            if let TileSlot::InFlight { generation } = slot
-                && !wanted[i]
-            {
-                fetch::trigger_abort(*generation);
-                *slot = TileSlot::NotLoaded;
+            match slot {
+                TileSlot::InFlight { generation } if !wanted[i] => {
+                    fetch::trigger_abort(*generation);
+                    *slot = TileSlot::NotLoaded;
+                }
+                TileSlot::InFlight { .. } => any_in_flight = true,
+                TileSlot::Ready { .. } => {
+                    has_ready = true;
+                    resident.push((i, set.last_touched[i]));
+                }
+                TileSlot::NotLoaded | TileSlot::Failed => {}
             }
         }
         // Budget guardrail (D7): the cap counts billable session-opening
@@ -2339,10 +2451,6 @@ fn drive_tiles3d(
                 .copied()
                 .unwrap_or_default()
                 .0;
-            let has_ready = set
-                .slots
-                .iter()
-                .any(|s| matches!(s, TileSlot::Ready { .. }));
             let mut within = 0usize;
             for req in &sel.loads {
                 if !matches!(set.slots[req.tile], TileSlot::NotLoaded) {
@@ -2365,29 +2473,27 @@ fn drive_tiles3d(
 
         // Eviction: out-of-cut residents past the grace window, then the
         // oldest extras over the hard budget (memory wins over reuse).
-        let mut resident: Vec<(usize, u64)> = Vec::new();
-        for (i, slot) in set.slots.iter().enumerate() {
-            if matches!(slot, TileSlot::Ready { .. }) {
-                resident.push((i, set.last_touched[i]));
-            }
-        }
+        //
         // `!hold[i]`: eviction is the one despawn path that would otherwise
         // ignore the refinement hold, and it drops the CACHE too — evicting a
         // held tile opens the hole the hold exists to prevent and pays a
         // re-download to close it. Both arms are gated: the grace arm because a
         // long starved motion can outlast `grace_frames`, the overflow arm
         // because it consults no clock at all.
+        let now = *frame;
+        let evictable = |i: usize| !want_visible[i] && !hold[i];
+        let expired = |seen: u64| now.saturating_sub(seen) > config.grace_frames;
         let mut evict: Vec<usize> = resident
             .iter()
-            .filter(|(i, seen)| {
-                !want_visible[*i] && !hold[*i] && frame.saturating_sub(*seen) > config.grace_frames
-            })
-            .map(|(i, _)| *i)
+            .filter(|&&(i, seen)| evictable(i) && expired(seen))
+            .map(|&(i, _)| i)
             .collect();
         if resident.len() - evict.len() > config.max_resident_tiles {
+            // Everything evictable the grace arm did not take: the same
+            // predicate with the clock negated (no O(resident × evict) scan).
             let mut extras: Vec<(usize, u64)> = resident
                 .iter()
-                .filter(|(i, _)| !want_visible[*i] && !hold[*i] && !evict.contains(i))
+                .filter(|&&(i, seen)| evictable(i) && !expired(seen))
                 .copied()
                 .collect();
             extras.sort_by_key(|(_, seen)| *seen);
@@ -2395,7 +2501,7 @@ fn drive_tiles3d(
             evict.extend(extras.iter().take(over).map(|(i, _)| *i));
         }
         for i in evict {
-            if let TileSlot::Ready { entity, .. } = set.slots[i] {
+            if let TileSlot::Ready { entity, bytes } = set.slots[i] {
                 if let Some(e) = entity {
                     commands.entity(e).despawn();
                 }
@@ -2403,6 +2509,7 @@ fn drive_tiles3d(
                 // reclaims the memory a hidden tile deliberately kept.
                 set.caches[i] = Vec::new();
                 set.slots[i] = TileSlot::NotLoaded;
+                *resident_cache = resident_cache.saturating_sub(bytes);
             }
         }
 
@@ -2418,7 +2525,10 @@ fn drive_tiles3d(
                     info!("tiles3d: {}: first cut visible", set.label);
                 }
                 set.last_cut = Some(cut);
-                info!(
+                // DEBUG, not INFO: a moving camera changes the cut most frames,
+                // and on wasm every INFO event is a console write plus a
+                // performance mark/measure. `bevy_3d_tiles=debug` brings it back.
+                debug!(
                     "tiles3d: {}: cut {} tile(s) at depth {dmin}..{dmax} (covered={})",
                     set.label, cut.0, sel.covered,
                 );
@@ -2427,10 +2537,6 @@ fn drive_tiles3d(
         set.history.absorb(&sel, tree.len());
         google_visible |= set.is_live() && !sel.render.is_empty();
         ground_covering |= matches!(set.frame, SetFrame::Ecef { .. }) && !sel.render.is_empty();
-        any_in_flight |= set
-            .slots
-            .iter()
-            .any(|s| matches!(s, TileSlot::InFlight { .. }));
     }
 
     // Issue across ALL sets under the GLOBAL concurrency pool (`load_slots`),
@@ -3134,15 +3240,14 @@ mod tests {
             SetFrame::Anchored,
             Vec3::new(0.0, 0.0, 600.0),
         );
-        let ledger = app
-            .world()
-            .resource::<Tiles3dSets>()
-            .resident_content_bytes();
 
         // Close in: the cut is the leaf level (spawn hidden, then show).
         app.update();
         app.update();
         assert_eq!(visible_tiles(&app), leaves, "leaf cut on screen");
+        // Read once a Drive has run: the ledger is cached by Drive (0.5).
+        let resident = ledger(&app);
+        assert_eq!(resident, 21 * TEST_TILE_BYTES, "every tile counted");
 
         // Pull back: the root alone covers the view, so every leaf is hidden.
         move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
@@ -3166,7 +3271,7 @@ mod tests {
         }
         assert_eq!(
             sets.resident_content_bytes(),
-            ledger,
+            resident,
             "ledger unchanged by despawn"
         );
         let meshes = app.world().resource::<Assets<Mesh>>();
@@ -3507,6 +3612,323 @@ mod tests {
             app.world().resource::<Tiles3dDecodeStats>().tiles,
             0,
             "no tile was decoded — re-entry is a spawn, not a decode"
+        );
+    }
+
+    /// Land a decoded tile on `tile` of set 0 the way a finished fetch+decode
+    /// task does: the slot goes in flight under a fresh generation and the
+    /// payload rides the real channel into `receive_tiles3d`.
+    fn land_tile(app: &mut App, tile: usize, items: Vec<DecodedItem>) {
+        let world = app.world_mut();
+        let generation = 1_000_000 + tile as u64;
+        world.resource_mut::<Tiles3dSets>().sets[0].slots[tile] = TileSlot::InFlight { generation };
+        let tx = world.resource::<Tiles3dChannel>().tx.clone();
+        tx.send(Tiles3dMsg::TileContent {
+            set_id: 1,
+            generation,
+            result: Ok(TileOutput::Content(Box::new(decoded(items)))),
+        })
+        .unwrap();
+    }
+
+    fn decoded(items: Vec<DecodedItem>) -> DecodedTile {
+        DecodedTile {
+            items,
+            content_bytes: 0,
+            rtc_center: None,
+            copyright: None,
+            stage_ms: [0.0; 4],
+        }
+    }
+
+    /// One untextured-or-textured triangle primitive with `material`.
+    fn plain_prim(material: content::DecodedMaterial) -> DecodedItem {
+        let DecodedItem::Mesh(mut p) = feature_prim(&Arc::default()) else {
+            unreachable!()
+        };
+        p.features = None;
+        p.material = material;
+        DecodedItem::Mesh(p)
+    }
+
+    /// Ready bytes summed over every slot — what the ledger must equal.
+    fn slot_sum(app: &App) -> u64 {
+        app.world()
+            .resource::<Tiles3dSets>()
+            .sets
+            .iter()
+            .flat_map(|s| s.slots.iter())
+            .map(|slot| match slot {
+                TileSlot::Ready { bytes, .. } => *bytes,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn ledger(app: &App) -> u64 {
+        app.world()
+            .resource::<Tiles3dSets>()
+            .resident_content_bytes()
+    }
+
+    /// The decode counters behind the host's material-sharing decision: mesh
+    /// primitives, the textured share, and the distinct untextured factor sets
+    /// each tile needed (summed per tile — two tiles with the same factors are
+    /// two keys, one per tile).
+    #[test]
+    fn decode_stats_count_primitives_and_material_keys() {
+        use content::DecodedMaterial;
+        let rough = || DecodedMaterial {
+            roughness: 0.5,
+            ..Default::default()
+        };
+        let textured = || DecodedMaterial {
+            base_color_image: Some(Image::default()),
+            ..Default::default()
+        };
+        let mut stats = Tiles3dDecodeStats::default();
+        stats.record(&decoded(vec![
+            plain_prim(DecodedMaterial::default()),
+            plain_prim(DecodedMaterial::default()),
+            plain_prim(rough()),
+            plain_prim(textured()),
+        ]));
+        stats.record(&decoded(vec![plain_prim(DecodedMaterial::default())]));
+        assert_eq!(stats.tiles, 2);
+        assert_eq!(stats.primitives, 5);
+        assert_eq!(stats.textured_primitives, 1);
+        assert_eq!(
+            stats.material_keys, 3,
+            "{{default, rough}} in the first tile + {{default}} in the second"
+        );
+    }
+
+    /// `resident_content_bytes` is O(1) for the host's per-frame ledger: Drive
+    /// caches the slot sum, and the cache reflects an eviction as soon as the
+    /// Drive that evicted has run.
+    #[test]
+    fn resident_bytes_cached_by_drive_matches_slot_sum() {
+        let mut app = despawn_test_app(Tiles3dConfig {
+            grace_frames: 0,
+            ..test_config()
+        });
+        let tree = synth_tree([100.0, 6.0, 0.0]);
+        let n = tree.len() as u64;
+        let (_, cam, _) = install_set(
+            &mut app,
+            tree,
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.update();
+        assert_eq!(ledger(&app), slot_sum(&app));
+        assert_eq!(ledger(&app), n * TEST_TILE_BYTES, "nothing evicted yet");
+
+        // Pull back with no grace window: once the root has shown, the leaves
+        // and children are out of the cut, unheld, and evicted.
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
+        app.update();
+        app.update();
+        assert!(slot_sum(&app) < n * TEST_TILE_BYTES, "tiles were evicted");
+        assert_eq!(ledger(&app), slot_sum(&app), "the cache saw the eviction");
+    }
+
+    /// The `sets.is_empty()` early return must still write the cache, or the
+    /// last detached set's bytes stay on the host's ledger forever.
+    #[test]
+    fn resident_bytes_zero_after_last_set_detaches() {
+        let mut app = despawn_test_app(test_config());
+        let (anchor, _, _) = install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.update();
+        assert!(ledger(&app) > 0);
+        app.world_mut().write_message(Tiles3dDetach { anchor });
+        app.update();
+        assert!(app.world().resource::<Tiles3dSets>().sets.is_empty());
+        assert_eq!(ledger(&app), 0, "no set, no resident bytes");
+    }
+
+    /// Without a `Tiles3dCamera` Drive returns before its slot pass, but tiles
+    /// keep landing in Receive: the cache is re-summed on that path too.
+    #[test]
+    fn resident_bytes_refreshed_without_a_tiles_camera() {
+        let mut app = despawn_test_app(test_config());
+        let (_, cam, _) = install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.update();
+        app.world_mut().despawn(cam);
+        land_tile(&mut app, 0, vec![plain_prim(Default::default())]);
+        app.update();
+        assert_ne!(
+            slot_sum(&app),
+            21 * TEST_TILE_BYTES,
+            "the landed tile changed the sum"
+        );
+        assert_eq!(ledger(&app), slot_sum(&app));
+    }
+
+    /// One indexed triangle carrying feature 0, sharing `node_of_feature` with
+    /// its tile's other primitives (one `FeatSource` per tile, as decode does).
+    fn feature_prim(node_of_feature: &Arc<Vec<String>>) -> DecodedItem {
+        use bevy::mesh::{Indices, PrimitiveTopology};
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        );
+        mesh.insert_indices(Indices::U32(vec![0, 1, 2]));
+        DecodedItem::Mesh(Box::new(DecodedPrimitive {
+            transform: Mat4::IDENTITY,
+            mesh,
+            material: content::DecodedMaterial::default(),
+            features: Some(content::TileFeatures {
+                feature_of_triangle: vec![0],
+                feature_of_vertex: vec![0.0; 3],
+                node_of_feature: node_of_feature.clone(),
+            }),
+        }))
+    }
+
+    /// The host resolver runs once per TILE: every primitive of a tile shares
+    /// one `node_of_feature` table, so resolving it per primitive repeated the
+    /// host's whole lookup (and its allocations) N times for the same answer.
+    #[test]
+    fn resolver_runs_once_per_tile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut app = despawn_test_app(test_config());
+        install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.world_mut().resource_mut::<Tiles3dSets>().sets[0].owner_id = Some("anchor".into());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        app.insert_resource(TileFeatureResolver(Some(Arc::new(
+            move |_anchor: &str, paths: &[&str]| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                // "b" stays unresolved: it must fall back to the anchor.
+                paths
+                    .iter()
+                    .map(|p| match *p {
+                        "a" => "owner:a".to_string(),
+                        _ => String::new(),
+                    })
+                    .collect()
+            },
+        ))));
+        let shared = Arc::new(vec!["a".to_string(), "b".to_string()]);
+        land_tile(&mut app, 0, (0..3).map(|_| feature_prim(&shared)).collect());
+        app.update();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one resolve per tile, not per primitive"
+        );
+        let sets = app.world().resource::<Tiles3dSets>();
+        let picks: Vec<&TileFeaturePick> = sets.sets[0].caches[0]
+            .iter()
+            .filter_map(|c| match c {
+                CachedItem::Mesh { pick, .. } => pick.as_ref(),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .collect();
+        assert_eq!(picks.len(), 3, "every primitive keeps its pick table");
+        assert_eq!(&*picks[0].owner_of_feature, ["owner:a", "anchor"]);
+        assert!(
+            picks
+                .iter()
+                .all(|p| Arc::ptr_eq(&p.owner_of_feature, &picks[0].owner_of_feature)),
+            "the tile's primitives share ONE owner table"
+        );
+        // The spawned entity carries the cached tables, not copies of them.
+        let entity_pick = app
+            .world_mut()
+            .query::<&TileFeaturePick>()
+            .iter(app.world())
+            .next()
+            .expect("a feature entity spawned")
+            .clone();
+        let sets = app.world().resource::<Tiles3dSets>();
+        assert!(sets.sets[0].caches[0].iter().any(|c| matches!(
+            c,
+            CachedItem::Mesh { pick: Some(cached), .. }
+                if Arc::ptr_eq(&entity_pick.owner_of_feature, &cached.owner_of_feature)
+                    && Arc::ptr_eq(&entity_pick.feature_of_triangle, &cached.feature_of_triangle)
+        )));
+    }
+
+    /// Per-cut logging is DEBUG: on wasm every INFO event goes through
+    /// tracing_wasm (mark + measure + console.log), and a moving camera changes
+    /// the cut almost every frame. The once-per-set "first cut visible" stays
+    /// at INFO and lands before the counted window.
+    #[test]
+    fn cut_changes_do_not_log_at_info() {
+        use bevy::ecs::schedule::SingleThreadedExecutor;
+        use bevy::log::tracing;
+        use bevy::log::tracing_subscriber::{self, Layer, layer::Context, prelude::*};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts this crate's events at INFO and at DEBUG.
+        struct Count(Arc<[AtomicUsize; 2]>);
+        impl<S: tracing::Subscriber> Layer<S> for Count {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let m = event.metadata();
+                if !m.target().starts_with("bevy_3d_tiles") {
+                    return;
+                }
+                match *m.level() {
+                    tracing::Level::INFO => self.0[0].fetch_add(1, Ordering::SeqCst),
+                    tracing::Level::DEBUG => self.0[1].fetch_add(1, Ordering::SeqCst),
+                    _ => 0,
+                };
+            }
+        }
+
+        let mut app = despawn_test_app(test_config());
+        // On the calling thread, so the scoped subscriber below sees drive's events.
+        app.edit_schedule(Update, |s| {
+            s.set_executor(SingleThreadedExecutor::new());
+        });
+        let (_, cam, _) = install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        app.update();
+        app.update();
+
+        let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let subscriber = tracing_subscriber::registry().with(Count(counts.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
+            app.update();
+            app.update();
+        });
+        assert_eq!(visible_tiles(&app), vec![0], "the cut really changed");
+        assert_eq!(
+            counts[0].load(Ordering::SeqCst),
+            0,
+            "a cut change logs nothing at INFO"
+        );
+        assert!(
+            counts[1].load(Ordering::SeqCst) > 0,
+            "the cut change is still logged, at DEBUG (and the counter is wired)"
         );
     }
 

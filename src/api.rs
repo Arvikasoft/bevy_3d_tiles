@@ -40,19 +40,27 @@ pub enum Tiles3dSet {
 /// decodes inline; `Err` = warn-once, then inline. On wasm the future may hold
 /// JS values (a Web Worker round-trip), so it is deliberately non-`Send`
 /// there; native hooks run on IO threads and must be `Send`.
+///
+/// The bytes are BORROWED from the fetch task for as long as the returned
+/// future lives (since 0.5): the crate keeps them for its inline fallback
+/// anyway, so a hook that only reads them (or copies them once into a worker
+/// message) costs no extra allocation. Copy inside the hook if something must
+/// own them beyond the future.
 #[cfg(target_arch = "wasm32")]
-pub type TilePrepareFn =
-    dyn Fn(
-        Vec<u8>,
-        bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<PreparedTile>, DecodeError>>>>;
+pub type TilePrepareFn = dyn for<'a> Fn(
+    &'a [u8],
+    bool,
+) -> Pin<
+    Box<dyn Future<Output = Result<Option<PreparedTile>, DecodeError>> + 'a>,
+>;
 /// The prepare-hook signature (native: `Send` — hooks run on IO threads).
 #[cfg(not(target_arch = "wasm32"))]
-pub type TilePrepareFn = dyn Fn(
-        Vec<u8>,
+pub type TilePrepareFn = dyn for<'a> Fn(
+        &'a [u8],
         bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<PreparedTile>, DecodeError>> + Send>>
-    + Send
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<PreparedTile>, DecodeError>> + Send + 'a>,
+    > + Send
     + Sync;
 
 /// Host-supplied off-thread tile-prepare hook (offthread-decode plan S4/S5).
@@ -163,21 +171,27 @@ pub struct TileGeometry {
 /// Pick-time feature resolution for a tile mesh entity (`EXT_mesh_features`,
 /// T8) — the Cesium model: ONE mesh per primitive, feature identity resolved
 /// from the HIT, never by splitting geometry per feature. (Splitting was
-/// measured at seconds of main-thread hang per refine wave: up to
-/// `max_feature_submeshes` mesh builds + GPU uploads per tile. Cesium3DTileFeature
-/// works the same way — batch ids + per-feature render state, one draw.)
+/// measured at seconds of main-thread hang per refine wave: a mesh build + GPU
+/// upload per feature per tile. Cesium3DTileFeature works the same way — batch
+/// ids + per-feature render state, one draw.)
 ///
 /// The crate never reads it. A host raycaster that knows the hit triangle's
 /// index-buffer ordinal resolves `owner_of_feature[feature_of_triangle[tri]]`
 /// — the same owner string the per-feature submeshes used to carry in their
 /// [`TileOwner`] tags.
+///
+/// Both tables are shared `Arc` slices (since 0.5): every primitive of a tile
+/// shares ONE owner table (the [`TileFeatureResolver`] runs once per tile), and
+/// a respawned tile shares its cached tables, so cloning this component is two
+/// refcount bumps. Reads (`.get()`, `.iter()`, indexing) are unchanged; to
+/// replace a table, build a new `Arc` (`vec.into()`).
 #[derive(Component, Clone, Debug)]
 pub struct TileFeaturePick {
     /// Index-buffer triangle ordinal → LOCAL feature id.
-    pub feature_of_triangle: Vec<u32>,
+    pub feature_of_triangle: Arc<[u32]>,
     /// LOCAL feature id → resolved owner id (host domain — twin id, node
     /// path under an identity resolver, …).
-    pub owner_of_feature: Vec<String>,
+    pub owner_of_feature: Arc<[String]>,
 }
 
 /// Optional per-feature resolver for tiles that carry `EXT_mesh_features`.
@@ -192,7 +206,8 @@ pub struct TileFeaturePick {
 /// Resolving a whole tile's paths in **one** call is deliberate: it lets the
 /// host build any per-anchor lookup (e.g. the section map) ONCE per tile and
 /// reuse it across the tile's many features, instead of rebuilding it per
-/// feature.
+/// feature. The crate calls it once per TILE, not once per primitive, and an
+/// empty returned id falls back to the anchor id.
 #[derive(Resource, Default, Clone)]
 pub struct TileFeatureResolver(pub Option<Arc<FeatureResolverFn>>);
 

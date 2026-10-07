@@ -87,11 +87,9 @@ fn main() {
             attach.write(Tiles3dAttach {
                 anchor,
                 url: "https://example.com/asset.3tz".into(), // or …/tileset.json
-                local: Transform::IDENTITY,
-                owner_id: None,
                 label: "my tileset".into(),
-                p3dt: None,
-                sse_threshold_px: None, // per-set SSE override; None = Tiles3dConfig default
+                // local transform, owner id, P3DT session, per-set SSE override
+                ..default()
             });
         })
         .run();
@@ -164,10 +162,44 @@ attribution lines whenever tiles are visible, and bring your own API key
 
 | `bevy_3d_tiles` | Bevy |
 |---|---|
-| 0.3 – 0.4 | 0.19 |
+| 0.3 – 0.5 | 0.19 |
 | 0.1 – 0.2 | 0.18 |
 
 ## Upgrading
+
+### 0.4.x → 0.5.0
+
+A performance release for large multi-tileset scenes (measured on a large
+mining site with ~450 resident tiles). Breaking changes:
+
+- **The `TilePrepareHook` closure receives `&[u8]`, not `Vec<u8>`.**
+  `TilePrepareFn` is `for<'a> Fn(&'a [u8], bool) -> Pin<Box<dyn Future<…> + 'a>>`
+  (plus `Send`/`Sync` on native): the future may borrow the fetched bytes, which
+  the crate keeps for its inline fallback anyway, so handing the hook a copy was
+  a full-tile allocation per request. Copy inside the hook if your future must
+  own the bytes beyond its own lifetime.
+- **`TileFeaturePick` fields are `Arc<[u32]>` and `Arc<[String]>`.** Reads
+  (`.get()`, `.iter()`, indexing) compile unchanged; code that builds or
+  replaces a table builds an `Arc` (`vec.into()`). Every primitive of a tile now
+  shares one owner table, and the `TileFeatureResolver` runs once per tile
+  instead of once per primitive.
+- **`Tiles3dConfig::max_feature_submeshes` is removed** (it has had no effect
+  since 0.1.6).
+- **`Tiles3dAttach` implements `Default`** (anchored to `Entity::PLACEHOLDER`).
+  Prefer `..default()` so future fields don't break your literals.
+- **`Tiles3dDecodeStats`** gains `primitives`, `textured_primitives` and
+  `material_keys` (distinct untextured PBR factor sets per decoded tile,
+  summed), so a struct literal of it needs the new fields.
+
+Behavioral:
+
+- `Tiles3dSets::resident_content_bytes()` keeps its meaning (decoded geometry
+  bytes) and is now O(1): the figure as of the end of the last
+  `Tiles3dSet::Drive`. A reader ordered before Drive sees the previous frame's
+  value.
+- The per-cut, per-graft and per-tileset-open log lines moved from `info` to
+  `debug` (a moving camera changes the cut most frames, and on wasm every
+  `info` line is a console write). Filter `bevy_3d_tiles=debug` to see them.
 
 ### 0.3.0 → 0.4.0
 
