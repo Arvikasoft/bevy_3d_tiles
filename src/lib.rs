@@ -85,7 +85,8 @@ pub use bevy_3d_tiles_prepare::meshopt;
 pub use api::PointTileMaterial;
 pub use api::{
     EcefOrigin, TileFeaturePick, TileFeatureResolver, TileGeometry, TileOwner, TilePrepareFn,
-    TilePrepareHook, TilePriorityClass, TileSseMultiplier, Tiles3dCamera, Tiles3dSet,
+    TilePrepareHook, TilePriorityClass, TileSseMultiplier, TileTextureFn, TileTextureHook,
+    Tiles3dCamera, Tiles3dSet,
 };
 pub use pick::{HiddenTileFeatures, TilePickMesh};
 
@@ -867,6 +868,7 @@ impl Plugin for Tiles3dPlugin {
             .init_resource::<EcefOrigin>()
             .init_resource::<TileFeatureResolver>()
             .init_resource::<TilePrepareHook>()
+            .init_resource::<TileTextureHook>()
             .add_message::<Tiles3dAttach>()
             .add_message::<Tiles3dDetach>()
             .add_systems(Startup, (latch_compressed_formats, init_dev_tileset))
@@ -1157,6 +1159,8 @@ fn receive_tiles3d(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut material_cache: ResMut<TileMaterialCache>,
     mut images: ResMut<Assets<Image>>,
+    // Read-only: host-decoded textures are bound through it as their tile lands.
+    texture_hook: Res<TileTextureHook>,
     #[cfg(feature = "points")] mut clouds: ResMut<Assets<PointCloud>>,
     #[cfg(feature = "points")] point_material: Res<PointTileMaterial>,
     #[cfg(feature = "splats")] mut splats: ResMut<Assets<PlanarGaussian3d>>,
@@ -1401,18 +1405,26 @@ fn receive_tiles3d(
                         // Resident cost = decoded geometry bytes, measured from
                         // the actual buffers (not the raw content len — see
                         // `content::resident_cost_bytes`).
-                        let (cache, resident_cost, cpu_bytes) = build_tile_cache(
+                        let Some((cache, resident_cost, cpu_bytes)) = build_tile_cache(
                             &mut meshes,
                             &mut materials,
                             &mut material_cache,
                             &mut images,
+                            &texture_hook,
                             renderers,
                             &resolver,
                             set,
                             items,
                             owners,
                             fresh,
-                        );
+                        ) else {
+                            // The host no longer holds one of its textures:
+                            // nothing was spawned, and the cut re-requests the
+                            // tile, which decodes again with fresh ones (the
+                            // origin-unresolved path above, same transition).
+                            set.slots[tile] = TileSlot::NotLoaded;
+                            continue;
+                        };
                         // Spawned HIDDEN; `drive_tiles3d` flips it visible in
                         // this same frame if the cut selects it (the documented
                         // `Added<TileGeometry>` window for host adapters).
@@ -1570,6 +1582,13 @@ fn resolve_owners(
 /// of positions + indices per decode, none per respawn), and goes
 /// `RENDER_WORLD`-only unless the set opted out. Feature primitives are queued
 /// on `fresh` so `apply_feature_visibility` cuts them in their spawn frame.
+///
+/// Host-decoded textures ([`content::DecodedMaterial::base_color_host`]) are
+/// bound FIRST, before anything else is added: one `Image` asset and one
+/// [`TileTextureHook`] call per token (one host bitmap fills one texture, so
+/// primitives sharing a token share the handle). `None` = the hook refused a
+/// token; the caller re-queues the tile, and the images added so far drop with
+/// their handles. With no hook installed, such a primitive renders untextured.
 #[allow(clippy::too_many_arguments)]
 // `renderers` is only read by the cfg-gated point/splat arms; with neither
 // feature it's unused. Scope the allow to that config so a genuinely unused
@@ -1583,13 +1602,15 @@ fn build_tile_cache(
     materials: &mut Assets<StandardMaterial>,
     material_cache: &mut TileMaterialCache,
     images: &mut Assets<Image>,
+    texture_hook: &TileTextureHook,
     renderers: ContentRenderers<'_>,
     resolver: &TileFeatureResolver,
     set: &ActiveTileset,
-    items: Vec<DecodedItem>,
+    mut items: Vec<DecodedItem>,
     owners: &mut FeatureOwners,
     fresh: &mut Vec<FreshFeatureItem>,
-) -> (Vec<CachedItem>, u64, u64) {
+) -> Option<(Vec<CachedItem>, u64, u64)> {
+    let host_textures = bind_host_textures(images, texture_hook, &mut items)?;
     let anchor = set.owner_id.as_deref();
     // T8 highlight: a feature tile under an owner resolves its feature paths to
     // host sub-owners via the host [`TileFeatureResolver`], so the host's
@@ -1623,11 +1644,16 @@ fn build_tile_cache(
                 let prim_transform = Transform::from_matrix(ptf);
                 // Untextured: the one shared material for these factors.
                 // Textured: its own material (the texture is unique to the tile),
-                // which the tile cache then reuses on every respawn.
+                // which the tile cache then reuses on every respawn. A host
+                // texture's image was added (and bound) up front.
                 let key = MaterialKey::of(&material);
-                let mat_handle = match material.base_color_image {
-                    Some(img) => materials.add(StandardMaterial {
-                        base_color_texture: Some(images.add(img)),
+                let texture = match material.base_color_host {
+                    Some(token) => host_textures.get(&token).cloned(),
+                    None => material.base_color_image.map(|img| images.add(img)),
+                };
+                let mat_handle = match texture {
+                    Some(texture) => materials.add(StandardMaterial {
+                        base_color_texture: Some(texture),
                         ..material_for(key)
                     }),
                     None => material_cache.get_or_add(key, materials),
@@ -1719,7 +1745,57 @@ fn build_tile_cache(
             }
         }
     }
-    (cache, resident, cpu)
+    Some((cache, resident, cpu))
+}
+
+/// Add and bind every host-decoded texture of one tile, taking each such
+/// primitive's data-less `Image` out of its material: one asset and one hook
+/// call per token. Returns token → handle, or `None` if the hook refused one
+/// (the handles added so far drop, and with them the images). Without a hook
+/// the textures are dropped, so those primitives render untextured.
+fn bind_host_textures(
+    images: &mut Assets<Image>,
+    hook: &TileTextureHook,
+    items: &mut [DecodedItem],
+) -> Option<std::collections::HashMap<u64, Handle<Image>>> {
+    let mut bound = std::collections::HashMap::new();
+    for item in items {
+        // Irrefutable with neither `points` nor `splats` (one variant).
+        #[allow(irrefutable_let_patterns)]
+        let DecodedItem::Mesh(p) = item else {
+            continue;
+        };
+        let Some(token) = p.material.base_color_host else {
+            continue;
+        };
+        let image = p.material.base_color_image.take();
+        let Some(hook) = &hook.0 else {
+            warn_no_texture_hook_once();
+            continue;
+        };
+        if bound.contains_key(&token) {
+            continue;
+        }
+        let Some(image) = image else {
+            continue;
+        };
+        let handle = images.add(image);
+        if !hook(token, handle.id()) {
+            debug!("tiles3d: host texture {token} is gone; re-queueing its tile");
+            return None;
+        }
+        bound.insert(token, handle);
+    }
+    Some(bound)
+}
+
+/// One-time warning for a host texture token with no [`TileTextureHook`] to
+/// bind it: the tile renders untextured.
+fn warn_no_texture_hook_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        warn!("tiles3d: a tile carries a host-decoded texture but no TileTextureHook is installed; rendering it untextured");
+    });
 }
 
 /// A decoded tile mesh's [`TilePickMesh`] and decode-time [`Aabb`] (the
@@ -4129,6 +4205,198 @@ mod tests {
             assert_eq!(got.base_color_texture.is_some(), i == 7);
             assert_eq!(format!("{got:?}"), format!("{want:?}"), "factor set {i}");
         }
+    }
+
+    /// Two primitives drawing ONE host-decoded texture (`TileImage::Host`),
+    /// decoded through the real extracted route.
+    fn host_textured_items(token: u64, width: u32, height: u32) -> Vec<DecodedItem> {
+        use prepare::{
+            ExtractedMaterial, ExtractedMeshes, ExtractedPrimitive, ExtractedTexture, PreparedTile,
+            TextureWrap, TileImage,
+        };
+        let prim = || ExtractedPrimitive {
+            transform: Mat4::IDENTITY.to_cols_array(),
+            positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            material: Some(0),
+            ..Default::default()
+        };
+        let prepared = PreparedTile {
+            glb: Vec::new(),
+            meshes: Some(ExtractedMeshes {
+                primitives: vec![prim(), prim()],
+                materials: vec![ExtractedMaterial {
+                    base_color_texture: Some(0),
+                    ..Default::default()
+                }],
+                textures: vec![ExtractedTexture {
+                    image: TileImage::Host {
+                        token,
+                        width,
+                        height,
+                    },
+                    wrap_s: TextureWrap::ClampToEdge,
+                    wrap_t: TextureWrap::MirroredRepeat,
+                }],
+            }),
+            rtc_center: None,
+            copyright: None,
+            features: None,
+        };
+        block_on(content::decode_prepared(prepared, 0))
+            .expect("decode")
+            .items
+    }
+
+    /// A host texture is ONE `Image` and ONE hook call per token, however many
+    /// primitives draw it (one host bitmap fills one texture), and the image is
+    /// the data-less, copy-destination texture `copyExternalImageToTexture`
+    /// needs: `RENDER_ATTACHMENT` included, sRGB RGBA8, one mip, the glTF wrap.
+    #[test]
+    fn host_texture_binds_once_per_token_with_render_attachment() {
+        use bevy::image::{ImageAddressMode, ImageSampler};
+        use bevy::render::render_resource::{TextureFormat, TextureUsages};
+
+        let mut app = despawn_test_app(test_config());
+        install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        app.insert_resource(TileTextureHook(Some(Arc::new(move |token, id| {
+            seen.lock().unwrap().push((token, id));
+            true
+        }))));
+        land_tile(&mut app, 0, host_textured_items(7, 4, 2));
+        app.update();
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "one hook call per token: {calls:?}");
+        let (token, id) = calls[0];
+        assert_eq!(token, 7);
+        let mats = cached_materials(&app, 0);
+        assert_eq!(mats.len(), 2);
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        for h in &mats {
+            let tex = materials.get(h).unwrap().base_color_texture.as_ref();
+            assert_eq!(tex.map(Handle::id), Some(id), "both draw the bound image");
+        }
+        let img = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(id)
+            .expect("added");
+        assert!(img.data.is_none(), "the host fills it");
+        let d = &img.texture_descriptor;
+        assert_eq!(d.format, TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(d.mip_level_count, 1);
+        assert_eq!(
+            d.usage,
+            TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::RENDER_ATTACHMENT
+        );
+        assert_eq!((img.width(), img.height()), (4, 2));
+        let ImageSampler::Descriptor(s) = &img.sampler else {
+            panic!("glTF sampler expected");
+        };
+        assert_eq!(
+            (s.address_mode_u, s.address_mode_v),
+            (
+                ImageAddressMode::ClampToEdge,
+                ImageAddressMode::MirrorRepeat
+            )
+        );
+    }
+
+    /// A hook that no longer holds the token refuses the bind: nothing of the
+    /// tile is kept (the image the crate added is freed), the slot goes back to
+    /// `NotLoaded` so the cut re-requests it, and the next delivery lands.
+    #[test]
+    fn rejected_host_texture_requeues_the_tile() {
+        // No new loads, so the re-queued slot stays `NotLoaded` to be seen.
+        let mut app = despawn_test_app(Tiles3dConfig {
+            halt_new_loads: true,
+            ..test_config()
+        });
+        // `Assets::track_assets` (which frees dropped handles) needs a server.
+        app.add_plugins((
+            bevy::app::TaskPoolPlugin::default(),
+            bevy::asset::AssetPlugin::default(),
+        ));
+        install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        let tile = 0;
+        app.world_mut().resource_mut::<Tiles3dSets>().sets[0].caches[tile].clear();
+        app.insert_resource(TileTextureHook(Some(Arc::new(|_, _| false))));
+        land_tile(&mut app, tile, host_textured_items(9, 2, 2));
+        app.update();
+        app.world_mut()
+            .run_system_cached(Assets::<Image>::track_assets)
+            .unwrap();
+        {
+            let world = app.world();
+            let set = &world.resource::<Tiles3dSets>().sets[0];
+            assert!(
+                matches!(set.slots[tile], TileSlot::NotLoaded),
+                "re-queued, not spawned"
+            );
+            assert!(set.caches[tile].is_empty(), "nothing cached");
+            assert_eq!(world.resource::<Assets<Image>>().len(), 0, "image freed");
+        }
+
+        app.insert_resource(TileTextureHook(Some(Arc::new(|_, _| true))));
+        land_tile(&mut app, tile, host_textured_items(10, 2, 2));
+        app.update();
+        let set = &app.world().resource::<Tiles3dSets>().sets[0];
+        assert!(
+            matches!(set.slots[tile], TileSlot::Ready { .. }),
+            "the second delivery lands"
+        );
+        assert_eq!(set.caches[tile].len(), 2);
+    }
+
+    /// A host token with no hook installed renders untextured (the shared
+    /// material for its factors) instead of drawing an unfilled texture.
+    #[test]
+    fn host_texture_without_hook_renders_untextured() {
+        let mut app = despawn_test_app(test_config());
+        install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        land_tile(&mut app, 0, host_textured_items(5, 2, 2));
+        app.update();
+        let mats = cached_materials(&app, 0);
+        assert_eq!(mats.len(), 2);
+        assert_eq!(mats[0], mats[1], "the one shared untextured material");
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        assert!(
+            materials
+                .get(&mats[0])
+                .unwrap()
+                .base_color_texture
+                .is_none()
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 0);
+    }
+
+    /// A primitive with a host texture counts as textured in the decode stats.
+    #[test]
+    fn decode_stats_count_host_textures_as_textured() {
+        let mut stats = Tiles3dDecodeStats::default();
+        stats.record(&decoded(host_textured_items(1, 2, 2)));
+        assert_eq!(stats.primitives, 2);
+        assert_eq!(stats.textured_primitives, 2);
+        assert_eq!(stats.material_keys, 0);
     }
 
     /// Past the cap the cache forgets everything, but a live tile's material

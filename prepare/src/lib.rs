@@ -24,8 +24,13 @@ use std::collections::HashMap;
 
 mod extract;
 pub mod meshopt;
+mod normals;
 
-pub use extract::{ExtractedMaterial, ExtractedMeshes, ExtractedPrimitive, extract_tile_meshes};
+pub use extract::{
+    ExtractOptions, ExtractedMaterial, ExtractedMeshes, ExtractedPrimitive, ExtractedTexture,
+    TextureWrap, TileImage, extract_tile_meshes,
+};
+pub use normals::compute_normals;
 
 /// Typed failure surface of tile-content decoding — the error of
 /// `decode_tile` / `decode_glb` (in `bevy_3d_tiles`), [`prepare_tile`], and
@@ -1043,7 +1048,8 @@ pub struct PreparedFeatures {
 /// * `meshes: None` (S4) — `glb` holds the prepared container and the consumer
 ///   parses it with the `gltf` crate;
 /// * `meshes: Some(_)` (S5, [`prepare_tile_extracting`]) — the geometry is
-///   already typed buffers, the consumer never parses glTF at all, and `glb`
+///   already typed buffers (base-colour textures still encoded, missing
+///   normals filled), the consumer never parses glTF at all, and `glb`
 ///   is **empty** (rebuilding a container nobody reads is pure cost, on both
 ///   the producing thread and the wire).
 pub struct PreparedTile {
@@ -1095,21 +1101,22 @@ pub fn prepare_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
 /// exactly one case: a vanilla tile — nothing to rewrite, so nothing for
 /// `prepare_tile` to do — IS worth the trip under S5, because the parse +
 /// attribute collect its geometry extraction saves is the cost S5 exists to
-/// move.
+/// move. Textured vanilla tiles included (since prepare 0.3 they extract, and
+/// the image decode can move with them).
 ///
 /// The relaxation is conditional on the tile being extractable at all: a
 /// vanilla tile [`extract_tile_meshes`] will decline anyway would pay a full
 /// round trip (two worker-side copies of a multi-MB GLB) to get its own bytes
-/// back and decode inline — strictly worse than S4. The two decline reasons a
-/// marker scan can see, an image/texture and a surviving `extensionsRequired`
-/// (`KHR_mesh_quantization` and anything else no pass here handles), keep
-/// declining here.
+/// back and decode inline — strictly worse than S4. The one decline reason a
+/// marker scan can see, a surviving `extensionsRequired` (`KHR_mesh_quantization`
+/// and anything else no pass here handles), keeps declining here.
 ///
 /// Ceiling: the decline reasons that live in *values* rather than keys — a
-/// non-TRIANGLES `mode`, a sparse or non-`FLOAT` attribute, a VEC3 `COLOR_0` —
-/// have no marker to scan for (`mode` is a number, the rest are accessor
-/// properties), so those tiles still pay one wasted round trip each. Catching
-/// them means parsing the JSON twice, which costs more than the trip saves.
+/// non-TRIANGLES `mode`, a sparse or non-`FLOAT` attribute, a VEC3 `COLOR_0`, a
+/// texture the consumer cannot decode, or any texture at all under
+/// [`ExtractOptions::textures`] off — have no marker to scan for, so those
+/// tiles still pay one wasted round trip each. Catching them means parsing the
+/// JSON twice, which costs more than the trip saves.
 pub fn extract_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
     extract_triage(bytes, georeferenced, false)
 }
@@ -1119,7 +1126,8 @@ pub fn extract_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
 /// dispatching there (the decode itself moves off-thread), so only splats and
 /// the unextractable-vanilla case still decline. A Google P3DT layer is Draco
 /// (and textured) on every tile, so under this predicate its tiles round-trip
-/// as S4 prepared GLBs with the Draco decode + splice done worker-side.
+/// with the Draco decode + splice done worker-side, and (prepare 0.3) come
+/// back extracted, textures included.
 pub fn extract_would_decline_with_draco(bytes: &[u8], georeferenced: bool) -> bool {
     extract_triage(bytes, georeferenced, true)
 }
@@ -1134,12 +1142,11 @@ fn extract_triage(bytes: &[u8], georeferenced: bool, draco_ok: bool) -> bool {
         return false;
     };
     let marks = Marks::scan(json_chunk);
-    // Marker scan, not a parse: `"images":[]` reads as textured and keeps the
-    // S4 answer, which is the safe direction (one skipped extraction, never a
-    // wasted trip).
-    let unextractable = memmem(json_chunk, b"\"images\"")
-        || memmem(json_chunk, b"\"textures\"")
-        || memmem(json_chunk, b"\"extensionsRequired\"");
+    // Marker scan, not a parse: `"extensionsRequired":[]` reads as required
+    // and keeps the S4 answer, which is the safe direction (one skipped
+    // extraction, never a wasted trip). Images and textures extract since
+    // prepare 0.3, so they no longer count.
+    let unextractable = memmem(json_chunk, b"\"extensionsRequired\"");
     let undecodable = if draco_ok {
         marks.splat
     } else {
@@ -1174,7 +1181,7 @@ pub fn prepare_tile(
     bytes: &[u8],
     georeferenced: bool,
 ) -> Result<Option<PreparedTile>, DecodeError> {
-    prepare_tile_inner(bytes, georeferenced, false, None)
+    prepare_tile_inner(bytes, georeferenced, None, None)
 }
 
 /// [`prepare_tile`] plus geometry extraction (offthread-decode plan S5): the
@@ -1184,15 +1191,17 @@ pub fn prepare_tile(
 /// main-thread streaming cost — 6-9 ms/tile on bevy 0.19).
 ///
 /// Same three outcomes as [`prepare_tile`], plus one shade: extraction is
-/// best-effort. Content it cannot reproduce byte-identically (textures,
-/// non-triangle primitives, quantized attributes — see [`extract_tile_meshes`])
-/// comes back as an ordinary S4 [`PreparedTile`] with `meshes: None`, which
-/// the consumer decodes exactly as before.
+/// best-effort. Content it cannot reproduce byte-identically (non-triangle
+/// primitives, quantized attributes, textures the consumer cannot decode — see
+/// [`extract_tile_meshes`]) comes back as an ordinary S4 [`PreparedTile`] with
+/// `meshes: None`, which the consumer decodes exactly as before.
+///
+/// [`ExtractOptions::default`]: textures extract, missing normals are filled.
 pub fn prepare_tile_extracting(
     bytes: &[u8],
     georeferenced: bool,
 ) -> Result<Option<PreparedTile>, DecodeError> {
-    prepare_tile_inner(bytes, georeferenced, true, None)
+    prepare_tile_extracting_with(bytes, georeferenced, None, ExtractOptions::default())
 }
 
 /// [`prepare_tile_extracting`] for a caller that already decoded this tile's
@@ -1206,13 +1215,34 @@ pub fn prepare_tile_extracting_with_draco(
     georeferenced: bool,
     decoded: Vec<DracoMesh>,
 ) -> Result<Option<PreparedTile>, DecodeError> {
-    prepare_tile_inner(bytes, georeferenced, true, Some(decoded))
+    prepare_tile_extracting_with(
+        bytes,
+        georeferenced,
+        Some(decoded),
+        ExtractOptions::default(),
+    )
 }
 
+/// The general extracting entry point: [`prepare_tile_extracting`] (`draco:
+/// None`) or [`prepare_tile_extracting_with_draco`] (`draco: Some`), with the
+/// [`ExtractOptions`] a host chose. Pipeline order: extraction, then the
+/// feature tables (which may give a non-indexed primitive indices), then the
+/// missing normals ([`compute_normals`], so a synthesized index list gets the
+/// smooth normals the inline route would compute).
+pub fn prepare_tile_extracting_with(
+    bytes: &[u8],
+    georeferenced: bool,
+    draco: Option<Vec<DracoMesh>>,
+    opts: ExtractOptions,
+) -> Result<Option<PreparedTile>, DecodeError> {
+    prepare_tile_inner(bytes, georeferenced, Some(opts), draco)
+}
+
+/// `extract: None` = [`prepare_tile`] (no extraction).
 fn prepare_tile_inner(
     bytes: &[u8],
     georeferenced: bool,
-    extract: bool,
+    extract: Option<ExtractOptions>,
     draco: Option<Vec<DracoMesh>>,
 ) -> Result<Option<PreparedTile>, DecodeError> {
     // Legacy b3dm containers unwrap to their embedded glb FIRST — a b3dm is
@@ -1232,7 +1262,7 @@ fn prepare_tile_inner(
     // S5 the geometry is the whole point of the trip, so it falls through.
     // `!marks.draco` guards the echo: `declines` counts the Draco mark, but a
     // tile arriving WITH decoded meshes must splice below, never echo.
-    if !extract && !marks.draco && declines(&marks, georeferenced) {
+    if extract.is_none() && !marks.draco && declines(&marks, georeferenced) {
         return Ok(Some(PreparedTile {
             glb: bytes.to_vec(),
             meshes: None,
@@ -1320,10 +1350,9 @@ fn prepare_tile_inner(
     // S5: geometry off the document we already hold. Runs BEFORE the feature
     // pass (which consumes `json`) and before the container rebuild — when it
     // succeeds there is no container to rebuild, because nobody will parse one.
-    let mut meshes = if extract {
-        extract_tile_meshes(&json, bin)?
-    } else {
-        None
+    let mut meshes = match extract {
+        Some(opts) => extract_tile_meshes(&json, bin, opts)?,
+        None => None,
     };
 
     let glb = if meshes.is_some() {
@@ -1361,6 +1390,19 @@ fn prepare_tile_inner(
     } else {
         None
     };
+
+    // Missing normals, LAST: the feature pass above may have given a
+    // non-indexed primitive indices, and the inline route computes smooth
+    // normals over those, so this must see them too.
+    if let (Some(m), Some(opts)) = (meshes.as_mut(), extract)
+        && opts.normals
+    {
+        for p in &mut m.primitives {
+            if p.normals.is_none() {
+                p.normals = Some(compute_normals(&p.positions, p.indices.as_deref()));
+            }
+        }
+    }
 
     Ok(Some(PreparedTile {
         glb,
@@ -1555,25 +1597,31 @@ mod tests {
         }
     }
 
-    /// The S5 triage relaxes `prepare_would_decline` for exactly one shape —
-    /// an untextured vanilla tile, whose geometry extraction is the whole
-    /// point. Everything `prepare_would_decline` rejects for having no work to
-    /// do AND no extractable geometry must still be rejected, or the host pays
-    /// a full round trip (two multi-MB copies) to get its own bytes back.
+    /// The S5 triage relaxes `prepare_would_decline` for vanilla tiles, whose
+    /// geometry extraction is the whole point — textured ones included since
+    /// prepare 0.3, when textures started extracting too. What a marker scan can
+    /// see `extract_tile_meshes` declining (a surviving `extensionsRequired`)
+    /// must still be rejected, or the host pays a full round trip (two
+    /// multi-MB copies) to get its own bytes back.
     #[test]
-    fn extract_would_decline_still_rejects_textured_vanilla_tiles() {
-        // The relaxation: nothing to rewrite, nothing textured — dispatch it.
-        let plain = br#"{"asset":{"version":"2.0"},"meshes":[]}"#;
-        assert!(prepare_would_decline(plain, false));
-        assert!(!extract_would_decline(plain, false), "S5 dispatches this");
-
+    fn triage_dispatches_vanilla_textured_tiles() {
         for json in [
-            // A plain PNG/JPEG-textured tile: no basisu, no meshopt, no RTC —
-            // `prepare_tile` echoes the bytes and extraction declines on the
-            // images, so the trip learns nothing.
+            // Nothing to rewrite, nothing textured.
+            r#"{"asset":{"version":"2.0"},"meshes":[]}"#,
+            // A plain PNG/JPEG-textured tile: no basisu, no meshopt, no RTC.
+            // `prepare_tile` alone would echo it; extraction now takes it.
             r#"{"asset":{"version":"2.0"},"images":[{"mimeType":"image/png"}]}"#,
             r#"{"asset":{"version":"2.0"},"textures":[{"source":0}]}"#,
-            // And the pre-existing no-decoder cases stay declined.
+        ] {
+            assert!(prepare_would_decline(json.as_bytes(), false), "{json}");
+            assert!(
+                !extract_would_decline(json.as_bytes(), false),
+                "S5 dispatches: {json}"
+            );
+        }
+
+        for json in [
+            // The pre-existing no-decoder cases stay declined.
             r#"{"extensionsUsed":["KHR_draco_mesh_compression"]}"#,
             r#"{"extensionsUsed":["KHR_gaussian_splatting"]}"#,
             // Untextured, nothing to rewrite, but `extract_tile_meshes` declines
@@ -1586,8 +1634,7 @@ mod tests {
                 "should decline: {json}"
             );
         }
-        // Textured but with real prep waiting (basisu) is still dispatched —
-        // that is S4 work, unchanged.
+        // Textured with real prep waiting (basisu) is dispatched as before.
         let basisu =
             br#"{"extensionsUsed":["KHR_texture_basisu"],"images":[{"mimeType":"image/ktx2"}]}"#;
         assert!(!extract_would_decline(basisu, false));
@@ -1604,6 +1651,215 @@ mod tests {
         let meshopt = br#"{"extensionsUsed":["EXT_meshopt_compression"],"extensionsRequired":["EXT_meshopt_compression"]}"#;
         assert!(!extract_would_decline(meshopt, false), "meshopt dispatches");
         assert!(!extract_would_decline(meshopt, true), "meshopt dispatches");
+    }
+
+    /// A one-triangle GLB whose two materials use a PNG and a JPEG base-colour
+    /// texture, and a third material that reuses the PNG. The image bytes are
+    /// opaque to this crate (it never decodes them), so they are short
+    /// literals with the right magic, not whole images.
+    fn textured_tile() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let png = b"\x89PNG\r\n\x1a\nfake-png".to_vec();
+        let jpeg = b"\xff\xd8\xff\xe0fake-jpeg\xff\xd9".to_vec();
+        let mut bin = Vec::new();
+        for v in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            .iter()
+            .flatten()
+        {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        let png_at = bin.len();
+        bin.extend_from_slice(&png);
+        let jpeg_at = bin.len();
+        bin.extend_from_slice(&jpeg);
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [
+                { "attributes": { "POSITION": 0 }, "material": 0 },
+                { "attributes": { "POSITION": 0 }, "material": 1 },
+                { "attributes": { "POSITION": 0 }, "material": 2 }
+            ]}],
+            "accessors": [{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+                { "buffer": 0, "byteOffset": png_at, "byteLength": png.len() },
+                { "buffer": 0, "byteOffset": jpeg_at, "byteLength": jpeg.len() }
+            ],
+            "buffers": [{ "byteLength": bin.len() }],
+            "materials": [
+                { "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 } } },
+                { "pbrMetallicRoughness": { "baseColorTexture": { "index": 1 }, "metallicFactor": 0.0 } },
+                { "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 }, "roughnessFactor": 0.5 } }
+            ],
+            "textures": [{ "source": 0, "sampler": 0 }, { "source": 1 }],
+            "samplers": [{ "wrapS": 33071, "wrapT": 33648 }],
+            "images": [
+                { "bufferView": 1, "mimeType": "image/png" },
+                { "bufferView": 2, "mimeType": "image/jpeg" }
+            ]
+        });
+        (
+            assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin),
+            png,
+            jpeg,
+        )
+    }
+
+    /// Textured content extracts (prepare 0.3): each base-colour texture rides
+    /// `textures` ENCODED, the bytes exactly the bufferView slice, its wrap
+    /// modes from the sampler (absent = REPEAT), and a texture two materials
+    /// share is carried once.
+    #[test]
+    fn extracts_textured_tile_with_encoded_base_color() {
+        let (glb, png, jpeg) = textured_tile();
+        let m = prepare_tile_extracting(&glb, false)
+            .unwrap()
+            .expect("prepared")
+            .meshes
+            .expect("textured content extracts");
+        assert_eq!(m.primitives.len(), 3);
+        assert_eq!(m.textures.len(), 2, "one entry per glTF texture used");
+        assert_eq!(
+            m.textures[0],
+            ExtractedTexture {
+                image: TileImage::Encoded {
+                    mime: "image/png".into(),
+                    bytes: png
+                },
+                wrap_s: TextureWrap::ClampToEdge,
+                wrap_t: TextureWrap::MirroredRepeat,
+            }
+        );
+        assert_eq!(
+            m.textures[1],
+            ExtractedTexture {
+                image: TileImage::Encoded {
+                    mime: "image/jpeg".into(),
+                    bytes: jpeg
+                },
+                wrap_s: TextureWrap::Repeat,
+                wrap_t: TextureWrap::Repeat,
+            }
+        );
+        let tex: Vec<_> = m.materials.iter().map(|m| m.base_color_texture).collect();
+        assert_eq!(tex, [Some(0), Some(1), Some(0)]);
+        assert_eq!(
+            (m.materials[1].metallic, m.materials[2].roughness),
+            (0.0, 0.5)
+        );
+    }
+
+    /// The shape of a photorealistic-mesh tile (Draco geometry with UVs and no
+    /// normals, one JPEG base-colour texture behind a CLAMP sampler, an unlit
+    /// material, a planetary node matrix), written from the format's public
+    /// description: no captured tile bytes. With Draco decoded by the host, it
+    /// extracts: textured, with normals filled in.
+    #[test]
+    fn photorealistic_shaped_textured_draco_tile_extracts() {
+        let draco_payload = [0xAAu8; 16];
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xD9];
+        let mut bin = draco_payload.to_vec();
+        bin.extend_from_slice(&jpeg);
+        let json = serde_json::json!({
+            "asset": { "version": "2.0", "copyright": "Data A;Data B" },
+            "extensionsUsed": ["KHR_draco_mesh_compression", "KHR_materials_unlit"],
+            "extensionsRequired": ["KHR_draco_mesh_compression"],
+            "scene": 0, "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0, "matrix": [1,0,0,0, 0,0,-1,0, 0,1,0,0, -1.9e6,-5.0e6,3.3e6,1] }],
+            "meshes": [{ "primitives": [{
+                "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "indices": 2, "material": 0,
+                "extensions": { "KHR_draco_mesh_compression": {
+                    "bufferView": 0, "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }
+                }}
+            }]}],
+            "accessors": [
+                { "componentType": 5126, "count": 4, "type": "VEC3", "min": [0,0,0], "max": [1,1,0] },
+                { "componentType": 5126, "count": 4, "type": "VEC2" },
+                { "componentType": 5125, "count": 6, "type": "SCALAR" }
+            ],
+            "materials": [{
+                "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 }, "metallicFactor": 0.0 },
+                "extensions": { "KHR_materials_unlit": {} }
+            }],
+            "textures": [{ "source": 0, "sampler": 0 }],
+            "samplers": [{ "magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071 }],
+            "images": [{ "bufferView": 1, "mimeType": "image/jpeg" }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 16 },
+                { "buffer": 0, "byteOffset": 16, "byteLength": 4 }
+            ],
+            "buffers": [{ "byteLength": bin.len() }]
+        });
+        let glb = assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin);
+        assert!(!extract_would_decline_with_draco(&glb, true), "dispatched");
+        let quad = || DracoMesh {
+            indices: vec![0, 1, 2, 0, 2, 3],
+            attributes: vec![
+                (0, 3, vec![0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.]),
+                (1, 2, vec![0., 0., 1., 0., 1., 1., 0., 1.]),
+            ],
+        };
+        for georeferenced in [true, false] {
+            let p = prepare_tile_extracting_with_draco(&glb, georeferenced, vec![quad()])
+                .unwrap()
+                .expect("prepared");
+            let Some(m) = p.meshes else {
+                panic!("declined to S4 (georeferenced {georeferenced})");
+            };
+            assert_eq!(m.primitives.len(), 1);
+            let prim = &m.primitives[0];
+            assert_eq!(prim.uvs.as_ref().map(Vec::len), Some(4));
+            assert_eq!(
+                prim.normals.as_ref().map(Vec::len),
+                Some(4),
+                "normals filled"
+            );
+            assert_eq!(m.materials[0].base_color_texture, Some(0));
+            assert!(m.materials[0].unlit);
+            assert_eq!(
+                m.textures[0].image,
+                TileImage::Encoded {
+                    mime: "image/jpeg".into(),
+                    bytes: jpeg.to_vec()
+                }
+            );
+            assert_eq!(m.textures[0].wrap_s, TextureWrap::ClampToEdge);
+            assert_eq!(p.rtc_center.is_some(), georeferenced, "planetary offset");
+        }
+    }
+
+    /// The worker fills every missing normal (prepare 0.3), so the consumer
+    /// never computes them: indexed, and non-indexed made indexed by the
+    /// feature pass (smooth normals over the synthesized indices, as inline).
+    /// `ExtractOptions::normals` off leaves them to the consumer.
+    #[test]
+    fn worker_fills_missing_normals() {
+        for indexed in [true, false] {
+            let glb = feature_tile(indexed);
+            let m = prepare_tile_extracting(&glb, false)
+                .unwrap()
+                .expect("prepared")
+                .meshes
+                .expect("extracted");
+            for p in &m.primitives {
+                assert_eq!(
+                    p.normals.as_deref(),
+                    Some(compute_normals(&p.positions, p.indices.as_deref()).as_slice()),
+                    "indexed {indexed}"
+                );
+            }
+            let off = ExtractOptions {
+                normals: false,
+                ..Default::default()
+            };
+            let m = prepare_tile_extracting_with(&glb, false, None, off)
+                .unwrap()
+                .expect("prepared")
+                .meshes
+                .expect("extracted");
+            assert!(m.primitives.iter().all(|p| p.normals.is_none()));
+        }
     }
 
     #[test]

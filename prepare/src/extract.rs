@@ -11,11 +11,17 @@
 //!
 //! It is deliberately narrow. [`extract_tile_meshes`] **declines**
 //! (`Ok(None)`) anything it cannot reproduce byte-identically to the
-//! consumer's own `gltf`-crate decode — any texture, non-triangle content,
-//! integer/quantized attributes, a surviving required extension — and a
-//! declined tile takes the S4 route (prepared GLB back, decoded inline) and
-//! renders exactly as it did before. Identical geometry through every route,
-//! or no route at all.
+//! consumer's own `gltf`-crate decode — non-triangle content, integer/quantized
+//! attributes, a surviving required extension, any document the `gltf` crate
+//! would reject — and a declined tile takes the S4 route (prepared GLB back,
+//! decoded inline) and renders exactly as it did before. Identical geometry
+//! through every route, or no route at all.
+//!
+//! Textured content extracts too (since prepare 0.3): the base-colour texture
+//! of every material rides [`ExtractedMeshes::textures`] still ENCODED, the
+//! bytes copied once out of the BIN chunk. The consumer decodes them exactly
+//! as its inline route does, or a host decodes them itself and hands over an
+//! opaque [`TileImage::Host`] token instead.
 
 use serde_json::Value;
 
@@ -36,9 +42,80 @@ const IDENTITY: Mat4 = [
     0.0, 0.0, 0.0, 1.0,
 ];
 
+/// Which optional work the off-thread extraction does. Each field is a switch a
+/// host can turn off without losing the tile: the work then happens where it
+/// did before. `Copy`, passed by value. [`Default`] turns both on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractOptions {
+    /// Extract textured content, carrying base-colour textures in
+    /// [`ExtractedMeshes::textures`]. Off = any image or texture declines the
+    /// tile to the S4 route, as before prepare 0.3.
+    pub textures: bool,
+    /// Fill every primitive that has no `NORMAL` with
+    /// [`crate::compute_normals`], so the consumer never computes normals.
+    /// Off = the consumer computes them, as before prepare 0.3.
+    pub normals: bool,
+}
+
+impl Default for ExtractOptions {
+    fn default() -> Self {
+        Self {
+            textures: true,
+            normals: true,
+        }
+    }
+}
+
+/// A glTF sampler wrap mode. Absent = [`TextureWrap::Repeat`], the glTF default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextureWrap {
+    /// glTF `10497`.
+    #[default]
+    Repeat,
+    /// glTF `33071`.
+    ClampToEdge,
+    /// glTF `33648`.
+    MirroredRepeat,
+}
+
+impl TextureWrap {
+    /// A sampler's `wrapS`/`wrapT`. `None` = an invalid value (the `gltf` crate
+    /// rejects the document).
+    fn of(v: &Value) -> Option<Self> {
+        match v {
+            Value::Null => Some(Self::Repeat),
+            v => match v.as_u64()? {
+                10497 => Some(Self::Repeat),
+                33071 => Some(Self::ClampToEdge),
+                33648 => Some(Self::MirroredRepeat),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The pixels of one extracted texture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TileImage {
+    /// Encoded bytes as stored in the tile (`image/png`, `image/jpeg` or
+    /// `image/ktx2`); the consumer decodes them.
+    Encoded { mime: String, bytes: Vec<u8> },
+    /// Decoded by the host and held outside this crate; `token` is the host's
+    /// name for it, `width`×`height` its size in texels.
+    Host { token: u64, width: u32, height: u32 },
+}
+
+/// One base-colour texture of an extracted tile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedTexture {
+    pub image: TileImage,
+    pub wrap_s: TextureWrap,
+    pub wrap_t: TextureWrap,
+}
+
 /// Material inputs of one glTF material, in exactly the set the consumer's
-/// inline decode reads (`decode_material`) — factors and flags, no textures.
-/// A document with any image declines, so there is nothing else to carry.
+/// inline decode reads (`decode_material`): factors, flags and the base-colour
+/// texture.
 ///
 /// [`Default`] is the **glTF** default material (metallic 1.0 — NOT the
 /// consumer's `DecodedMaterial::default()`), because that is what a primitive
@@ -52,6 +129,8 @@ pub struct ExtractedMaterial {
     pub double_sided: bool,
     /// `KHR_materials_unlit` present on this material.
     pub unlit: bool,
+    /// Index into [`ExtractedMeshes::textures`]; `None` = untextured.
+    pub base_color_texture: Option<u32>,
 }
 
 impl Default for ExtractedMaterial {
@@ -62,6 +141,7 @@ impl Default for ExtractedMaterial {
             roughness: 1.0,
             double_sided: false,
             unlit: false,
+            base_color_texture: None,
         }
     }
 }
@@ -89,8 +169,9 @@ pub struct ExtractedPrimitive {
     /// material ([`ExtractedMaterial::default`]).
     pub material: Option<usize>,
     pub positions: Vec<[f32; 3]>,
-    /// `None` = the tile omitted NORMAL; the consumer smooth-computes, exactly
-    /// as it does inline.
+    /// `None` = the tile omitted NORMAL and [`ExtractOptions::normals`] was
+    /// off; the consumer computes them, exactly as it does inline. With it on,
+    /// [`crate::compute_normals`] filled them (bevy's normals, bit for bit).
     pub normals: Option<Vec<[f32; 3]>>,
     /// `TEXCOORD_0`.
     pub uvs: Option<Vec<[f32; 2]>>,
@@ -142,6 +223,10 @@ impl ExtractedPrimitive {
 pub struct ExtractedMeshes {
     pub primitives: Vec<ExtractedPrimitive>,
     pub materials: Vec<ExtractedMaterial>,
+    /// The base-colour textures [`ExtractedMaterial::base_color_texture`]
+    /// indexes, one per glTF texture the materials use. A hook that builds
+    /// this struct by hand may leave it empty for an untextured tile.
+    pub textures: Vec<ExtractedTexture>,
 }
 
 /// Extract every renderable primitive of an ALREADY-PARSED, already-prepared
@@ -151,31 +236,40 @@ pub struct ExtractedMeshes {
 /// * `Ok(Some(_))` — the consumer builds meshes straight from the buffers and
 ///   never parses the glTF at all.
 /// * `Ok(None)` — **declined**: content this cannot reproduce byte-identically
-///   (any image/texture, a surviving `extensionsRequired`, non-TRIANGLES
-///   primitives, sparse or non-`FLOAT` vertex attributes, a node graph deeper
-///   than [`MAX_NODE_DEPTH`]). Not an error — the caller falls back to the
-///   glTF-bytes route.
+///   (a surviving `extensionsRequired`, non-TRIANGLES primitives, sparse or
+///   non-`FLOAT` vertex attributes, an index past the vertex count, a node
+///   graph deeper than [`MAX_NODE_DEPTH`], a texture setup the `gltf` crate
+///   rejects or the consumer cannot decode, any image or texture at all with
+///   [`ExtractOptions::textures`] off). Not an error — the caller falls back to
+///   the glTF-bytes route.
 /// * `Err(_)` — the document is malformed (an attribute accessor that does not
 ///   read). The caller falls back too; the inline decode surfaces it with full
 ///   diagnostics.
+///
+/// Normals are NOT filled here (feature ids may still add indices);
+/// [`crate::prepare_tile_extracting_with`] does that last.
 pub fn extract_tile_meshes(
     json: &Value,
     bin: Option<&[u8]>,
+    opts: ExtractOptions,
 ) -> Result<Option<ExtractedMeshes>, DecodeError> {
-    // Textures need `Image` decode/transcode on the consumer's side, which is
-    // bevy-typed and stays there (plan §5); a surviving required extension is
-    // something no pass here handled, and the `gltf` crate would reject it.
+    // A surviving required extension is something no pass here handled, and
+    // the `gltf` crate would reject it.
     let non_empty = |key: &str| json[key].as_array().is_some_and(|a| !a.is_empty());
-    if non_empty("images") || non_empty("textures") || non_empty("extensionsRequired") {
+    if non_empty("extensionsRequired")
+        || (!opts.textures && (non_empty("images") || non_empty("textures")))
+        || !textures_valid(json)
+    {
         return Ok(None);
     }
 
-    let Some(materials) = extract_materials(json) else {
+    let Some((materials, textures)) = extract_materials(json, bin) else {
         return Ok(None);
     };
     let mut out = ExtractedMeshes {
         primitives: Vec::new(),
         materials,
+        textures,
     };
 
     // Default scene, resolved exactly like `Document::default_scene()` then
@@ -242,20 +336,97 @@ fn opt_f32(v: &Value, default: f32) -> Option<f32> {
     }
 }
 
-/// Every material of the document, in index order. `None` = decline (a
-/// material shape this cannot reproduce).
-fn extract_materials(json: &Value) -> Option<Vec<ExtractedMaterial>> {
+/// The texture setup of the whole document — every texture, image, sampler
+/// and material texture slot — checked the way `gltf::Gltf::from_slice`
+/// checks it (gltf-json 1.4 `Root::validate` + serde). The inline route errors
+/// the whole tile on any of these, so extraction must decline on every one,
+/// whether or not the slot is one it reads. `false` = decline.
+fn textures_valid(json: &Value) -> bool {
+    fn list<'v>(json: &'v Value, key: &str) -> Option<&'v [Value]> {
+        match &json[key] {
+            Value::Null => Some(&[][..]),
+            Value::Array(a) => Some(a.as_slice()),
+            _ => None,
+        }
+    }
+    let (Some(textures), Some(images), Some(samplers), Some(materials)) = (
+        list(json, "textures"),
+        list(json, "images"),
+        list(json, "samplers"),
+        list(json, "materials"),
+    ) else {
+        return false;
+    };
+    let views = json["bufferViews"].as_array().map_or(0, Vec::len);
+    let below = |v: &Value, n: usize| v.as_u64().is_some_and(|i| i < n as u64);
+    let opt_below = |v: &Value, n: usize| v.is_null() || below(v, n);
+    let opt_str = |v: &Value| v.is_null() || v.is_string();
+    let opt_in =
+        |v: &Value, set: &[u64]| v.is_null() || v.as_u64().is_some_and(|x| set.contains(&x));
+    const WRAPS: &[u64] = &[33071, 33648, 10497];
+    // A textureInfo: absent, or an object with an in-range integer `index` and
+    // an integer `texCoord` when present.
+    let info = |v: &Value| {
+        v.is_null()
+            || (v.is_object()
+                && below(&v["index"], textures.len())
+                && (v["texCoord"].is_null()
+                    || v["texCoord"].as_u64().is_some_and(|t| t <= u32::MAX as u64)))
+    };
+    textures.iter().all(|t| {
+        // gltf-json reports a missing `source` as `Missing`.
+        t.is_object()
+            && below(&t["source"], images.len())
+            && opt_below(&t["sampler"], samplers.len())
+    }) && images.iter().all(|i| {
+        i.is_object()
+            && opt_below(&i["bufferView"], views)
+            && opt_str(&i["uri"])
+            // gltf's `Image::source()` unwraps the mime type of a view image.
+            && if i["bufferView"].is_null() {
+                opt_str(&i["mimeType"])
+            } else {
+                i["mimeType"].is_string()
+            }
+    }) && samplers.iter().all(|s| {
+        s.is_object()
+            && opt_in(&s["magFilter"], &[9728, 9729])
+            && opt_in(&s["minFilter"], &[9728, 9729, 9984, 9985, 9986, 9987])
+            && opt_in(&s["wrapS"], WRAPS)
+            && opt_in(&s["wrapT"], WRAPS)
+    }) && materials.iter().all(|m| {
+        let pbr = &m["pbrMetallicRoughness"];
+        m.is_object()
+            && info(&pbr["baseColorTexture"])
+            && info(&pbr["metallicRoughnessTexture"])
+            && info(&m["normalTexture"])
+            && info(&m["occlusionTexture"])
+            && info(&m["emissiveTexture"])
+    })
+}
+
+/// Every material of the document, in index order, plus the base-colour
+/// textures they use (one entry per glTF texture). `None` = decline (a
+/// material shape this cannot reproduce). Runs after [`textures_valid`].
+fn extract_materials(
+    json: &Value,
+    bin: Option<&[u8]>,
+) -> Option<(Vec<ExtractedMaterial>, Vec<ExtractedTexture>)> {
     let Some(materials) = json["materials"].as_array() else {
         // Absent is "no materials"; present-but-not-an-array fails serde, so it
         // declines rather than rendering everything with the default material.
-        return json["materials"].is_null().then(Vec::new);
+        return json["materials"].is_null().then(Default::default);
     };
     let mut out = Vec::with_capacity(materials.len());
+    let mut textures = Vec::new();
+    // glTF texture index → index into `textures`, so two materials sharing a
+    // texture share one copy of its bytes.
+    let mut seen = std::collections::HashMap::new();
     for m in materials {
         let pbr = &m["pbrMetallicRoughness"];
-        // A texture reference is unreachable (the document-level image check
-        // declined first), so only the factors are read — the same set the
-        // consumer's `decode_material` reads.
+        // The same set the consumer's `decode_material` reads: factors, flags
+        // and the base-colour texture. The other texture slots are validated
+        // (`textures_valid`) but, like inline, never read.
         let mut mat = ExtractedMaterial {
             double_sided: m["doubleSided"].as_bool().unwrap_or(false),
             unlit: !m["extensions"]["KHR_materials_unlit"].is_null(),
@@ -271,9 +442,50 @@ fn extract_materials(json: &Value) -> Option<Vec<ExtractedMaterial>> {
         }
         mat.metallic = opt_f32(&pbr["metallicFactor"], mat.metallic)?;
         mat.roughness = opt_f32(&pbr["roughnessFactor"], mat.roughness)?;
+        if let Some(tex) = pbr["baseColorTexture"]["index"].as_u64() {
+            let ix = match seen.get(&tex) {
+                Some(&ix) => ix,
+                None => {
+                    textures.push(base_color_texture(json, bin, tex as usize)?);
+                    let ix = textures.len() as u32 - 1;
+                    seen.insert(tex, ix);
+                    ix
+                }
+            };
+            mat.base_color_texture = Some(ix);
+        }
         out.push(mat);
     }
-    Some(out)
+    Some((out, textures))
+}
+
+/// One base-colour texture, encoded bytes copied out of the BIN chunk. `None`
+/// = decline: the inline decode errors on a URI image, a buffer outside the
+/// BIN chunk and a MIME type it cannot decode, so the tile goes S4 and inline
+/// reproduces that error.
+fn base_color_texture(json: &Value, bin: Option<&[u8]>, tex: usize) -> Option<ExtractedTexture> {
+    let texture = &json["textures"][tex];
+    let image = &json["images"][texture["source"].as_u64()? as usize];
+    let view = image["bufferView"].as_u64()? as usize;
+    let mime = image["mimeType"].as_str()?;
+    if !matches!(mime, "image/png" | "image/jpeg" | "image/ktx2")
+        || !json["buffers"][0]["uri"].is_null()
+    {
+        return None;
+    }
+    let bytes = crate::buffer_view_slice(json, bin, view).ok()?.to_vec();
+    let sampler = match texture["sampler"].as_u64() {
+        Some(s) => &json["samplers"][s as usize],
+        None => &Value::Null,
+    };
+    Some(ExtractedTexture {
+        image: TileImage::Encoded {
+            mime: mime.to_string(),
+            bytes,
+        },
+        wrap_s: TextureWrap::of(&sampler["wrapS"])?,
+        wrap_t: TextureWrap::of(&sampler["wrapT"])?,
+    })
 }
 
 /// Walk one node: its own mesh primitives first, then its children — the
@@ -384,6 +596,16 @@ fn extract_primitive(
             None => return Ok(None),
         },
     };
+
+    // bevy's `compute_normals` panics on an index past the vertex count, and
+    // the inline route runs it on the frame thread; never extract (or compute
+    // normals off-thread for) what the inline route cannot draw.
+    if indices
+        .as_ref()
+        .is_some_and(|ix| ix.iter().any(|&i| i as usize >= positions.len()))
+    {
+        return Ok(None);
+    }
 
     let Some(material) = opt_index(&prim["material"]) else {
         return Ok(None);
@@ -649,19 +871,63 @@ mod tests {
         );
     }
 
+    /// `ExtractOptions::textures` off is the 0.2 rule: any image or texture
+    /// declines. On, the same (texture-less, scene-less) document extracts.
     #[test]
-    fn declines_textured_documents() {
+    fn textures_off_declines_textured_documents() {
         let json = serde_json::json!({
             "images": [{ "mimeType": "image/png", "bufferView": 0 }],
-            "scenes": [{ "nodes": [0] }],
+            "bufferViews": [{ "buffer": 0, "byteLength": 4 }],
         });
-        assert!(extract_tile_meshes(&json, None).unwrap().is_none());
+        let off = ExtractOptions {
+            textures: false,
+            ..Default::default()
+        };
+        assert!(extract_tile_meshes(&json, None, off).unwrap().is_none());
+        assert!(
+            extract_tile_meshes(&json, None, ExtractOptions::default())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn declines_surviving_required_extension() {
         let json = serde_json::json!({ "extensionsRequired": ["KHR_something_new"] });
-        assert!(extract_tile_meshes(&json, None).unwrap().is_none());
+        assert!(
+            extract_tile_meshes(&json, None, ExtractOptions::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// An index past the vertex count declines (bevy's `compute_normals`
+    /// panics on it inline); the same primitive with in-range indices extracts.
+    #[test]
+    fn out_of_range_index_declines_extraction() {
+        let mut bin = vec![0u8; 36];
+        for i in [0u16, 1, 3] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        bin.extend_from_slice(&[0, 0]);
+        let mut json = doc(serde_json::json!({ "attributes": { "POSITION": 0 }, "indices": 1 }));
+        json["accessors"][1] = serde_json::json!({ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" });
+        json["bufferViews"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "buffer": 0, "byteOffset": 36, "byteLength": 6 }));
+        let opts = ExtractOptions::default();
+        assert!(
+            extract_tile_meshes(&json, Some(&bin), opts)
+                .unwrap()
+                .is_none(),
+            "index 3 of 3 vertices"
+        );
+        bin[40..42].copy_from_slice(&2u16.to_le_bytes());
+        let out = extract_tile_meshes(&json, Some(&bin), opts)
+            .unwrap()
+            .expect("in-range indices extract");
+        assert_eq!(out.primitives[0].indices.as_deref(), Some(&[0, 1, 2][..]));
     }
 
     /// A document with no scene is legal and renders nothing — it must not be
@@ -669,7 +935,7 @@ mod tests {
     /// second decode).
     #[test]
     fn empty_document_extracts_to_no_primitives() {
-        let out = extract_tile_meshes(&serde_json::json!({}), None)
+        let out = extract_tile_meshes(&serde_json::json!({}), None, ExtractOptions::default())
             .unwrap()
             .expect("accepted");
         assert!(out.primitives.is_empty() && out.materials.is_empty());
@@ -696,12 +962,14 @@ mod tests {
         let bin = vec![0u8; 36];
         let points = doc(serde_json::json!({ "mode": 0, "attributes": { "POSITION": 0 } }));
         assert!(
-            extract_tile_meshes(&points, Some(&bin)).unwrap().is_none(),
+            extract_tile_meshes(&points, Some(&bin), ExtractOptions::default())
+                .unwrap()
+                .is_none(),
             "POINTS declines"
         );
         let quantized = doc(serde_json::json!({ "attributes": { "POSITION": 1 } }));
         assert!(
-            extract_tile_meshes(&quantized, Some(&bin))
+            extract_tile_meshes(&quantized, Some(&bin), ExtractOptions::default())
                 .unwrap()
                 .is_none(),
             "u16 POSITION declines"
@@ -709,7 +977,7 @@ mod tests {
         // The same document with a FLOAT position and the default mode is the
         // control: it must NOT decline, or the two asserts above prove nothing.
         let ok = doc(serde_json::json!({ "attributes": { "POSITION": 0 } }));
-        let out = extract_tile_meshes(&ok, Some(&bin))
+        let out = extract_tile_meshes(&ok, Some(&bin), ExtractOptions::default())
             .unwrap()
             .expect("plain triangles extract");
         assert_eq!(out.primitives.len(), 1);
@@ -745,7 +1013,9 @@ mod tests {
         ] {
             json["materials"] = serde_json::json!([{}]);
             assert!(
-                extract_tile_meshes(&json, Some(&bin)).unwrap().is_none(),
+                extract_tile_meshes(&json, Some(&bin), ExtractOptions::default())
+                    .unwrap()
+                    .is_none(),
                 "{what} must decline"
             );
         }
@@ -779,7 +1049,9 @@ mod tests {
             let mut json = doc(prim.clone());
             json["nodes"] = serde_json::json!([node]);
             assert!(
-                extract_tile_meshes(&json, Some(&bin)).unwrap().is_none(),
+                extract_tile_meshes(&json, Some(&bin), ExtractOptions::default())
+                    .unwrap()
+                    .is_none(),
                 "{what} must decline"
             );
         }
@@ -805,7 +1077,9 @@ mod tests {
             ("non-array materials", serde_json::json!({ "materials": 3 })),
         ] {
             assert!(
-                extract_tile_meshes(&json, None).unwrap().is_none(),
+                extract_tile_meshes(&json, None, ExtractOptions::default())
+                    .unwrap()
+                    .is_none(),
                 "{what} must decline"
             );
         }
@@ -819,7 +1093,9 @@ mod tests {
             ),
         ] {
             assert!(
-                extract_tile_meshes(&json, None).unwrap().is_some(),
+                extract_tile_meshes(&json, None, ExtractOptions::default())
+                    .unwrap()
+                    .is_some(),
                 "{what} must still extract"
             );
         }
@@ -832,7 +1108,7 @@ mod tests {
             "extensions": { "KHR_materials_unlit": {} },
             "pbrMetallicRoughness": { "baseColorFactor": [0.5, 0.25, 0.0, 1.0], "metallicFactor": 0.0 },
         }] });
-        let mats = extract_materials(&json).expect("materials");
+        let (mats, _) = extract_materials(&json, None).expect("materials");
         assert_eq!(mats[0], ExtractedMaterial::default());
         assert_eq!(mats[0].metallic, 1.0, "glTF default metallic is 1.0");
         assert_eq!(mats[1].base_color, [0.5, 0.25, 0.0, 1.0]);

@@ -76,10 +76,12 @@ pub type TilePrepareFn = dyn for<'a> Fn(
 /// * `meshes: Some(_)` (S5,
 ///   [`bevy_3d_tiles_prepare::prepare_tile_extracting`]) — typed vertex
 ///   buffers; the crate only builds `Mesh` objects and uploads them, and `glb`
-///   is empty. Extraction declines content it cannot reproduce exactly
-///   (textures, non-triangle, quantized attributes), which lands back on the
-///   first shape — so a hook can always return the richer call and let the
-///   fallbacks sort it out.
+///   is empty. Base-colour textures ride along encoded (decoded here exactly
+///   as inline) or as a host token ([`TileTextureHook`]). Extraction declines
+///   content it cannot reproduce exactly (non-triangle, quantized attributes,
+///   textures the crate cannot decode), which lands back on the first shape —
+///   so a hook can always return the richer call and let the fallbacks sort
+///   it out.
 #[derive(Resource, Default, Clone)]
 pub struct TilePrepareHook(pub Option<Arc<TilePrepareFn>>);
 
@@ -92,6 +94,27 @@ pub struct TilePrepareHook(pub Option<Arc<TilePrepareFn>>);
 unsafe impl Send for TilePrepareHook {}
 #[cfg(target_arch = "wasm32")]
 unsafe impl Sync for TilePrepareHook {}
+
+/// The texture-hook signature: `(host token, the texture's asset id)` → whether
+/// the host still holds that token and will fill the texture.
+pub type TileTextureFn =
+    dyn Fn(u64, bevy::asset::AssetId<bevy::image::Image>) -> bool + Send + Sync;
+
+/// Fills tile textures the host decoded itself
+/// ([`bevy_3d_tiles_prepare::TileImage::Host`], e.g. a browser `ImageBitmap`
+/// decoded in a Web Worker). Called once per such texture, in the frame its
+/// tile lands, with the host's token and the crate-built data-less `Image`
+/// (`Rgba8UnormSrgb`, 1 mip, `TEXTURE_BINDING | COPY_DST | RENDER_ATTACHMENT`,
+/// the glTF sampler's wrap modes). The host copies its pixels into that
+/// texture's GPU texture once it exists; the crate never reads them.
+///
+/// Return `false` when the token is unknown or has expired: the crate then
+/// discards that tile's build and re-queues the tile, so it decodes again and
+/// never draws an unfilled texture. Without a hook such a texture renders
+/// untextured and the crate warns once. `None` (the default) = no hook. Insert
+/// before `add_plugins(Tiles3dPlugin)`, like [`TilePrepareHook`].
+#[derive(Resource, Default, Clone)]
+pub struct TileTextureHook(pub Option<Arc<TileTextureFn>>);
 
 /// The ECEF→world transform the host supplies so the crate can place
 /// planet-georeferenced tilesets (a `region` root, a planetary-scale bounding

@@ -237,6 +237,21 @@ mining site with ~450 resident tiles). Breaking changes:
   is empty when `meshes` is `Some`. `feature_tables()`, `bounds_of()` and
   `ExtractedPrimitive::set_feature_ids()` are the one implementation every
   route calls.
+- **Extraction accepts textured tiles** (prepare 0.3). `ExtractedMeshes` gains
+  `textures` and `ExtractedMaterial` gains `base_color_texture`, so a hook
+  that builds them by struct literal must fill them (empty / `None` for an
+  untextured tile). Base-colour textures ride encoded and decode here exactly
+  as inline (PNG/JPEG through `Image::from_buffer`, KTX2 through the transcode
+  pass), and missing normals arrive filled (`prepare::compute_normals`, bevy's
+  `Mesh::compute_normals` bit for bit). `extract_tile_meshes` takes an
+  `ExtractOptions` (both on by default; the `prepare_tile_extracting*`
+  functions keep their signatures, `prepare_tile_extracting_with` takes the
+  options). `DecodedMaterial` gains `base_color_host`.
+- **Host-decoded textures need a `TileTextureHook`.** A hook may decode a
+  texture itself and hand the crate an opaque `TileImage::Host` token; the
+  crate builds a data-less destination `Image` and calls the hook once per
+  token with its `AssetId`. Return `false` for a token you no longer hold and
+  the tile is decoded again. Without a hook such textures render untextured.
 - **Tile `StandardMaterial`s are shared.** Every untextured primitive with the
   same PBR factors (base color, metallic, roughness, unlit, double-sided) uses
   ONE material, across tiles and tilesets, so their draws share a bind group and

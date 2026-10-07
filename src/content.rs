@@ -59,7 +59,8 @@ use super::draco;
 // `bevy_3d_tiles_prepare` crate (offthread-decode plan S4) — moved, never
 // copied, and re-exported here so `content::DecodeError` etc. keep working.
 pub use bevy_3d_tiles_prepare::{
-    DecodeError, DecodeStage, ExtractedMaterial, ExtractedMeshes, ExtractedPrimitive, PreparedTile,
+    DecodeError, DecodeStage, ExtractOptions, ExtractedMaterial, ExtractedMeshes,
+    ExtractedPrimitive, ExtractedTexture, PreparedTile, TextureWrap, TileImage,
     extract_tile_meshes, prepare_tile, prepare_tile_extracting,
 };
 
@@ -234,6 +235,11 @@ pub struct DecodedMaterial {
     /// `KHR_materials_unlit` — photogrammetry/satellite content ships baked
     /// lighting (Google P3DT requires this extension); re-lighting it dims.
     pub unlit: bool,
+    /// The host's token for a base-colour texture it decoded itself
+    /// ([`TileImage::Host`]). `base_color_image` is then the data-less
+    /// destination texture, which the [`crate::TileTextureHook`] fills when the
+    /// tile lands.
+    pub base_color_host: Option<u64>,
 }
 
 impl Default for DecodedMaterial {
@@ -247,6 +253,7 @@ impl Default for DecodedMaterial {
             roughness: 1.0,
             double_sided: false,
             unlit: false,
+            base_color_host: None,
         }
     }
 }
@@ -327,9 +334,11 @@ pub struct DecodedTile {
     /// On the **extracted** route (S5 — the hook returned
     /// [`PreparedTile::meshes`]) spans `[0]` and `[1]` read 0 because both ran
     /// on the hook's thread, and `[2]` measures ONLY the `Mesh` build from the
-    /// hook's buffers (`insert_attribute` + `compute_normals`) — no attribute
-    /// collect, no image decode. Comparing `[2]` across the two routes is
-    /// therefore comparing two different quantities; compare route totals.
+    /// hook's buffers (`insert_attribute`, plus `compute_normals` when the hook
+    /// left normals out) and the decode of any base-colour texture the hook
+    /// sent still encoded — no attribute collect. Comparing `[2]` across the
+    /// two routes is therefore comparing two different quantities; compare
+    /// route totals.
     pub stage_ms: [f32; 4],
 }
 
@@ -402,11 +411,12 @@ fn warn_prepare_hook_once(detail: &str) {
 /// Decode a hook-prepared tile.
 ///
 /// Two routes, and the hook picks by what it put in [`PreparedTile::meshes`]:
-/// * **extracted (S5)** — typed vertex buffers; only the `Mesh` build runs
-///   here (span 2), spans 0-1 moved into the hook and read 0;
+/// * **extracted (S5)** — typed vertex buffers; only the `Mesh` build (and the
+///   decode of textures that arrived encoded) runs here (span 2), spans 0-1
+///   moved into the hook and read 0;
 /// * **prepared GLB (S4)** — the glb is already vanilla glTF, so spans 1-3
 ///   run here and only span 0 moved.
-async fn decode_prepared(
+pub(crate) async fn decode_prepared(
     prepared: PreparedTile,
     content_bytes: u64,
 ) -> Result<DecodedTile, DecodeError> {
@@ -905,18 +915,14 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
     }
     match p.normals.take() {
         Some(n) => mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n),
-        // Tiler output may omit normals to save bytes; smooth-compute them.
-        // On wasm the decode task IS the frame thread (`spawn_local`), so this
-        // is frame time — counted in `DecodedTile::stage_ms[2]`, and on a
-        // normal-less tileset it DOMINATES that span even on the extracted
-        // route. ponytail: it stays here anyway. Moving it needs a bit-exact
-        // copy of bevy's angle-weighted `compute_smooth_normals` (glam
-        // `angle_between`/`acos_approx`/`try_normalize`) inside the
-        // math-dependency-free prepare crate, and "almost the same normals"
-        // is the one failure mode the parity lattice exists to forbid. Do it
-        // only if a real flight shows the extracted route is actually taken
-        // (read the `extracted / off_thread` counters) AND span 2 is still
-        // over budget — then take a `glam` dep rather than hand-rolling it.
+        // Tiler output may omit normals to save bytes; compute them. On the
+        // extracted route the hook already did (`prepare::compute_normals`,
+        // pinned bit for bit against this call by
+        // `compute_normals_matches_bevy_bit_for_bit`), so this runs only
+        // inline, on the S4 route, or for a hook that turned
+        // `ExtractOptions::normals` off. On wasm the decode task IS the frame
+        // thread (`spawn_local`), so it is frame time, counted in
+        // `DecodedTile::stage_ms[2]`.
         None => mesh.compute_normals(),
     }
     mesh
@@ -925,6 +931,11 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
 /// The extracted route (S5): meshes straight from the hook's typed buffers —
 /// no `gltf` parse, no attribute collect, just `Mesh` assembly. Item order is
 /// the extraction's node-traversal order, which is the inline route's.
+///
+/// Base-colour textures resolve once per texture, on first use (a texture no
+/// primitive draws is never decoded, as inline); every further primitive that
+/// uses it gets a clone, the last one the original. An encoded texture that
+/// fails to decode fails the tile, as it does inline.
 fn items_from_extracted(
     meshes: ExtractedMeshes,
     feat: Option<&FeatSource>,
@@ -932,7 +943,26 @@ fn items_from_extracted(
     let ExtractedMeshes {
         mut primitives,
         materials,
+        textures,
     } = meshes;
+    let material_of = |p: &ExtractedPrimitive| {
+        p.material
+            .and_then(|ix| materials.get(ix))
+            .copied()
+            .unwrap_or_default()
+    };
+    let mut resolved: Vec<Option<ResolvedTexture>> = vec![None; textures.len()];
+    // Uses left per texture, so the last use takes the decoded image instead
+    // of copying its pixels.
+    let mut uses = vec![0u32; textures.len()];
+    for p in &primitives {
+        if let Some(n) = material_of(p)
+            .base_color_texture
+            .and_then(|ix| uses.get_mut(ix as usize))
+        {
+            *n += 1;
+        }
+    }
     let mut out = Vec::with_capacity(primitives.len());
     for p in &mut primitives {
         let features = match feat {
@@ -949,18 +979,32 @@ fn items_from_extracted(
         };
         // No material index = the glTF default material, which is what the
         // `gltf` crate hands the inline route for the same primitive.
-        let material = p
-            .material
-            .and_then(|ix| materials.get(ix))
-            .copied()
-            .unwrap_or_default();
+        let material = material_of(&*p);
+        let texture = match material.base_color_texture {
+            Some(ix) => {
+                let ix = ix as usize;
+                let t = textures
+                    .get(ix)
+                    .ok_or_else(|| format!("material names texture {ix} of {}", textures.len()))?;
+                if resolved[ix].is_none() {
+                    resolved[ix] = Some(resolve_texture(t)?);
+                }
+                uses[ix] -= 1;
+                if uses[ix] == 0 {
+                    resolved[ix].take()
+                } else {
+                    resolved[ix].clone()
+                }
+            }
+            None => None,
+        };
         let transform = Mat4::from_cols_array(&p.transform);
         let bounds = p.bounds.or_else(|| bounds_of(&p.positions));
         let mesh = mesh_from_buffers(p);
         out.push(DecodedItem::Mesh(Box::new(DecodedPrimitive {
             transform,
             mesh,
-            material: material_from_extracted(&material),
+            material: material_from_extracted(&material, texture),
             features,
             bounds,
         })));
@@ -968,20 +1012,101 @@ fn items_from_extracted(
     Ok(out)
 }
 
-/// Extracted material factors → the decode-time material. Textured tiles never
-/// reach this route (the extraction declines any document with an image), so
-/// there is nothing to resolve later.
-fn material_from_extracted(m: &ExtractedMaterial) -> DecodedMaterial {
-    DecodedMaterial {
+/// One extracted base-colour texture in the shape [`DecodedMaterial`] carries
+/// it: exactly one of `image` (decoded, or a host texture's data-less
+/// destination when `host` is set) and `ktx2` (awaiting the transcode pass).
+#[derive(Clone)]
+struct ResolvedTexture {
+    image: Option<Image>,
+    ktx2: Option<Vec<u8>>,
+    host: Option<u64>,
+    sampler: ImageSamplerDescriptor,
+}
+
+/// Resolve one extracted texture the way [`decode_material`] resolves the
+/// inline one: the same `Image::from_buffer` call for PNG/JPEG, the same
+/// deferred transcode for KTX2, the same sampler.
+fn resolve_texture(t: &ExtractedTexture) -> Result<ResolvedTexture, String> {
+    let sampler = sampler_for(t.wrap_s, t.wrap_t);
+    let mut out = ResolvedTexture {
+        image: None,
+        ktx2: None,
+        host: None,
+        sampler: sampler.clone(),
+    };
+    match &t.image {
+        TileImage::Encoded { mime, bytes } if mime == "image/ktx2" => {
+            out.ktx2 = Some(bytes.clone())
+        }
+        TileImage::Encoded { mime, bytes } => {
+            out.image = Some(
+                Image::from_buffer(
+                    bytes,
+                    ImageType::MimeType(mime.as_str()),
+                    CompressedImageFormats::NONE,
+                    true,
+                    ImageSampler::Descriptor(sampler),
+                    RenderAssetUsages::RENDER_WORLD,
+                )
+                .map_err(|e| format!("texture decode ({mime}): {e}"))?,
+            );
+        }
+        &TileImage::Host {
+            token,
+            width,
+            height,
+        } => {
+            out.image = Some(host_texture(width, height, sampler));
+            out.host = Some(token);
+        }
+    }
+    Ok(out)
+}
+
+/// The data-less destination of a host-decoded texture: `Rgba8UnormSrgb` (what
+/// `Image::from_buffer` makes of every 8-bit PNG/JPEG base colour), one mip,
+/// at least one texel, and `RENDER_ATTACHMENT`, which WebGPU requires on the
+/// destination of `copyExternalImageToTexture`. bevy creates the GPU texture
+/// empty; the host fills it through the [`crate::TileTextureHook`].
+fn host_texture(width: u32, height: u32, sampler: ImageSamplerDescriptor) -> Image {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+    let mut image = Image::new_uninit(
+        Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage =
+        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
+    image.sampler = ImageSampler::Descriptor(sampler);
+    image
+}
+
+/// Extracted material factors plus its resolved texture → the decode-time
+/// material.
+fn material_from_extracted(
+    m: &ExtractedMaterial,
+    texture: Option<ResolvedTexture>,
+) -> DecodedMaterial {
+    let mut out = DecodedMaterial {
         base_color: m.base_color,
         metallic: m.metallic,
         roughness: m.roughness,
         double_sided: m.double_sided,
         unlit: m.unlit,
-        base_color_image: None,
-        base_color_ktx2: None,
-        base_color_sampler: ImageSamplerDescriptor::default(),
+        ..DecodedMaterial::default()
+    };
+    if let Some(t) = texture {
+        out.base_color_image = t.image;
+        out.base_color_ktx2 = t.ktx2;
+        out.base_color_host = t.host;
+        out.base_color_sampler = t.sampler;
     }
+    out
 }
 
 /// `POINTS`-mode primitive → point-renderer data. Positions stay in the glTF
@@ -1012,26 +1137,41 @@ fn decode_points(
     Ok(DecodedItem::Points { transform, points })
 }
 
-/// glTF `WrappingMode` → bevy `ImageAddressMode`.
-fn gltf_address_mode(w: gltf::texture::WrappingMode) -> ImageAddressMode {
+/// glTF `WrappingMode` → the route-neutral [`TextureWrap`].
+fn gltf_wrap(w: gltf::texture::WrappingMode) -> TextureWrap {
     use gltf::texture::WrappingMode;
     match w {
-        WrappingMode::ClampToEdge => ImageAddressMode::ClampToEdge,
-        WrappingMode::MirroredRepeat => ImageAddressMode::MirrorRepeat,
-        WrappingMode::Repeat => ImageAddressMode::Repeat,
+        WrappingMode::ClampToEdge => TextureWrap::ClampToEdge,
+        WrappingMode::MirroredRepeat => TextureWrap::MirroredRepeat,
+        WrappingMode::Repeat => TextureWrap::Repeat,
+    }
+}
+
+/// [`TextureWrap`] → bevy `ImageAddressMode`.
+fn address_mode(w: TextureWrap) -> ImageAddressMode {
+    match w {
+        TextureWrap::ClampToEdge => ImageAddressMode::ClampToEdge,
+        TextureWrap::MirroredRepeat => ImageAddressMode::MirrorRepeat,
+        TextureWrap::Repeat => ImageAddressMode::Repeat,
     }
 }
 
 /// Build a bevy sampler descriptor from a glTF texture's sampler. The `gltf`
 /// crate returns the spec default (REPEAT, linear) for an unauthored sampler,
 /// so this both honours authored wrap modes and revives tiling textures the old
-/// `ImageSampler::Default` (ClampToEdge) silently flattened. Linear filtering;
-/// mips are deferred crate-wide.
+/// `ImageSampler::Default` (ClampToEdge) silently flattened.
 fn sampler_from_gltf(texture: &gltf::Texture<'_>) -> ImageSamplerDescriptor {
     let s = texture.sampler();
+    sampler_for(gltf_wrap(s.wrap_s()), gltf_wrap(s.wrap_t()))
+}
+
+/// The ONE tile-texture sampler, shared by the inline and extracted routes:
+/// the wrap modes from the glTF, linear filtering (the glTF filters are
+/// ignored); mips are deferred crate-wide.
+fn sampler_for(wrap_s: TextureWrap, wrap_t: TextureWrap) -> ImageSamplerDescriptor {
     ImageSamplerDescriptor {
-        address_mode_u: gltf_address_mode(s.wrap_s()),
-        address_mode_v: gltf_address_mode(s.wrap_t()),
+        address_mode_u: address_mode(wrap_s),
+        address_mode_v: address_mode(wrap_t),
         mag_filter: ImageFilterMode::Linear,
         min_filter: ImageFilterMode::Linear,
         mipmap_filter: ImageFilterMode::Linear,
@@ -1053,10 +1193,8 @@ fn decode_material(
         metallic: pbr.metallic_factor(),
         roughness: pbr.roughness_factor(),
         double_sided: material.double_sided(),
-        base_color_image: None,
-        base_color_ktx2: None,
-        base_color_sampler: ImageSamplerDescriptor::default(),
         unlit: material.unlit(),
+        ..DecodedMaterial::default()
     };
     if let Some(info) = pbr.base_color_texture() {
         let texture = info.texture();
@@ -2182,25 +2320,30 @@ pub(crate) mod tests {
             }
             assert_eq!(x.mesh.attributes().count(), y.mesh.attributes().count());
             assert_eq!(indices_u32(&x.mesh), indices_u32(&y.mesh), "indices");
-            // Material factors/flags, and whether a texture resolved at all
-            // (the image CONTENTS are the transcoder's business, tested
-            // separately — presence is what differs if a route drops one).
+            // Material factors/flags and the texture: a decoded image's
+            // format, size, sampler and pixels; pending KTX2 bytes; the
+            // sampler; a host token.
             let (mx, my) = (&x.material, &y.material);
             assert_eq!(mx.base_color, my.base_color, "base_color");
             assert_eq!(mx.metallic, my.metallic, "metallic");
             assert_eq!(mx.roughness, my.roughness, "roughness");
             assert_eq!(mx.double_sided, my.double_sided, "double_sided");
             assert_eq!(mx.unlit, my.unlit, "unlit");
-            assert_eq!(
-                mx.base_color_image.is_some(),
-                my.base_color_image.is_some(),
-                "base color texture presence"
-            );
-            assert_eq!(
-                mx.base_color_ktx2.is_some(),
-                my.base_color_ktx2.is_some(),
-                "pending ktx2 presence"
-            );
+            match (&mx.base_color_image, &my.base_color_image) {
+                (None, None) => {}
+                (Some(ix), Some(iy)) => {
+                    let (dx, dy) = (&ix.texture_descriptor, &iy.texture_descriptor);
+                    assert_eq!(dx.format, dy.format, "texture format");
+                    assert_eq!(dx.size, dy.size, "texture size");
+                    assert_eq!(dx.mip_level_count, dy.mip_level_count, "mips");
+                    assert_eq!(ix.sampler, iy.sampler, "texture sampler");
+                    assert_eq!(ix.data, iy.data, "texture pixels");
+                }
+                _ => panic!("base color texture presence differs between paths"),
+            }
+            assert_eq!(mx.base_color_ktx2, my.base_color_ktx2, "pending ktx2");
+            assert_eq!(mx.base_color_sampler, my.base_color_sampler, "sampler");
+            assert_eq!(mx.base_color_host, my.base_color_host, "host token");
             // Per-vertex feature ids are UV1, compared byte-for-byte above.
             match (&x.features, &y.features) {
                 (None, None) => {}
@@ -2450,7 +2593,15 @@ pub(crate) mod tests {
         assert_eq!(p.positions.len(), 6);
         assert_eq!(p.colors.as_ref().map(Vec::len), Some(6));
         assert_eq!(p.indices.as_ref().map(Vec::len), Some(12));
-        assert!(p.normals.is_none(), "fixture has no NORMAL");
+        // The fixture has no NORMAL: the worker fills it (prepare 0.3).
+        assert_eq!(
+            p.normals.as_deref(),
+            Some(
+                bevy_3d_tiles_prepare::compute_normals(&p.positions, p.indices.as_deref())
+                    .as_slice()
+            ),
+            "missing normals computed off-thread"
+        );
         // Node translation [10,0,0] flattened into the primitive transform.
         assert_eq!(&p.transform[12..15], &[10.0, 0.0, 0.0]);
         // `prepare_tile` (S4) still returns a container and no buffers.
@@ -2567,34 +2718,421 @@ pub(crate) mod tests {
         }
     }
 
-    /// S5 gate test (b), the decline lattice: content the extraction cannot
-    /// reproduce exactly falls back to the S4 container route (or all the way
-    /// inline) and renders identically. A textured tile is the live one — it
-    /// decodes for real through both routes.
+    /// `ExtractOptions::textures` off keeps a textured tile on the S4
+    /// container route, where it decodes exactly as inline (the kill switch
+    /// that restores the pre-0.5 texture path).
     #[test]
-    fn extraction_declines_textured_tile_to_the_s4_route() {
+    fn textures_off_keeps_the_s4_route() {
         use bevy::tasks::block_on;
 
         set_supported_compressed_formats(CompressedImageFormats::BC);
-        let glb = basisu_fixture();
-        // Declined: buffers absent, container present — the S4 payload.
-        let prepared = prepare_tile_extracting(&glb, false)
-            .unwrap()
-            .expect("accepted");
-        assert!(prepared.meshes.is_none(), "a textured tile must decline");
-        assert!(!prepared.glb.is_empty(), "declining still prepares the glb");
+        let off = ExtractOptions {
+            textures: false,
+            ..Default::default()
+        };
+        let hook: Arc<crate::api::TilePrepareFn> = Arc::new(move |bytes, geo| {
+            Box::pin(async move {
+                bevy_3d_tiles_prepare::prepare_tile_extracting_with(bytes, geo, None, off)
+            })
+        });
+        for glb in [basisu_fixture(), textured_fixture()] {
+            // Declined: buffers absent, container present — the S4 payload.
+            let prepared =
+                bevy_3d_tiles_prepare::prepare_tile_extracting_with(&glb, false, None, off)
+                    .unwrap()
+                    .expect("accepted");
+            assert!(prepared.meshes.is_none(), "textures off must decline");
+            assert!(!prepared.glb.is_empty(), "declining still prepares the glb");
 
-        let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
-        let hooked = block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook())))
-            .expect("declined-to-S4 decode");
-        assert_tiles_equal(&inline, &hooked);
-        let DecodedItem::Mesh(p) = &hooked.items[0] else {
+            let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+            let hooked = block_on(decode_tile_with(&glb, false, Some(&hook))).expect("S4 decode");
+            assert_tiles_equal(&inline, &hooked);
+            let DecodedItem::Mesh(p) = &hooked.items[0] else {
+                panic!("expected mesh")
+            };
+            assert!(
+                p.material.base_color_image.is_some(),
+                "texture still resolves through the declined route"
+            );
+        }
+    }
+
+    /// A 2×2 RGBA PNG and an 8×8 baseline JPEG (three components, every
+    /// coefficient zero: mid grey), both written by hand, so the fixture needs
+    /// no encoder.
+    const PNG_2X2: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR4nGP4z8DwHwyBNAg0AABJSQl4KKDbdwAAAABJRU5ErkJggg==";
+    const JPEG_8X8: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAARCAAIAAgDAREAAhEAAxEA/8QAJgABAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACAAMAAD8AA//Z";
+
+    fn b64(s: &str) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    /// One normal-less, UV-mapped triangle drawn three times: with a PNG
+    /// texture behind an authored CLAMP/MIRROR sampler, with a JPEG texture
+    /// and no sampler (REPEAT), and with the PNG again (a shared texture).
+    /// `edit` changes the JSON before the GLB is built.
+    fn textured_fixture_with(edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let (png, jpeg) = (b64(PNG_2X2), b64(JPEG_8X8));
+        let mut bin = Vec::new();
+        for v in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.25]]
+            .iter()
+            .flatten()
+        {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [[0.0f32, 0.0], [2.0, 0.0], [0.0, -1.0]].iter().flatten() {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        let png_at = bin.len();
+        bin.extend_from_slice(&png);
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+        let jpeg_at = bin.len();
+        bin.extend_from_slice(&jpeg);
+        let mut json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [
+                { "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 0 },
+                { "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 1 },
+                { "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 2 }
+            ]}],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                  "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.25] },
+                { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+                { "buffer": 0, "byteOffset": 36, "byteLength": 24 },
+                { "buffer": 0, "byteOffset": png_at, "byteLength": png.len() },
+                { "buffer": 0, "byteOffset": jpeg_at, "byteLength": jpeg.len() }
+            ],
+            "buffers": [{ "byteLength": bin.len() }],
+            "materials": [
+                { "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 } } },
+                { "pbrMetallicRoughness": { "baseColorTexture": { "index": 1 }, "metallicFactor": 0.0 },
+                  "extensions": { "KHR_materials_unlit": {} } },
+                { "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 }, "roughnessFactor": 0.5 } }
+            ],
+            "textures": [{ "source": 0, "sampler": 0 }, { "source": 1 }],
+            "samplers": [{ "wrapS": 33071, "wrapT": 33648 }],
+            "images": [
+                { "bufferView": 2, "mimeType": "image/png" },
+                { "bufferView": 3, "mimeType": "image/jpeg" }
+            ]
+        });
+        edit(&mut json);
+        assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin)
+    }
+
+    fn textured_fixture() -> Vec<u8> {
+        textured_fixture_with(|_| {})
+    }
+
+    /// Textured tiles take the extracted route (prepare 0.3) and decode
+    /// identically to inline: the same pixels, format, size and sampler per
+    /// texture, the same pending KTX2 bytes, and the same normals (the worker's
+    /// `compute_normals` against bevy's, on a normal-less fixture).
+    #[test]
+    fn extracted_textured_route_matches_inline() {
+        use bevy::tasks::block_on;
+
+        set_supported_compressed_formats(CompressedImageFormats::BC);
+        for glb in [textured_fixture(), basisu_fixture()] {
+            // The route under test really is the extracted one.
+            assert!(
+                prepare_tile_extracting(&glb, false)
+                    .unwrap()
+                    .is_some_and(|p| p.meshes.is_some()),
+                "textured fixture must extract"
+            );
+            let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
+            let hooked = block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook())))
+                .expect("extracted decode");
+            assert_tiles_equal(&inline, &hooked);
+            assert_eq!(hooked.stage_ms[1], 0.0, "no gltf parse on this route");
+        }
+        // And the textures really decoded (a fixture both routes failed to
+        // decode would compare equal too).
+        let tile = block_on(decode_tile_with(
+            &textured_fixture(),
+            false,
+            Some(&canned_extract_hook()),
+        ))
+        .expect("extracted decode");
+        let sizes: Vec<_> = tile
+            .items
+            .iter()
+            .map(|i| {
+                let DecodedItem::Mesh(p) = i else {
+                    panic!("expected mesh")
+                };
+                let img = p.material.base_color_image.as_ref().expect("decoded");
+                (
+                    img.width(),
+                    img.height(),
+                    p.material.base_color_sampler.address_mode_u,
+                )
+            })
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                (2, 2, ImageAddressMode::ClampToEdge),
+                (8, 8, ImageAddressMode::Repeat),
+                (2, 2, ImageAddressMode::ClampToEdge)
+            ]
+        );
+    }
+
+    /// Every texture setup the inline route rejects, the extraction declines:
+    /// each row runs through BOTH. Validation rows fail `gltf::Gltf::from_slice`
+    /// (`Root::validate` or serde); decode rows parse but fail (or panic in the
+    /// `gltf` crate) in the inline decode. A row that extracted would render a
+    /// tile the inline route errors on.
+    #[test]
+    fn textured_extraction_declines_exactly_where_inline_rejects() {
+        use bevy::tasks::block_on;
+        use serde_json::{Value, json};
+
+        let extracts = |glb: &[u8]| match prepare_tile_extracting(glb, false) {
+            Ok(Some(p)) => p.meshes.is_some(),
+            other => panic!("prepare must succeed (S4 at worst): {:?}", other.err()),
+        };
+        let inline_rejects = |glb: &[u8]| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on(decode_tile(glb, false)).is_err()
+            }))
+            .unwrap_or(true)
+        };
+        // The control: the base fixture extracts and both checks pass.
+        let base = textured_fixture();
+        assert!(extracts(&base));
+        assert!(gltf::Gltf::from_slice(&base).is_ok());
+        assert!(!inline_rejects(&base));
+
+        type Edit = fn(&mut Value);
+        let validation: &[(&str, Edit)] = &[
+            ("baseColorTexture index out of range", |j| {
+                j["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"] = json!(5)
+            }),
+            ("metallicRoughnessTexture index out of range", |j| {
+                j["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"] =
+                    json!({ "index": 5 })
+            }),
+            ("normalTexture index out of range", |j| {
+                j["materials"][0]["normalTexture"] = json!({ "index": 5 })
+            }),
+            ("occlusionTexture index out of range", |j| {
+                j["materials"][0]["occlusionTexture"] = json!({ "index": 5 })
+            }),
+            ("emissiveTexture index out of range", |j| {
+                j["materials"][0]["emissiveTexture"] = json!({ "index": 5 })
+            }),
+            ("texture without source", |j| {
+                j["textures"][0] = json!({ "sampler": 0 })
+            }),
+            ("source out of range", |j| {
+                j["textures"][0]["source"] = json!(7)
+            }),
+            ("image bufferView out of range", |j| {
+                j["images"][0]["bufferView"] = json!(40)
+            }),
+            ("sampler index out of range", |j| {
+                j["textures"][0]["sampler"] = json!(3)
+            }),
+            ("bad wrapS", |j| j["samplers"][0]["wrapS"] = json!(1234)),
+            ("bad magFilter", |j| {
+                j["samplers"][0]["magFilter"] = json!(9984)
+            }),
+            ("bad minFilter", |j| {
+                j["samplers"][0]["minFilter"] = json!(1)
+            }),
+            ("non-integer index", |j| {
+                j["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"] = json!("0")
+            }),
+        ];
+        let decode: &[(&str, Edit)] = &[
+            ("base colour from a URI image", |j| {
+                j["images"][0] = json!({ "uri": "a.png", "mimeType": "image/png" })
+            }),
+            ("base colour image/webp", |j| {
+                j["images"][0]["mimeType"] = json!("image/webp")
+            }),
+            ("base colour with no mimeType on a bufferView image", |j| {
+                j["images"][0].as_object_mut().unwrap().remove("mimeType");
+            }),
+        ];
+        for (what, edit) in validation {
+            let glb = textured_fixture_with(edit);
+            assert!(!extracts(&glb), "{what}: must decline");
+            assert!(
+                gltf::Gltf::from_slice(&glb).is_err(),
+                "{what}: the gltf crate must reject it"
+            );
+        }
+        for (what, edit) in decode {
+            let glb = textured_fixture_with(edit);
+            assert!(!extracts(&glb), "{what}: must decline");
+            assert!(inline_rejects(&glb), "{what}: inline must fail");
+        }
+    }
+
+    /// A zero-sized host texture still gets a 1×1 destination (a zero-sized GPU
+    /// texture is invalid), like the host's own uninitialised images.
+    #[test]
+    fn zero_sized_host_texture_is_one_texel() {
+        let meshes = ExtractedMeshes {
+            primitives: vec![ExtractedPrimitive {
+                positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                material: Some(0),
+                ..Default::default()
+            }],
+            materials: vec![ExtractedMaterial {
+                base_color_texture: Some(0),
+                ..Default::default()
+            }],
+            textures: vec![ExtractedTexture {
+                image: TileImage::Host {
+                    token: 3,
+                    width: 0,
+                    height: 0,
+                },
+                wrap_s: TextureWrap::Repeat,
+                wrap_t: TextureWrap::Repeat,
+            }],
+        };
+        let items = items_from_extracted(meshes, None).expect("decode");
+        let DecodedItem::Mesh(p) = &items[0] else {
             panic!("expected mesh")
         };
-        assert!(
-            p.material.base_color_image.is_some(),
-            "texture still resolves through the declined route"
-        );
+        assert_eq!(p.material.base_color_host, Some(3));
+        let img = p.material.base_color_image.as_ref().expect("destination");
+        assert_eq!((img.width(), img.height()), (1, 1));
+        assert!(img.data.is_none(), "the host fills it");
+    }
+
+    /// `prepare::compute_normals` (the worker's) is bevy_mesh's
+    /// `Mesh::compute_normals`, bit for bit and length for length, on ~200
+    /// seeded meshes: shared vertices, degenerate/zero-area/collinear
+    /// triangles, corners straddling bevy's `f32::EPSILON` guard (edges near
+    /// 0.0186), far-from-origin coordinates, index tails of 3n+1 and 3n+2, and
+    /// non-indexed meshes of 3n, 3n+1 and 3n+2 vertices. Also catches a bevy
+    /// bump that changes the algorithm.
+    #[test]
+    fn compute_normals_matches_bevy_bit_for_bit() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn unit(&mut self) -> f32 {
+                (self.next() >> 40) as f32 / (1u64 << 24) as f32
+            }
+            fn below(&mut self, n: u32) -> u32 {
+                (self.next() % u64::from(n)) as u32
+            }
+            fn point(&mut self, scale: f32, offset: f32) -> [f32; 3] {
+                std::array::from_fn(|_| offset + (self.unit() * 2.0 - 1.0) * scale)
+            }
+        }
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut checked = 0;
+        for case in 0..200u32 {
+            let tail = case % 3;
+            let (positions, indices): (Vec<[f32; 3]>, Option<Vec<u32>>) = match case % 5 {
+                // Random shared-vertex meshes, some triangles degenerate.
+                0 => {
+                    let nv = 3 + rng.below(30);
+                    let p = (0..nv).map(|_| rng.point(10.0, 0.0)).collect();
+                    let mut ix: Vec<u32> = (0..3 * (1 + rng.below(40)))
+                        .map(|_| rng.below(nv))
+                        .collect();
+                    if case.is_multiple_of(4) {
+                        ix[1] = ix[0]; // a repeated index
+                    }
+                    ix.extend((0..tail).map(|_| rng.below(nv)));
+                    (p, Some(ix))
+                }
+                // Corners around bevy's EPS guard: right-angled corners with
+                // both edges in [0.0182, 0.0190] (L⁴ ≈ f32::EPSILON at ~0.0186),
+                // plus a collinear triangle.
+                1 => {
+                    let mut p = Vec::new();
+                    let mut ix = Vec::new();
+                    for _ in 0..8 {
+                        let o = rng.point(5.0, 0.0);
+                        let (a, b) = (0.0182 + rng.unit() * 0.0008, 0.0182 + rng.unit() * 0.0008);
+                        let base = p.len() as u32;
+                        p.extend([o, [o[0] + a, o[1], o[2]], [o[0], o[1] + b, o[2] + a * 0.1]]);
+                        ix.extend([base, base + 1, base + 2]);
+                    }
+                    let base = p.len() as u32;
+                    p.extend([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]);
+                    ix.extend([base, base + 1, base + 2]);
+                    ix.extend(0..tail);
+                    (p, Some(ix))
+                }
+                // Non-indexed: 3n, 3n+1, 3n+2 vertices (flat normals).
+                2 => {
+                    let n = 3 * (1 + rng.below(20)) + tail;
+                    ((0..n).map(|_| rng.point(3.0, 0.0)).collect(), None)
+                }
+                // Zero-area triangles: coincident points, and a vertex no
+                // triangle touches (its normal stays zero).
+                3 => {
+                    let q = rng.point(1.0, 0.0);
+                    let r = rng.point(1.0, 0.0);
+                    let p = vec![q, q, q, r, r, rng.point(1.0, 0.0), rng.point(1.0, 0.0)];
+                    let mut ix = vec![0, 1, 2, 3, 4, 5, 2, 2, 5];
+                    ix.extend(0..tail);
+                    (p, Some(ix))
+                }
+                // Small triangles far from the origin.
+                _ => {
+                    let nv = 3 + rng.below(12);
+                    let off = 1.0e3 + rng.unit() * 1.0e5;
+                    let p = (0..nv).map(|_| rng.point(0.5, off)).collect();
+                    let mut ix: Vec<u32> = (0..3 * (1 + rng.below(12)))
+                        .map(|_| rng.below(nv))
+                        .collect();
+                    ix.extend((0..tail).map(|_| rng.below(nv)));
+                    (p, Some(ix))
+                }
+            };
+            let mut mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            );
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone());
+            if let Some(ix) = &indices {
+                mesh.insert_indices(Indices::U32(ix.clone()));
+            }
+            mesh.compute_normals();
+            let want = mesh
+                .attribute(Mesh::ATTRIBUTE_NORMAL)
+                .and_then(|v| v.as_float3())
+                .expect("bevy normals");
+            let got = bevy_3d_tiles_prepare::compute_normals(&positions, indices.as_deref());
+            assert_eq!(got.len(), want.len(), "case {case}: normal count");
+            for (v, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.map(f32::to_bits),
+                    w.map(f32::to_bits),
+                    "case {case} vertex {v}: {g:?} vs bevy {w:?}"
+                );
+            }
+            checked += got.len();
+        }
+        assert!(checked > 2000, "{checked} normals compared");
     }
 
     /// The rest of the lattice: Draco and splat content declines the whole
