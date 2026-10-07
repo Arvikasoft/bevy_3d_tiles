@@ -564,6 +564,57 @@ impl MaterialKey {
     }
 }
 
+/// The ONLY tile-material constructor. An untextured primitive's material is a
+/// function of its key alone, so a glTF field the crate starts reading later has
+/// to enter the key too, and can never make two different primitives share one.
+/// A textured primitive is `StandardMaterial { base_color_texture, ..material_for(key) }`.
+///
+/// Opaque: no discard and no alpha, so the GPU keeps early-Z under the dense
+/// overdraw of photogrammetry tiles.
+fn material_for(key: MaterialKey) -> StandardMaterial {
+    let [r, g, b, a] = key.base_color.map(f32::from_bits);
+    StandardMaterial {
+        base_color: Color::LinearRgba(LinearRgba::new(r, g, b, a)),
+        metallic: f32::from_bits(key.metallic),
+        perceptual_roughness: f32::from_bits(key.roughness),
+        unlit: key.unlit,
+        cull_mode: if key.double_sided {
+            None
+        } else {
+            Some(bevy::render::render_resource::Face::Back)
+        },
+        ..default()
+    }
+}
+
+/// [`TileMaterialCache`] clears itself past this many entries.
+const MATERIAL_CACHE_CAP: usize = 4096;
+
+/// One shared `StandardMaterial` per untextured [`MaterialKey`], across every
+/// tile and tileset: equal-factor draws then share a bind group, and a landing
+/// or respawning tile creates no material. Strong handles, so an entry outlives
+/// the tiles that used it; that is bounded by the distinct factor sets a scene
+/// uses (tens on a real site), and past [`MATERIAL_CACHE_CAP`] the map is
+/// cleared. Clearing is safe: every live tile holds its own handle.
+#[derive(Resource, Default)]
+struct TileMaterialCache(std::collections::HashMap<MaterialKey, Handle<StandardMaterial>>);
+
+impl TileMaterialCache {
+    fn get_or_add(
+        &mut self,
+        key: MaterialKey,
+        materials: &mut Assets<StandardMaterial>,
+    ) -> Handle<StandardMaterial> {
+        if self.0.len() >= MATERIAL_CACHE_CAP && !self.0.contains_key(&key) {
+            self.0.clear();
+        }
+        self.0
+            .entry(key)
+            .or_insert_with(|| materials.add(material_for(key)))
+            .clone()
+    }
+}
+
 /// Live tilesets + scheduler counters.
 #[derive(Resource, Default)]
 pub struct Tiles3dSets {
@@ -734,6 +785,7 @@ impl Plugin for Tiles3dPlugin {
             .init_resource::<Tiles3dChannel>()
             .init_resource::<TilesetCredits>()
             .init_resource::<Tiles3dDecodeStats>()
+            .init_resource::<TileMaterialCache>()
             // Host-supplied seams (defaults are inert: no origin, no resolver,
             // no prepare hook). The host overwrites these via its own adapter
             // systems (or pre-inserts them); a standalone viewer leaves them
@@ -1021,6 +1073,7 @@ fn receive_tiles3d(
     mut decode_stats: ResMut<Tiles3dDecodeStats>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut material_cache: ResMut<TileMaterialCache>,
     mut images: ResMut<Assets<Image>>,
     #[cfg(feature = "points")] mut clouds: ResMut<Assets<PointCloud>>,
     #[cfg(feature = "points")] point_material: Res<PointTileMaterial>,
@@ -1261,6 +1314,7 @@ fn receive_tiles3d(
                         let cache = build_tile_cache(
                             &mut meshes,
                             &mut materials,
+                            &mut material_cache,
                             &mut images,
                             renderers,
                             &resolver,
@@ -1428,6 +1482,7 @@ fn resolve_owners(
 fn build_tile_cache(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    material_cache: &mut TileMaterialCache,
     images: &mut Assets<Image>,
     renderers: ContentRenderers<'_>,
     resolver: &TileFeatureResolver,
@@ -1460,28 +1515,17 @@ fn build_tile_cache(
                     features,
                 } = *prim;
                 let prim_transform = Transform::from_matrix(ptf);
-                // One OPAQUE StandardMaterial per primitive, SHARED by all of its
-                // feature submeshes (no per-submesh texture duplication). Opaque:
-                // no discard/alpha so the GPU keeps early-Z (dense P3DT overdraw).
-                let standard = StandardMaterial {
-                    base_color: Color::LinearRgba(LinearRgba::new(
-                        material.base_color[0],
-                        material.base_color[1],
-                        material.base_color[2],
-                        material.base_color[3],
-                    )),
-                    base_color_texture: material.base_color_image.map(|img| images.add(img)),
-                    metallic: material.metallic,
-                    perceptual_roughness: material.roughness,
-                    unlit: material.unlit,
-                    cull_mode: if material.double_sided {
-                        None
-                    } else {
-                        Some(bevy::render::render_resource::Face::Back)
-                    },
-                    ..default()
+                // Untextured: the one shared material for these factors.
+                // Textured: its own material (the texture is unique to the tile),
+                // which the tile cache then reuses on every respawn.
+                let key = MaterialKey::of(&material);
+                let mat_handle = match material.base_color_image {
+                    Some(img) => materials.add(StandardMaterial {
+                        base_color_texture: Some(images.add(img)),
+                        ..material_for(key)
+                    }),
+                    None => material_cache.get_or_add(key, materials),
                 };
-                let mat_handle = materials.add(standard);
 
                 // ONE mesh per primitive, always — the Cesium model. Features
                 // resolve at PICK time from the hit triangle via
@@ -3700,6 +3744,166 @@ mod tests {
         assert_eq!(
             stats.material_keys, 3,
             "{{default, rough}} in the first tile + {{default}} in the second"
+        );
+    }
+
+    /// The material handle of every mesh item cached for `tile` of set 0.
+    fn cached_materials(app: &App, tile: usize) -> Vec<Handle<StandardMaterial>> {
+        app.world().resource::<Tiles3dSets>().sets[0].caches[tile]
+            .iter()
+            .filter_map(|c| match c {
+                CachedItem::Mesh { material, .. } => Some(material.clone()),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Untextured primitives with equal PBR factors share ONE material, within a
+    /// tile and across tiles: their draws share a bind group, and a landing tile
+    /// mints no material. A different factor is a different material; a
+    /// textured primitive keeps its own (its texture is unique to the tile).
+    #[test]
+    fn untextured_primitives_share_one_material() {
+        use content::DecodedMaterial;
+        let mut app = despawn_test_app(test_config());
+        install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        let rough = || DecodedMaterial {
+            roughness: 0.5,
+            ..Default::default()
+        };
+        let textured = || DecodedMaterial {
+            base_color_image: Some(Image::default()),
+            ..Default::default()
+        };
+        let before = app.world().resource::<Assets<StandardMaterial>>().len();
+        land_tile(
+            &mut app,
+            0,
+            vec![
+                plain_prim(DecodedMaterial::default()),
+                plain_prim(DecodedMaterial::default()),
+                plain_prim(rough()),
+                plain_prim(textured()),
+                plain_prim(textured()),
+            ],
+        );
+        land_tile(&mut app, 1, vec![plain_prim(DecodedMaterial::default())]);
+        app.update();
+
+        let (a, b) = (cached_materials(&app, 0), cached_materials(&app, 1));
+        assert_eq!(a[0], a[1], "equal factors in one tile share a material");
+        assert_eq!(a[0], b[0], "equal factors across tiles share a material");
+        assert_ne!(a[0], a[2], "a different roughness is a different material");
+        assert_ne!(a[3], a[4], "textured primitives keep one material each");
+        assert!(a[3] != a[0] && a[4] != a[0]);
+        assert_eq!(
+            app.world().resource::<Assets<StandardMaterial>>().len() - before,
+            4,
+            "default + rough + two textured, for six primitives"
+        );
+    }
+
+    /// Materials that differ in exactly one factor never share, and the
+    /// material a primitive gets is exactly `material_for` of its key (plus its
+    /// texture), so the key and the material cannot drift apart.
+    #[test]
+    fn distinct_factor_sets_get_distinct_materials() {
+        use content::DecodedMaterial;
+        let table = || {
+            vec![
+                DecodedMaterial::default(),
+                DecodedMaterial {
+                    base_color: [0.5, 1.0, 1.0, 1.0],
+                    ..Default::default()
+                },
+                DecodedMaterial {
+                    base_color: [1.0, 1.0, 1.0, 0.5],
+                    ..Default::default()
+                },
+                DecodedMaterial {
+                    metallic: 1.0,
+                    ..Default::default()
+                },
+                DecodedMaterial {
+                    roughness: 0.25,
+                    ..Default::default()
+                },
+                DecodedMaterial {
+                    unlit: true,
+                    ..Default::default()
+                },
+                DecodedMaterial {
+                    double_sided: true,
+                    ..Default::default()
+                },
+                DecodedMaterial {
+                    base_color_image: Some(Image::default()),
+                    roughness: 0.25,
+                    ..Default::default()
+                },
+            ]
+        };
+        let mut app = despawn_test_app(test_config());
+        install_set(
+            &mut app,
+            synth_tree([100.0, 6.0, 0.0]),
+            SetFrame::Anchored,
+            Vec3::new(0.0, 0.0, 600.0),
+        );
+        land_tile(&mut app, 0, table().into_iter().map(plain_prim).collect());
+        app.update();
+
+        let handles = cached_materials(&app, 0);
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        for (i, (h, decoded)) in handles.iter().zip(table()).enumerate() {
+            assert!(
+                handles[..i].iter().all(|other| other != h),
+                "factor set {i} shares a material with an earlier, different one"
+            );
+            let got = materials.get(h).expect("material inserted");
+            let want = StandardMaterial {
+                base_color_texture: got.base_color_texture.clone(),
+                ..material_for(MaterialKey::of(&decoded))
+            };
+            assert_eq!(got.base_color_texture.is_some(), i == 7);
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "factor set {i}");
+        }
+    }
+
+    /// Past the cap the cache forgets everything, but a live tile's material
+    /// survives: tiles hold their own strong handles, the cache only shortcuts
+    /// creation.
+    #[test]
+    fn material_cache_cap_clears_without_dropping_live_materials() {
+        let mut materials = Assets::<StandardMaterial>::default();
+        let mut cache = TileMaterialCache::default();
+        let key = |i: u32| MaterialKey {
+            base_color: [i, 0, 0, 0],
+            ..MaterialKey::of(&Default::default())
+        };
+        let live = cache.get_or_add(key(0), &mut materials);
+        for i in 1..MATERIAL_CACHE_CAP as u32 {
+            cache.get_or_add(key(i), &mut materials);
+        }
+        assert_eq!(cache.0.len(), MATERIAL_CACHE_CAP);
+        assert_eq!(
+            cache.get_or_add(key(0), &mut materials),
+            live,
+            "a hit at the cap neither clears nor re-mints"
+        );
+        assert_eq!(cache.0.len(), MATERIAL_CACHE_CAP);
+
+        cache.get_or_add(key(MATERIAL_CACHE_CAP as u32), &mut materials);
+        assert_eq!(cache.0.len(), 1, "a miss at the cap clears the map");
+        assert!(
+            materials.get(&live).is_some(),
+            "clearing never removes a material a tile still holds"
         );
     }
 

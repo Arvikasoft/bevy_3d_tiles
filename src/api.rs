@@ -141,19 +141,47 @@ pub struct TileOwner {
 /// cut reveals it), so a host system reacting to `Added<TileGeometry>` lands its
 /// changes before the geometry is ever drawn — no first-frame flicker.
 ///
+/// Tile `StandardMaterial`s are shared (since 0.5): every untextured primitive
+/// with the same PBR factors uses one material, across tiles and tilesets, and
+/// a respawned tile comes back with the same handles. Never mutate one in
+/// place; clone it. A replacement material should be shared the same way, keyed
+/// by (base material, your extension's key), or every tile mints its own
+/// material and bind group again. Prune on the base's removal, so an evicted
+/// textured tile's copy (which holds its texture) goes with it.
+///
 /// ```ignore
 /// // Replace the crate's StandardMaterial with an extended one, per tileset.
+/// type MyMat = ExtendedMaterial<StandardMaterial, MyExt>;
 /// fn extend_tile_materials(
 ///     mut commands: Commands,
 ///     added: Query<(Entity, &MeshMaterial3d<StandardMaterial>, &TileGeometry), Added<TileGeometry>>,
 ///     standard: Res<Assets<StandardMaterial>>,
-///     mut extended: ResMut<Assets<ExtendedMaterial<StandardMaterial, MyExt>>>,
+///     mut base_events: MessageReader<AssetEvent<StandardMaterial>>,
+///     mut extended: ResMut<Assets<MyMat>>,
+///     mut cache: Local<HashMap<(AssetId<StandardMaterial>, MyExtKey), Handle<MyMat>>>,
 ///     my_sets: Res<MyPerTilesetState>,
 /// ) {
+///     // Read every frame (before any early return), so the prune runs in a
+///     // steady state with no new tiles too.
+///     let gone = base_events
+///         .read()
+///         .filter(|e| matches!(e, AssetEvent::Removed { .. } | AssetEvent::Unused { .. }))
+///         .count();
+///     if gone > 0 {
+///         cache.retain(|(base, _), _| standard.contains(*base));
+///     }
 ///     for (entity, mat, content) in &added {
 ///         let Some(state) = my_sets.get(content.set_id) else { continue };
-///         let Some(base) = standard.get(&mat.0).cloned() else { continue };
-///         let handle = extended.add(ExtendedMaterial { base, extension: state.ext() });
+///         let key = (mat.0.id(), state.key());
+///         let handle = match cache.get(&key) {
+///             Some(h) => h.clone(),
+///             None => {
+///                 let Some(base) = standard.get(&mat.0).cloned() else { continue };
+///                 let h = extended.add(MyMat { base, extension: state.ext() });
+///                 cache.insert(key, h.clone());
+///                 h
+///             }
+///         };
 ///         commands
 ///             .entity(entity)
 ///             .remove::<MeshMaterial3d<StandardMaterial>>()

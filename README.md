@@ -190,6 +190,14 @@ mining site with ~450 resident tiles). Breaking changes:
 - **`Tiles3dDecodeStats`** gains `primitives`, `textured_primitives` and
   `material_keys` (distinct untextured PBR factor sets per decoded tile,
   summed), so a struct literal of it needs the new fields.
+- **Tile `StandardMaterial`s are shared.** Every untextured primitive with the
+  same PBR factors (base color, metallic, roughness, unlit, double-sided) uses
+  ONE material, across tiles and tilesets, so their draws share a bind group and
+  a landing or respawning tile creates no material. Mutating one in place now
+  changes every tile that shares it: **clone before mutating**, and cache a
+  replacement material per (base material, your key) rather than per entity
+  (the `TileGeometry` doc example shows the pattern, with an `AssetEvent`
+  prune). Textured primitives still own their material, as before.
 
 Behavioral:
 
