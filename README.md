@@ -286,6 +286,17 @@ Behavioral:
 - The per-cut, per-graft and per-tileset-open log lines moved from `info` to
   `debug` (a moving camera changes the cut most frames, and on wasm every
   `info` line is a console write). Filter `bevy_3d_tiles=debug` to see them.
+- With a `TilePrepareHook` that extracts (`prepare_tile_extracting*`), textured
+  and normal-less content (photorealistic mesh layers) no longer comes back as
+  a prepared GLB: the glTF parse, the attribute collect, the feature tables and
+  the missing normals run on the preparing thread. Encoded base-colour
+  textures still decode on the main thread unless a `TileTextureHook` takes
+  them as host-decoded tokens. `ExtractOptions { textures: false, .. }` keeps
+  the 0.4 route for textured content.
+- `TilePickMesh::raycast()` visits only the runs of 64 triangles whose padded
+  bounds the ray touches, for the same nearest hit. A copy's first ray builds
+  those bounds (under one full walk); every later ray costs a small fraction
+  of one.
 
 ### 0.3.0 → 0.4.0
 
