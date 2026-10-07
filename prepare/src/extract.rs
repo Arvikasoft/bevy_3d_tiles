@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 
-use crate::{DecodeError, read_accessor};
+use crate::{DecodeError, bounds_of, read_accessor};
 
 /// Node-graph recursion cap. Tile bytes are untrusted network input and a
 /// cyclic `children` chain would otherwise recurse until the (Worker) stack
@@ -97,8 +97,42 @@ pub struct ExtractedPrimitive {
     /// `COLOR_0`, always RGBA.
     pub colors: Option<Vec<[f32; 4]>>,
     /// Widened to u32 (from the accessor's u8/u16/u32) like the `gltf`
-    /// crate's `into_u32`; `None` = non-indexed.
+    /// crate's `into_u32`; `None` = non-indexed. A FEATURE primitive is never
+    /// non-indexed: [`ExtractedPrimitive::set_feature_ids`] synthesizes `0..n`.
     pub indices: Option<Vec<u32>>,
+    /// `EXT_mesh_features` ids per vertex in the `ATTRIBUTE_UV_1` layout
+    /// `[fid, 0]`, padded to the vertex count ([`crate::feature_tables`]).
+    /// `None` = no feature ids on this primitive. A hook that builds this
+    /// struct itself may leave it `None` and send
+    /// [`crate::PreparedFeatures::vertex_ids`] instead (the 0.2 shape): the
+    /// consumer then derives the tables itself.
+    pub feature_uv1: Option<Vec<[f32; 2]>>,
+    /// Feature id of each triangle, in index order: a pick hit's triangle
+    /// ordinal indexes it directly. Built with `feature_uv1`.
+    pub feature_of_triangle: Option<Vec<u32>>,
+    /// Axis-aligned position bounds `[min, max]` ([`crate::bounds_of`]);
+    /// `None` = no positions.
+    pub bounds: Option<[[f32; 3]; 2]>,
+}
+
+impl ExtractedPrimitive {
+    /// Attach this primitive's `EXT_mesh_features` ids (raw per-vertex
+    /// `_FEATURE_ID_0` values): a non-indexed primitive first gets U32 indices
+    /// `0..n` (hiding a feature rewrites index ranges, so every feature
+    /// primitive is indexed; the triangles do not change), then both tables
+    /// come from [`crate::feature_tables`]. Every decode route calls this, so
+    /// they cannot disagree.
+    pub fn set_feature_ids(&mut self, per_vertex: &[f32]) {
+        let n = self.positions.len();
+        // Whole triangles only (`n` is a multiple of 3 in valid content); a
+        // trailing partial triangle draws nothing either way.
+        let indices = self
+            .indices
+            .get_or_insert_with(|| (0..(n - n % 3) as u32).collect());
+        let (uv1, by_triangle) = crate::feature_tables(per_vertex, indices, n);
+        self.feature_uv1 = Some(uv1);
+        self.feature_of_triangle = Some(by_triangle);
+    }
 }
 
 /// The geometry of one tile, extracted off-thread: every TRIANGLES primitive
@@ -360,11 +394,15 @@ fn extract_primitive(
         mesh_ix,
         prim_ix,
         material: material.map(|i| i as usize),
+        bounds: bounds_of(&positions),
         positions,
         normals,
         uvs,
         colors,
         indices,
+        // Filled by `prepare_tile_inner` once the feature table is read.
+        feature_uv1: None,
+        feature_of_triangle: None,
     }))
 }
 

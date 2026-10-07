@@ -190,6 +190,24 @@ mining site with ~450 resident tiles). Breaking changes:
 - **`Tiles3dDecodeStats`** gains `primitives`, `textured_primitives` and
   `material_keys` (distinct untextured PBR factor sets per decoded tile,
   summed), so a struct literal of it needs the new fields.
+- **`TileFeatures::feature_of_vertex` is removed.** The per-vertex feature ids
+  have always also been on the decoded mesh as `Mesh::ATTRIBUTE_UV_1`
+  (`[fid, 0]`); read them there (on `DecodedPrimitive::mesh`, before spawn).
+- **Non-indexed feature primitives are now indexed** (U32 `0..n`). The
+  triangles and their ordinals are unchanged; every `EXT_mesh_features`
+  primitive is now addressable by index.
+- **`DecodedPrimitive` gains `bounds`**: the position AABB `[min, max]` in the
+  primitive's own frame, computed off-thread on the extracted route.
+- **`bevy_3d_tiles_prepare` 0.3.** `ExtractedPrimitive` gains `feature_uv1`,
+  `feature_of_triangle` and `bounds`, so a hook that builds one by struct
+  literal must fill them; `None` (or `..Default::default()`) keeps the 0.2
+  behaviour, where the crate derives the tables from
+  `PreparedFeatures::vertex_ids`. `prepare_tile_extracting` now builds the
+  feature tables (and the synthesized indices) on the preparing thread, so the
+  main thread only moves them onto the mesh, and `PreparedFeatures::vertex_ids`
+  is empty when `meshes` is `Some`. `feature_tables()`, `bounds_of()` and
+  `ExtractedPrimitive::set_feature_ids()` are the one implementation every
+  route calls.
 - **Tile `StandardMaterial`s are shared.** Every untextured primitive with the
   same PBR factors (base color, metallic, roughness, unlit, double-sided) uses
   ONE material, across tiles and tilesets, so their draws share a bind group and

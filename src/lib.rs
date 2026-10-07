@@ -1513,6 +1513,7 @@ fn build_tile_cache(
                     mesh,
                     material,
                     features,
+                    bounds: _,
                 } = *prim;
                 let prim_transform = Transform::from_matrix(ptf);
                 // Untextured: the one shared material for these factors.
@@ -4000,9 +4001,9 @@ mod tests {
             material: content::DecodedMaterial::default(),
             features: Some(content::TileFeatures {
                 feature_of_triangle: vec![0],
-                feature_of_vertex: vec![0.0; 3],
                 node_of_feature: node_of_feature.clone(),
             }),
+            bounds: None,
         }))
     }
 

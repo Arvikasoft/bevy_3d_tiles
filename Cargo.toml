@@ -32,7 +32,7 @@ splats = ["dep:bevy_gaussian_splatting"]
 # `prepare_tile`. Everything is re-exported here so downstream never notices
 # the split; a host's Web Worker links the prepare crate ALONE (no bevy).
 # Version-lockstep: publish both crates together (see prepare/Cargo.toml).
-bevy_3d_tiles_prepare = { version = "0.2.1", path = "prepare" }
+bevy_3d_tiles_prepare = { version = "0.3.0", path = "prepare" }
 # Exact-pin, in lockstep with bevy-client and bevy_pointcloud_x (which pins
 # `=0.19.0` per-subcrate), so no bevy patch release enters the tree without
 # someone deciding to. It is NOT what keeps `Assets<PointCloud>` typechecking

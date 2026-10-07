@@ -804,6 +804,26 @@ impl FeatureCtx {
         Ok(Some(vals.into_iter().map(|v| v[0]).collect()))
     }
 
+    /// [`FeatureCtx::materialize`] for EXTRACTED geometry: each primitive
+    /// gets its tables here ([`ExtractedPrimitive::set_feature_ids`]), on the
+    /// preparing thread, so the consumer does no per-vertex pass; the raw ids
+    /// are then not carried a second time (`vertex_ids` comes back empty).
+    fn attach(
+        mut self,
+        bin: Option<&[u8]>,
+        primitives: &mut [ExtractedPrimitive],
+    ) -> Result<PreparedFeatures, String> {
+        for p in primitives {
+            if let Some(ids) = self.per_vertex_ids(bin, p.mesh_ix, p.prim_ix)? {
+                p.set_feature_ids(&ids);
+            }
+        }
+        Ok(PreparedFeatures {
+            node_of_feature: std::mem::take(&mut self.node_of_feature),
+            vertex_ids: Vec::new(),
+        })
+    }
+
     /// Read every feature-carrying primitive's per-vertex ids up front — the
     /// [`PreparedFeatures`] the worker reply carries so the main thread never
     /// re-splits/re-parses the JSON to rebuild feature picking.
@@ -821,6 +841,45 @@ impl FeatureCtx {
             vertex_ids,
         })
     }
+}
+
+/// The `EXT_mesh_features` tables of one primitive, from its raw per-vertex
+/// `_FEATURE_ID_0` values:
+/// * the `ATTRIBUTE_UV_1` layout `[fid, 0]`, padded with feature 0 to
+///   `vertex_count` (a mesh attribute must match the position count);
+/// * the feature id of each triangle, in `indices` order, so a pick hit's
+///   triangle ordinal indexes it directly.
+///
+/// The one implementation behind every decode route (inline, prepared GLB,
+/// extracted), so their picking cannot drift.
+pub fn feature_tables(
+    per_vertex: &[f32],
+    indices: &[u32],
+    vertex_count: usize,
+) -> (Vec<[f32; 2]>, Vec<u32>) {
+    let uv1 = (0..vertex_count)
+        .map(|v| [per_vertex.get(v).copied().unwrap_or(0.0), 0.0])
+        .collect();
+    let by_triangle = indices
+        .chunks_exact(3)
+        .map(|t| {
+            per_vertex
+                .get(t[0] as usize)
+                .map_or(0, |f| f.round() as u32)
+        })
+        .collect();
+    (uv1, by_triangle)
+}
+
+/// Axis-aligned bounds `[min, max]` of `positions`; `None` when there are none.
+pub fn bounds_of(positions: &[[f32; 3]]) -> Option<[[f32; 3]; 2]> {
+    let (first, rest) = positions.split_first()?;
+    Some(rest.iter().fold([*first, *first], |[lo, hi], p| {
+        [
+            std::array::from_fn(|i| lo[i].min(p[i])),
+            std::array::from_fn(|i| hi[i].max(p[i])),
+        ]
+    }))
 }
 
 /// Read the `nodePath` STRING property of `EXT_structural_metadata`'s first
@@ -970,7 +1029,10 @@ pub struct PreparedFeatures {
     pub node_of_feature: Vec<String>,
     /// `(mesh index, primitive index)` → raw per-VERTEX `_FEATURE_ID_0`
     /// values (accessor order/length — the consumer pads to vertex count and
-    /// derives the per-triangle table from its own index buffer).
+    /// derives the per-triangle table from its own index buffer), sorted by
+    /// key. **Empty when [`PreparedTile::meshes`] is `Some`**: the extracted
+    /// primitives already carry their tables
+    /// ([`ExtractedPrimitive::feature_uv1`]), so the ids are not sent twice.
     pub vertex_ids: Vec<((u64, u64), Vec<f32>)>,
 }
 
@@ -1258,7 +1320,7 @@ fn prepare_tile_inner(
     // S5: geometry off the document we already hold. Runs BEFORE the feature
     // pass (which consumes `json`) and before the container rebuild — when it
     // succeeds there is no container to rebuild, because nobody will parse one.
-    let meshes = if extract {
+    let mut meshes = if extract {
         extract_tile_meshes(&json, bin)?
     } else {
         None
@@ -1284,9 +1346,16 @@ fn prepare_tile_inner(
     //   routes to warn-once → inline, which reproduces that failure with full
     //   diagnostics. Swallowing it instead would make the same bytes render
     //   (picking silently gone) or fail depending on whether a Worker booted.
+    //
+    // Extracted geometry gets its feature tables (and synthesized indices)
+    // here, off the consumer's thread; only the primitives it extracted are
+    // read, exactly the set the inline route would read.
     let features = if marks.features {
         match FeatureCtx::build(json, bin) {
-            Ok(ctx) => Some(ctx.materialize(bin)?),
+            Ok(ctx) => Some(match meshes.as_mut() {
+                Some(m) => ctx.attach(bin, &mut m.primitives)?,
+                None => ctx.materialize(bin)?,
+            }),
             Err(_) => None,
         }
     } else {
@@ -1567,6 +1636,153 @@ mod tests {
             panic!("a bad feature accessor must fail the tile, not lose picking");
         };
         assert!(err.to_string().contains("accessor 7"), "{err}");
+    }
+
+    /// Two triangles carrying features 0 and 1, plus the `nodePath` table our
+    /// tiler writes. The index buffer lists the SECOND triangle first, so a
+    /// per-triangle table built in vertex order instead of index order fails.
+    /// `indexed = false` drops the indices (vertices `3t..3t+3` are triangle t).
+    fn feature_tile(indexed: bool) -> Vec<u8> {
+        let positions: [[f32; 3]; 6] = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [2.0, 1.0, -1.0],
+        ];
+        let ids: [f32; 6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let indices: [u32; 6] = [3, 4, 5, 0, 1, 2];
+        let mut bin = Vec::new();
+        for v in positions.iter().flatten().chain(&ids) {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        for i in indices {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        bin.extend_from_slice(b"AB/c");
+        for o in [0u32, 1, 4] {
+            bin.extend_from_slice(&o.to_le_bytes());
+        }
+        let mut json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "extensionsUsed": ["EXT_mesh_features", "EXT_structural_metadata"],
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{
+                "attributes": { "POSITION": 0, "_FEATURE_ID_0": 1 },
+                "indices": 2,
+                "extensions": { "EXT_mesh_features": {
+                    "featureIds": [{ "featureCount": 2, "attribute": 0, "propertyTable": 0 }]
+                }}
+            }]}],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 6, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5126, "count": 6, "type": "SCALAR" },
+                { "bufferView": 2, "componentType": 5125, "count": 6, "type": "SCALAR" }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 72 },
+                { "buffer": 0, "byteOffset": 72, "byteLength": 24 },
+                { "buffer": 0, "byteOffset": 96, "byteLength": 24 },
+                { "buffer": 0, "byteOffset": 120, "byteLength": 4 },
+                { "buffer": 0, "byteOffset": 124, "byteLength": 12 }
+            ],
+            "buffers": [{ "byteLength": bin.len() }],
+            "extensions": { "EXT_structural_metadata": { "propertyTables": [{
+                "count": 2,
+                "properties": { "nodePath": { "values": 3, "stringOffsets": 4 } }
+            }]}}
+        });
+        if !indexed {
+            json["meshes"][0]["primitives"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("indices");
+        }
+        assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin)
+    }
+
+    /// The worker builds the feature tables (UV1 `[fid, 0]` + the per-triangle
+    /// ids, in INDEX order) so the main thread does no per-vertex pass. They
+    /// must equal what the consumer derives from the S4 route's raw per-vertex
+    /// ids, and the raw ids are then not sent a second time.
+    #[test]
+    fn extracted_feature_tables_match_inline() {
+        let glb = feature_tile(true);
+        let s4 = prepare_tile(&glb, false).unwrap().expect("prepared");
+        let mut s4_ids = s4.features.expect("S4 features").vertex_ids;
+        assert_eq!(s4_ids.len(), 1);
+        let (key, raw) = s4_ids.remove(0);
+        assert_eq!(key, (0, 0));
+
+        let s5 = prepare_tile_extracting(&glb, false)
+            .unwrap()
+            .expect("prepared");
+        let feats = s5.features.expect("S5 features");
+        assert_eq!(feats.node_of_feature, ["A", "B/c"]);
+        assert!(
+            feats.vertex_ids.is_empty(),
+            "ids ride the primitive, not twice"
+        );
+        let p = &s5.meshes.expect("extracted").primitives[0];
+        let (uv1, by_tri) = feature_tables(&raw, p.indices.as_deref().unwrap(), 6);
+        assert_eq!(p.feature_uv1.as_deref(), Some(uv1.as_slice()));
+        assert_eq!(p.feature_of_triangle.as_deref(), Some(by_tri.as_slice()));
+        // And the values themselves: second triangle (feature 1) listed first.
+        assert_eq!(by_tri, [1, 0]);
+        assert_eq!(
+            uv1,
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0]
+            ]
+        );
+    }
+
+    /// Short id accessors pad with feature 0 (a mesh attribute must match the
+    /// vertex count or bevy rejects the mesh); the per-triangle id rounds.
+    #[test]
+    fn feature_tables_pad_and_round() {
+        let (uv1, by_tri) = feature_tables(&[2.0, 2.0, 1.6], &[0, 1, 2, 3, 4, 2], 5);
+        assert_eq!(
+            uv1,
+            [[2.0, 0.0], [2.0, 0.0], [1.6, 0.0], [0.0, 0.0], [0.0, 0.0]]
+        );
+        assert_eq!(by_tri, [2, 0]);
+    }
+
+    /// Hiding a feature rewrites index ranges, so a non-indexed FEATURE
+    /// primitive gets U32 indices `0..n` where its tables are built: the same
+    /// triangles, now addressable.
+    #[test]
+    fn non_indexed_feature_primitive_gets_sequential_u32_indices() {
+        let s5 = prepare_tile_extracting(&feature_tile(false), false)
+            .unwrap()
+            .expect("prepared");
+        let p = &s5.meshes.expect("extracted").primitives[0];
+        assert_eq!(p.indices.as_deref(), Some(&[0, 1, 2, 3, 4, 5][..]));
+        assert_eq!(p.feature_of_triangle.as_deref(), Some(&[0, 1][..]));
+    }
+
+    /// The worker ships each primitive's AABB so the consumer never re-walks
+    /// the positions for it.
+    #[test]
+    fn bounds_match_mesh_min_max() {
+        let s5 = prepare_tile_extracting(&feature_tile(true), false)
+            .unwrap()
+            .expect("prepared");
+        let p = &s5.meshes.expect("extracted").primitives[0];
+        assert_eq!(p.bounds, Some([[0.0, 0.0, -1.0], [3.0, 1.0, 0.0]]));
+        assert_eq!(bounds_of(&[]), None);
+        assert_eq!(
+            bounds_of(&[[1.0, -2.0, 3.0]]),
+            Some([[1.0, -2.0, 3.0], [1.0, -2.0, 3.0]])
+        );
     }
 
     #[test]

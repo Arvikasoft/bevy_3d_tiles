@@ -66,7 +66,7 @@ pub use bevy_3d_tiles_prepare::{
 #[cfg(feature = "splats")]
 use bevy_3d_tiles_prepare::read_accessor;
 use bevy_3d_tiles_prepare::{
-    DracoPrim, FeatureCtx, Marks, PreparedFeatures, assemble_glb, buffer_view_slice,
+    DracoPrim, FeatureCtx, Marks, PreparedFeatures, assemble_glb, bounds_of, buffer_view_slice,
     decode_meshopt_views, extract_planetary_root_offset, find_draco_prims, preprocess_basisu,
     splice_draco, split_glb, strip_handled_extensions, tile_rtc_to_content_frame, unwrap_b3dm,
 };
@@ -159,19 +159,18 @@ fn warn_ktx2_once(detail: &str) {
 
 /// Per-feature picking data for one mesh primitive (T8): `EXT_mesh_features`
 /// (`_FEATURE_ID_0`) + the tile's `EXT_structural_metadata` property table.
+///
+/// The per-VERTEX ids live on the mesh itself, as `ATTRIBUTE_UV_1` (`[fid, 0]`),
+/// so a host material can style per feature in the fragment shader (the Cesium
+/// `Cesium3DTileFeature.color` model) through the standard pipeline's
+/// `VERTEX_UVS_B` path, with no custom vertex shader. Feature tiles never carry
+/// a real `TEXCOORD_1` (it was already dropped before 0.1.7), so nothing is
+/// displaced. Read them from [`DecodedPrimitive::mesh`] before it is spawned.
 pub struct TileFeatures {
     /// featureId per triangle, in the spawned mesh's index-buffer order — so
-    /// the pick raycast's triangle ordinal indexes straight into it.
+    /// the pick raycast's triangle ordinal indexes straight into it. A feature
+    /// primitive is always indexed (a non-indexed one gets `0..n`).
     pub feature_of_triangle: Vec<u32>,
-    /// featureId per VERTEX (raw `_FEATURE_ID_0` values, length == the
-    /// primitive's vertex count). The decode also writes these onto the mesh
-    /// as `ATTRIBUTE_UV_1` (`[fid, 0]`), so a host material can style
-    /// per-feature in the fragment shader (the Cesium
-    /// `Cesium3DTileFeature.color` model) through the standard pipeline's
-    /// `VERTEX_UVS_B` path — no custom vertex shader. Feature tiles never
-    /// carry a real `TEXCOORD_1` (it was already dropped before 0.1.7), so
-    /// nothing is displaced.
-    pub feature_of_vertex: Vec<f32>,
     /// Shared per-tile table: featureId → source-node path (the `/`-joined node
     /// names the sections resolver matches `mesh_section` against). `Arc` so
     /// every primitive of one tile shares one decode.
@@ -188,6 +187,10 @@ pub struct DecodedPrimitive {
     /// Feature metadata when the tile carries `EXT_mesh_features` (T8); `None`
     /// for plain/scenery tiles. Drives feature → node → twin picking.
     pub features: Option<TileFeatures>,
+    /// Axis-aligned bounds `[min, max]` of the mesh positions, in the
+    /// primitive's own frame (before `transform`). Computed off-thread on the
+    /// extracted route. `None` only for a primitive with no positions.
+    pub bounds: Option<[[f32; 3]; 2]>,
 }
 
 /// One decoded piece of tile content. A tile may carry several (multiple
@@ -689,8 +692,9 @@ fn decode_vanilla(
 /// Feature-picking source for one tile's decode: the parsed-JSON context on
 /// the inline path (accessors read lazily against the BIN), or the
 /// worker-materialized arrays of a [`PreparedTile`] — which is exactly what
-/// lets the hook path skip re-parsing the JSON. Both funnel into the same
-/// triangle/vertex mapping so the two paths cannot drift.
+/// lets the hook path skip re-parsing the JSON. Both funnel into
+/// [`ExtractedPrimitive::set_feature_ids`] (the prepare crate's one table
+/// builder, which the worker's extraction runs too) so no route can drift.
 struct FeatSource {
     /// featureId → source-node path, shared across the tile's primitives.
     node_of_feature: Arc<Vec<String>>,
@@ -699,6 +703,7 @@ struct FeatSource {
 
 enum FeatKind {
     Json(FeatureCtx),
+    /// Sorted by key, so a lookup is a binary search.
     Prepared(Vec<((u64, u64), Vec<f32>)>),
 }
 
@@ -710,54 +715,41 @@ impl FeatSource {
         }
     }
 
-    fn from_prepared(f: PreparedFeatures) -> Self {
+    fn from_prepared(mut f: PreparedFeatures) -> Self {
+        // `materialize` sorts; a hand-built hook reply might not.
+        f.vertex_ids.sort_unstable_by_key(|(key, _)| *key);
         Self {
             node_of_feature: Arc::new(f.node_of_feature),
             kind: FeatKind::Prepared(f.vertex_ids),
         }
     }
 
-    /// `feature_of_triangle` for primitive `(mesh_ix, prim_ix)` in `indices`
-    /// order (matching the spawned mesh + pick raycast), or `None` when this
-    /// primitive carries no feature ids.
-    fn for_primitive(
-        &self,
-        bin: Option<&[u8]>,
-        mesh_ix: u64,
-        prim_ix: u64,
-        indices: Option<&[u32]>,
-        vertex_count: usize,
-    ) -> Result<Option<TileFeatures>, String> {
-        use std::borrow::Cow;
-        let per_vertex: Option<Cow<'_, [f32]>> = match &self.kind {
-            FeatKind::Json(ctx) => ctx.per_vertex_ids(bin, mesh_ix, prim_ix)?.map(Cow::Owned),
-            FeatKind::Prepared(prims) => prims
-                .iter()
-                .find(|((m, p), _)| (*m, *p) == (mesh_ix, prim_ix))
-                .map(|(_, ids)| Cow::Borrowed(ids.as_slice())),
-        };
-        let Some(per_vertex) = per_vertex else {
-            return Ok(None);
-        };
-        let feature_of = |v: usize| per_vertex.get(v).map(|f| f.round() as u32).unwrap_or(0);
-        let feature_of_triangle = match indices {
-            Some(idx) => idx
-                .chunks_exact(3)
-                .map(|t| feature_of(t[0] as usize))
-                .collect(),
-            // Non-indexed: triangle t spans vertices 3t..3t+3.
-            None => (0..vertex_count / 3).map(|t| feature_of(t * 3)).collect(),
-        };
-        // Exactly vertex_count entries (pad with feature 0) — a mesh attribute
-        // must match the position count or bevy rejects the mesh.
-        let feature_of_vertex = (0..vertex_count)
-            .map(|v| per_vertex.get(v).copied().unwrap_or(0.0))
-            .collect();
-        Ok(Some(TileFeatures {
-            feature_of_triangle,
-            feature_of_vertex,
+    /// Give primitive `p` its feature tables (and, if it is non-indexed,
+    /// indices) from this tile's raw per-vertex ids. No-op when the primitive
+    /// carries no feature ids.
+    fn attach(&self, bin: Option<&[u8]>, p: &mut ExtractedPrimitive) -> Result<(), String> {
+        let key = (p.mesh_ix, p.prim_ix);
+        match &self.kind {
+            FeatKind::Json(ctx) => {
+                if let Some(ids) = ctx.per_vertex_ids(bin, key.0, key.1)? {
+                    p.set_feature_ids(&ids);
+                }
+            }
+            FeatKind::Prepared(prims) => {
+                if let Ok(i) = prims.binary_search_by_key(&key, |(k, _)| *k) {
+                    p.set_feature_ids(&prims[i].1);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The pick table of a primitive whose tables are built, taken out of it.
+    fn take_features(&self, p: &mut ExtractedPrimitive) -> Option<TileFeatures> {
+        Some(TileFeatures {
+            feature_of_triangle: p.feature_of_triangle.take()?,
             node_of_feature: self.node_of_feature.clone(),
-        }))
+        })
     }
 }
 
@@ -844,35 +836,36 @@ fn decode_primitive(
         uvs: reader.read_tex_coords(0).map(|tc| tc.into_f32().collect()),
         colors: reader.read_colors(0).map(|c| c.into_rgba_f32().collect()),
         indices: reader.read_indices().map(|ix| ix.into_u32().collect()),
+        ..Default::default()
     };
+    buffers.bounds = bounds_of(&buffers.positions);
 
-    // T8: per-feature picking — derive feature_of_triangle from `_FEATURE_ID_0`
-    // (raw JSON) in the SAME index order as the mesh below.
+    // T8: per-feature picking — the tables from `_FEATURE_ID_0` (raw JSON) in
+    // the SAME index order as the mesh below.
     let features = match feat {
-        Some(ctx) => ctx.for_primitive(
-            blob,
-            mesh_ix,
-            buffers.prim_ix,
-            buffers.indices.as_deref(),
-            buffers.positions.len(),
-        )?,
+        Some(ctx) => {
+            ctx.attach(blob, &mut buffers)?;
+            ctx.take_features(&mut buffers)
+        }
         None => None,
     };
 
-    let mesh = mesh_from_buffers(&mut buffers, features.as_ref());
+    let mesh = mesh_from_buffers(&mut buffers);
     let material = decode_material(&primitive.material(), blob)?;
     Ok(DecodedPrimitive {
         transform,
         mesh,
         material,
         features,
+        bounds: buffers.bounds,
     })
 }
 
 /// Build one `Mesh` from plain typed vertex buffers — the ONE place a tile
 /// mesh is assembled, shared by the inline `gltf` route and the off-thread
-/// extracted route (S5). Consumes the buffers (`take`), so nothing is copied.
-fn mesh_from_buffers(p: &mut ExtractedPrimitive, features: Option<&TileFeatures>) -> Mesh {
+/// extracted route (S5). Consumes the buffers (`take`), so nothing is copied:
+/// the feature UV1 the worker built is moved in as-is.
+fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
     let vertex_count = p.positions.len();
     let has_uv0 = p.uvs.is_some();
     let mut mesh = Mesh::new(
@@ -887,8 +880,8 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive, features: Option<&TileFeatures>
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     }
     // Feature ids ride UV1 so a host material can tint per feature in the
-    // fragment stage (see `TileFeatures::feature_of_vertex`).
-    if let Some(f) = features {
+    // fragment stage (see [`TileFeatures`]).
+    if let Some(uv1) = p.feature_uv1.take() {
         // UV1 WITHOUT UV0 is a combination bevy 0.18's pbr shader never
         // handles: `pbr_fragment.wgsl` declares `var uv` only under
         // VERTEX_UVS_A but references it in VERTEX_UVS-gated code (defined by
@@ -898,8 +891,6 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive, features: Option<&TileFeatures>
         if !has_uv0 {
             mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32, 0.0]; vertex_count]);
         }
-        let mut uv1: Vec<[f32; 2]> = Vec::with_capacity(f.feature_of_vertex.len());
-        uv1.extend(f.feature_of_vertex.iter().map(|&id| [id, 0.0]));
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1);
     }
     if let Some(colors) = p.colors.take() {
@@ -941,15 +932,15 @@ fn items_from_extracted(
     let mut out = Vec::with_capacity(primitives.len());
     for p in &mut primitives {
         let features = match feat {
-            // `bin` is unused for a prepared feature source (the ids are
-            // already materialized) — there is no BIN chunk on this route.
-            Some(ctx) => ctx.for_primitive(
-                None,
-                p.mesh_ix,
-                p.prim_ix,
-                p.indices.as_deref(),
-                p.positions.len(),
-            )?,
+            Some(ctx) => {
+                // The worker built the tables (prepare 0.3). A hook that sends
+                // only the raw ids (the 0.2 shape) gets them built here. `bin`
+                // is unused for a prepared source: there is no BIN on this route.
+                if p.feature_uv1.is_none() {
+                    ctx.attach(None, p)?;
+                }
+                ctx.take_features(p)
+            }
             None => None,
         };
         // No material index = the glTF default material, which is what the
@@ -960,12 +951,14 @@ fn items_from_extracted(
             .copied()
             .unwrap_or_default();
         let transform = Mat4::from_cols_array(&p.transform);
-        let mesh = mesh_from_buffers(p, features.as_ref());
+        let bounds = p.bounds.or_else(|| bounds_of(&p.positions));
+        let mesh = mesh_from_buffers(p);
         out.push(DecodedItem::Mesh(Box::new(DecodedPrimitive {
             transform,
             mesh,
             material: material_from_extracted(&material),
             features,
+            bounds,
         })));
     }
     Ok(out)
@@ -1835,6 +1828,30 @@ mod tests {
     /// tri 0 → feature 0, tri 1 → feature 1, node paths
     /// `["AlphaModule", "BetaModule/sub"]`.
     fn feature_fixture() -> Vec<u8> {
+        feature_glb(true, true)
+    }
+
+    /// The per-vertex feature ids a decoded mesh carries (`ATTRIBUTE_UV_1`'s
+    /// first component), the only place they live since 0.5.
+    fn feature_ids_of(mesh: &Mesh) -> Vec<f32> {
+        match mesh.attribute(Mesh::ATTRIBUTE_UV_1) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x2(v)) => {
+                assert!(v.iter().all(|uv| uv[1] == 0.0), "UV1 is [fid, 0]");
+                v.iter().map(|uv| uv[0]).collect()
+            }
+            other => panic!("feature UV1 missing or mistyped: {other:?}"),
+        }
+    }
+
+    /// [`feature_fixture`] with no `indices`: a NON-indexed TRIANGLES primitive
+    /// (vertices `3t..3t+3` are triangle `t`). `with_ids = false` also drops the
+    /// primitive's `EXT_mesh_features`, leaving the tile-level table: the
+    /// control for "only FEATURE primitives get synthesized indices".
+    fn non_indexed_feature_fixture(with_ids: bool) -> Vec<u8> {
+        feature_glb(false, with_ids)
+    }
+
+    fn feature_glb(indexed: bool, with_ids: bool) -> Vec<u8> {
         let positions: [[f32; 3]; 6] = [
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -1913,6 +1930,14 @@ mod tests {
                 }]
             }}
         });
+        let mut json = json;
+        let prim = json["meshes"][0]["primitives"][0].as_object_mut().unwrap();
+        if !indexed {
+            prim.remove("indices");
+        }
+        if !with_ids {
+            prim.remove("extensions");
+        }
         assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin)
     }
 
@@ -1932,14 +1957,9 @@ mod tests {
             &**feats.node_of_feature,
             &["AlphaModule".to_string(), "BetaModule/sub".to_string()]
         );
-        // Per-vertex ids are kept AND written onto the mesh as UV1, so a host
+        // Per-vertex ids are written onto the mesh as UV1, so a host
         // feature-tint material can read them in the fragment stage (0.1.7).
-        assert_eq!(feats.feature_of_vertex, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
-        let uv1 = p
-            .mesh
-            .attribute(Mesh::ATTRIBUTE_UV_1)
-            .expect("feature ids as UV1");
-        assert_eq!(uv1.len(), 6);
+        assert_eq!(feature_ids_of(&p.mesh), [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
         // This fixture has no TEXCOORD_0 — UV1 without UV0 kills pipeline
         // creation in bevy's pbr shader (`uv` only declared under
         // VERTEX_UVS_A), so the decode must backfill zero UV0s (0.1.8).
@@ -1948,6 +1968,55 @@ mod tests {
             .attribute(Mesh::ATTRIBUTE_UV_0)
             .expect("zero UV0 backfilled alongside feature UV1");
         assert_eq!(uv0.len(), 6);
+    }
+
+    /// Hiding a feature rewrites its triangles' INDICES, so every feature
+    /// primitive has to be indexed. A non-indexed one gets U32 indices `0..n` on
+    /// every route (inline, prepared GLB, extracted): the same triangles in the
+    /// same order, now addressable. A primitive without feature ids keeps
+    /// whatever the glTF has.
+    #[test]
+    fn non_indexed_feature_primitive_gets_sequential_u32_indices() {
+        use bevy::tasks::block_on;
+
+        for with_ids in [true, false] {
+            let glb = non_indexed_feature_fixture(with_ids);
+            // The extracted arm below really is the extracted route.
+            assert!(
+                prepare_tile_extracting(&glb, false)
+                    .unwrap()
+                    .is_some_and(|p| p.meshes.is_some()),
+                "fixture must extract"
+            );
+            for (route, tile) in [
+                ("inline", block_on(decode_tile(&glb, false))),
+                (
+                    "prepared glb",
+                    block_on(decode_tile_with(&glb, false, Some(&canned_hook()))),
+                ),
+                (
+                    "extracted",
+                    block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook()))),
+                ),
+            ] {
+                let tile = tile.expect(route);
+                let DecodedItem::Mesh(p) = &tile.items[0] else {
+                    panic!("{route}: expected mesh")
+                };
+                if !with_ids {
+                    assert!(p.mesh.indices().is_none(), "{route}: no ids, no indices");
+                    assert!(p.features.is_none(), "{route}");
+                    continue;
+                }
+                assert!(
+                    matches!(p.mesh.indices(), Some(Indices::U32(_))),
+                    "{route}: U32 indices"
+                );
+                assert_eq!(indices_u32(&p.mesh), Some((0..6).collect()), "{route}");
+                let f = p.features.as_ref().expect(route);
+                assert_eq!(f.feature_of_triangle, vec![0, 1], "{route}");
+            }
+        }
     }
 
     /// A GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,
@@ -2018,6 +2087,7 @@ mod tests {
             mesh,
             material: DecodedMaterial::default(),
             features: None,
+            bounds: None,
         }))];
         assert_eq!(resident_cost_bytes(&items), 36 + 24 + 12);
     }
@@ -2086,15 +2156,16 @@ mod tests {
                 my.base_color_ktx2.is_some(),
                 "pending ktx2 presence"
             );
+            // Per-vertex feature ids are UV1, compared byte-for-byte above.
             match (&x.features, &y.features) {
                 (None, None) => {}
                 (Some(fx), Some(fy)) => {
                     assert_eq!(fx.feature_of_triangle, fy.feature_of_triangle);
-                    assert_eq!(fx.feature_of_vertex, fy.feature_of_vertex);
                     assert_eq!(fx.node_of_feature, fy.node_of_feature);
                 }
                 _ => panic!("feature presence differs between paths"),
             }
+            assert_eq!(x.bounds, y.bounds, "bounds");
         }
     }
 
@@ -2146,6 +2217,7 @@ mod tests {
         };
         let f = p.features.as_ref().expect("features decoded via hook");
         assert_eq!(f.feature_of_triangle, vec![0, 1]);
+        assert_eq!(feature_ids_of(&p.mesh), [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
     }
 
     /// S4 gate test (b): a declining hook (`Ok(None)` — the Draco/splat
@@ -2368,11 +2440,86 @@ mod tests {
             .as_ref()
             .expect("features on the extracted route");
         assert_eq!(f.feature_of_triangle, vec![0, 1]);
-        assert_eq!(f.feature_of_vertex, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
-        // UV1 (feature ids) + the backfilled zero UV0 come from the SHARED
-        // mesh builder, so they must be on this route too.
-        assert!(p.mesh.attribute(Mesh::ATTRIBUTE_UV_1).is_some());
+        // UV1 (feature ids, built by the worker) + the backfilled zero UV0
+        // (the shared mesh builder) must be on this route too.
+        assert_eq!(feature_ids_of(&p.mesh), [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
         assert!(p.mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_some());
+    }
+
+    /// The worker builds the feature tables; the main thread only MOVES them
+    /// onto the mesh. Hand the extracted route tables no recompute could
+    /// produce (features 7 and 9), next to the raw per-vertex ids a 0.4
+    /// consumer recomputed them from: the mesh UV1 and the pick table must be
+    /// the provided ones.
+    #[test]
+    fn extracted_route_uses_worker_feature_tables() {
+        use bevy::mesh::VertexAttributeValues;
+        use bevy::tasks::block_on;
+
+        let glb = feature_fixture();
+        let mut prepared = prepare_tile_extracting(&glb, false)
+            .unwrap()
+            .expect("accepted");
+        let uv1 = vec![[7.0f32, 0.0]; 6];
+        let by_triangle = vec![9u32, 7];
+        let p = &mut prepared.meshes.as_mut().expect("extracted").primitives[0];
+        p.feature_uv1 = Some(uv1.clone());
+        p.feature_of_triangle = Some(by_triangle.clone());
+        prepared.features.as_mut().expect("features").vertex_ids =
+            vec![((0, 0), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])];
+
+        let tile = block_on(decode_prepared(prepared, glb.len() as u64)).expect("decode");
+        let DecodedItem::Mesh(p) = &tile.items[0] else {
+            panic!("expected mesh")
+        };
+        match p.mesh.attribute(Mesh::ATTRIBUTE_UV_1) {
+            Some(VertexAttributeValues::Float32x2(v)) => assert_eq!(v, &uv1),
+            other => panic!("UV1 missing or mistyped: {other:?}"),
+        }
+        let f = p.features.as_ref().expect("features");
+        assert_eq!(f.feature_of_triangle, by_triangle);
+    }
+
+    /// Every route hands spawn a decode-time AABB equal to the mesh's own
+    /// position min/max (the extracted route computes it off-thread). The
+    /// parity lattice compares it across routes; this pins its value.
+    #[test]
+    fn bounds_match_mesh_min_max() {
+        use bevy::math::Vec3;
+        use bevy::tasks::block_on;
+
+        for glb in [
+            feature_fixture(),
+            nested_transform_fixture(),
+            meshopt_fixture(),
+        ] {
+            for (route, tile) in [
+                ("inline", block_on(decode_tile(&glb, false))),
+                (
+                    "prepared glb",
+                    block_on(decode_tile_with(&glb, false, Some(&canned_hook()))),
+                ),
+                (
+                    "extracted",
+                    block_on(decode_tile_with(&glb, false, Some(&canned_extract_hook()))),
+                ),
+            ] {
+                for item in tile.expect(route).items {
+                    let DecodedItem::Mesh(p) = item else {
+                        panic!("{route}: expected mesh")
+                    };
+                    let pos = p.mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap();
+                    let pos = pos.as_float3().unwrap();
+                    let (lo, hi) = pos
+                        .iter()
+                        .map(|&v| Vec3::from(v))
+                        .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), v| {
+                            (lo.min(v), hi.max(v))
+                        });
+                    assert_eq!(p.bounds, Some([lo.to_array(), hi.to_array()]), "{route}");
+                }
+            }
+        }
     }
 
     /// S5 gate test (b), the decline lattice: content the extraction cannot
