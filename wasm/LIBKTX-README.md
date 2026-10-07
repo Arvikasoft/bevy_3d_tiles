@@ -12,5 +12,5 @@ decision), so we transcode in JS exactly like the Draco shim. Native builds use
 bevy's `basis-universal` feature instead (C++ compiles fine off-wasm).
 
 To update: download the matching `-Web-libktx_read.zip` from the KTX-Software
-release and replace both files (keep the version in sync with the `ktx` CLI in
-`infra/blender-service/Dockerfile`).
+release and replace both files (keep the version in sync with the `ktx` CLI
+that encodes your KTX2 textures).

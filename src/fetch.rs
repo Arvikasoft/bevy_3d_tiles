@@ -3,9 +3,9 @@
 //! Adapts the basemap fetch layer's discipline to tile streaming:
 //!
 //! * **Never block the executor** — every wasm operation `.await`s a JS future
-//!   inside a `spawn_local` task (the `run_background_task` grey-screen lesson;
-//!   see `bevy-client/CLAUDE.md`). Results drain into the ECS per frame over a
-//!   crossbeam channel.
+//!   inside a `spawn_local` task (a task that awaits forever starves bevy's own
+//!   asset futures on the single wasm thread). Results drain into the ECS per
+//!   frame over a crossbeam channel.
 //! * **Range requests against a single blob URL** — the `.3tz` reader
 //!   ([`super::archive`]) issues byte-range reads ([`ByteSource::read`]);
 //!   exploded tilesets fetch whole entries ([`ByteSource::read_all_abortable`] /
