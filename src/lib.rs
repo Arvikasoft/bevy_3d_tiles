@@ -3687,6 +3687,8 @@ mod tests {
 
     /// One untextured-or-textured triangle primitive with `material`.
     fn plain_prim(material: content::DecodedMaterial) -> DecodedItem {
+        // Irrefutable with neither `points` nor `splats` (one variant).
+        #[allow(irrefutable_let_patterns)]
         let DecodedItem::Mesh(mut p) = feature_prim(&Arc::default()) else {
             unreachable!()
         };
@@ -4085,26 +4087,44 @@ mod tests {
         use bevy::ecs::schedule::SingleThreadedExecutor;
         use bevy::log::tracing;
         use bevy::log::tracing_subscriber::{self, Layer, layer::Context, prelude::*};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::cell::Cell;
 
-        /// Counts this crate's events at INFO and at DEBUG.
-        struct Count(Arc<[AtomicUsize; 2]>);
+        thread_local! {
+            /// `[info, debug]` counts of this crate's events, `None` = not armed.
+            static COUNTS: Cell<Option<[usize; 2]>> = const { Cell::new(None) };
+        }
+        struct Count;
         impl<S: tracing::Subscriber> Layer<S> for Count {
             fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
                 let m = event.metadata();
                 if !m.target().starts_with("bevy_3d_tiles") {
                     return;
                 }
-                match *m.level() {
-                    tracing::Level::INFO => self.0[0].fetch_add(1, Ordering::SeqCst),
-                    tracing::Level::DEBUG => self.0[1].fetch_add(1, Ordering::SeqCst),
-                    _ => 0,
-                };
+                COUNTS.with(|c| {
+                    if let Some(mut n) = c.get() {
+                        match *m.level() {
+                            tracing::Level::INFO => n[0] += 1,
+                            tracing::Level::DEBUG => n[1] += 1,
+                            _ => {}
+                        }
+                        c.set(Some(n));
+                    }
+                });
             }
         }
+        // A GLOBAL subscriber that counts only on the armed thread. Not a
+        // scoped `with_default`: tracing caches each callsite's interest
+        // process-wide, and while only one dispatcher exists a callsite first
+        // reached on ANOTHER test thread (no subscriber there) is cached as
+        // "never", which zeroed the DEBUG count in ~40% of parallel runs.
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ =
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Count));
+        });
 
         let mut app = despawn_test_app(test_config());
-        // On the calling thread, so the scoped subscriber below sees drive's events.
+        // On the calling thread, so the thread-local counter sees drive's events.
         app.edit_schedule(Update, |s| {
             s.set_executor(SingleThreadedExecutor::new());
         });
@@ -4117,21 +4137,18 @@ mod tests {
         app.update();
         app.update();
 
-        let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
-        let subscriber = tracing_subscriber::registry().with(Count(counts.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
-            app.update();
-            app.update();
-        });
+        // A callsite whose registration raced the install gets its interest
+        // recomputed against the global subscriber.
+        tracing::callsite::rebuild_interest_cache();
+        COUNTS.with(|c| c.set(Some([0, 0])));
+        move_camera(&mut app, cam, Vec3::new(0.0, 0.0, 60_000.0));
+        app.update();
+        app.update();
+        let [info, debug] = COUNTS.with(Cell::take).expect("armed");
         assert_eq!(visible_tiles(&app), vec![0], "the cut really changed");
-        assert_eq!(
-            counts[0].load(Ordering::SeqCst),
-            0,
-            "a cut change logs nothing at INFO"
-        );
+        assert_eq!(info, 0, "a cut change logs nothing at INFO");
         assert!(
-            counts[1].load(Ordering::SeqCst) > 0,
+            debug > 0,
             "the cut change is still logged, at DEBUG (and the counter is wired)"
         );
     }
