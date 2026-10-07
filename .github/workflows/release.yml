@@ -68,8 +68,10 @@ jobs:
           # distribution channel and a library has no binaries to attach. Link
           # there instead. The release note is the ANNOTATED TAG's message, so
           # it lives with the tag and there is no CHANGELOG file to rot; a
-          # lightweight tag just falls back to the commit range.
-          NOTE=$(git for-each-ref --format='%(contents)' "refs/tags/$VERSION" | head -c 1500)
+          # lightweight tag just falls back to the commit range. 3500 bytes keeps
+          # a full release note (0.5.0's is ~2.3 KB) plus the links below under
+          # Discord's 4096-character embed description limit.
+          NOTE=$(git for-each-ref --format='%(contents)' "refs/tags/$VERSION" | head -c 3500)
           PREV=$(git describe --tags --abbrev=0 "$VERSION^" 2>/dev/null || true)
           if [ -n "$PREV" ]; then
             RANGE="https://github.com/Arvikasoft/bevy_3d_tiles/compare/$PREV...$VERSION"

@@ -16,6 +16,9 @@
 //!   spawning discipline.
 //! * [`content`] — tile GLB → mesh / point / splat data (plan D5: one
 //!   decoder, three renderers).
+//! * [`pick`] — what a host reads and steers instead of tile meshes, which
+//!   are `RENDER_WORLD`-only: the CPU pick copy on every tile mesh entity
+//!   ([`TilePickMesh`]) and crate-owned feature hiding ([`HiddenTileFeatures`]).
 //! * this module — ECS wiring: per-frame selection, the request scheduler
 //!   (priorities recomputed each frame, out-of-cut requests aborted),
 //!   time-boxed content spawning, visibility cut, eviction, and the
@@ -64,6 +67,12 @@ pub mod ktx2;
 pub mod pick;
 pub mod schema;
 pub mod traversal;
+
+// The README's Rust blocks compile as doctests, so the quickstart cannot drift
+// from the API (it used `..default()` on `Tiles3dAttach` before 0.5 had one).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 // The bevy-free CPU half of tile decode (offthread-decode plan S4) — split
 // into the sibling `bevy_3d_tiles_prepare` crate so a host worker can link it

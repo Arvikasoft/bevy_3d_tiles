@@ -201,7 +201,6 @@ mining site with ~450 resident tiles). Breaking changes:
   material and in every pass), skipped by `TilePickMesh` — and triangle ordinals
   never change, so `TileFeaturePick` lookups stay valid. Hiding a whole
   featureless tile is still yours (remove its `Mesh3d`).
-
 - **The `TilePrepareHook` closure receives `&[u8]`, not `Vec<u8>`.**
   `TilePrepareFn` is `for<'a> Fn(&'a [u8], bool) -> Pin<Box<dyn Future<…> + 'a>>`
   (plus `Send`/`Sync` on native): the future may borrow the fetched bytes, which
