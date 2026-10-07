@@ -261,8 +261,11 @@ mining site with ~450 resident tiles). Breaking changes:
   triangles whose padded bounds the ray touches, in the same order with the
   same ordinals and hidden mask, and `raycast()` uses it. A picker that runs its
   own triangle test over `for_each_visible_triangle` can switch for the same
-  nearest hit. The bounds are built on a copy's first ray (24 B per 64
-  triangles) and counted in `resident_cpu_bytes()` from the start.
+  nearest hit (grazing rays aside; the test must reject a triangle with a NaN
+  coordinate, as Möller–Trumbore does). The bounds are built on a copy's first
+  ray (24 B per 64 triangles) and counted in `resident_cpu_bytes()` from the
+  start, so that figure is an upper bound: it includes copies no ray has
+  reached yet.
 - **Tile `StandardMaterial`s are shared.** Every untextured primitive with the
   same PBR factors (base color, metallic, roughness, unlit, double-sided) uses
   ONE material, across tiles and tilesets, so their draws share a bind group and

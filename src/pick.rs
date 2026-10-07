@@ -139,12 +139,15 @@ impl TilePickMesh {
     /// [`Self::for_each_visible_triangle`] restricted to the runs of 64
     /// triangles whose padded bounds the ray `origin + t·dir, t ≥ 0` touches.
     /// Same order, same pristine ordinals, same hidden mask: runs are only
-    /// skipped, never reordered. A skipped run's box misses the ray by more
-    /// than a coordinate-relative epsilon (`1e-5 · max|coord| + 1e-6`), so a
-    /// nearest-hit search over this walk equals one over the full walk except,
-    /// at most, at Möller–Trumbore's own float-noise level on grazing rays
-    /// (the same exposure as an unpadded per-entity AABB test in front of the
-    /// walk). The bounds are built on the first call, O(triangles), and
+    /// skipped, never reordered. Each box is grown by
+    /// `1e-5 · (max|box coord| + max|origin coord|) + 1e-6`, above the float
+    /// noise of both the slab test and Möller–Trumbore, which grows with the
+    /// coordinates and with the origin's distance. So a nearest-hit search
+    /// over this walk equals one over the full walk except on grazing rays,
+    /// where Möller–Trumbore's own answer is float noise. A triangle with
+    /// a NaN coordinate is left out of the bounds: the triangle test must
+    /// reject it, as Möller–Trumbore's range checks do. The bounds are built on
+    /// the first call, one O(triangles) pass cheaper than one full walk, and
     /// counted in the pick copy's bytes from construction.
     /// Holds the mask's read lock for the walk; don't call back into the crate.
     pub fn for_each_visible_triangle_on_ray(
@@ -157,8 +160,11 @@ impl TilePickMesh {
         let hidden = self.read();
         let n = self.pristine_triangle_count();
         let (o, d) = (local_origin.to_array(), local_dir.to_array());
+        // The origin's share of the pad: slab and Möller–Trumbore rounding
+        // grow with `|o - box|`, not with the box's own coordinates.
+        let e = 1e-5 * o.iter().fold(0f32, |m, x| m.max(x.abs()));
         for (c, b) in chunks.iter().enumerate() {
-            if ray_touches(o, d, b) {
+            if ray_touches(o, d, b, e) {
                 let start = c * PICK_CHUNK_TRIS;
                 let end = (start + PICK_CHUNK_TRIS).min(n);
                 self.walk(start..end, &hidden.features, &mut f);
@@ -191,35 +197,21 @@ impl TilePickMesh {
         }
     }
 
-    /// Exact bounds of each run of [`PICK_CHUNK_TRIS`] pristine triangles
-    /// (out-of-range vertices skipped), padded by `1e-5 · max|coord| + 1e-6`.
-    /// A run with a non-finite vertex, or none in range, is all of space.
+    /// [`run_bounds`] of each run of [`PICK_CHUNK_TRIS`] pristine triangles,
+    /// out-of-range vertices skipped.
     fn build_chunks(&self) -> Box<[[[f32; 3]; 2]]> {
-        const ALL: [[f32; 3]; 2] = [[f32::NEG_INFINITY; 3], [f32::INFINITY; 3]];
-        let n = self.pristine_triangle_count();
-        let pos = self.positions();
-        (0..n.div_ceil(PICK_CHUNK_TRIS))
-            .map(|c| {
-                let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-                let start = c * PICK_CHUNK_TRIS;
-                for t in start..(start + PICK_CHUNK_TRIS).min(n) {
-                    for p in self.tri(t).iter().filter_map(|&v| pos.get(v as usize)) {
-                        if !p.iter().all(|x| x.is_finite()) {
-                            return ALL;
-                        }
-                        for (i, &x) in p.iter().enumerate() {
-                            lo[i] = lo[i].min(x);
-                            hi[i] = hi[i].max(x);
-                        }
-                    }
-                }
-                if lo[0] > hi[0] {
-                    return ALL;
-                }
-                let pad = 1e-5 * lo.iter().chain(&hi).fold(0f32, |m, x| m.max(x.abs())) + 1e-6;
-                [lo.map(|x| x - pad), hi.map(|x| x + pad)]
-            })
-            .collect()
+        let (pos, n) = (self.positions(), self.pristine_triangle_count() * 3);
+        let run = PICK_CHUNK_TRIS * 3;
+        match &self.0.indices {
+            Some(ix) => ix[..n]
+                .chunks(run)
+                .map(|vs| run_bounds(vs.iter().filter_map(|&v| pos.get(v as usize))))
+                .collect(),
+            None => pos[..n]
+                .chunks(run)
+                .map(|vs| run_bounds(vs.iter()))
+                .collect(),
+        }
     }
 
     /// Nearest visible hit of a ray in mesh-local space: `(t, pristine
@@ -316,20 +308,47 @@ fn cut(indices: &[u32], feature_of_triangle: &[u32], mask: &[u64]) -> Arc<[u32]>
     out.into()
 }
 
-/// Does the ray `o + t·d, t ≥ 0` touch the box `[lo, hi]`? Slab test by
-/// division (exact for a tiny `d[i]`); a zero `d[i]` passes its axis iff `o[i]`
-/// lies in `[lo[i], hi[i]]`, so an axis-parallel ray never meets `0 · ∞`. NaN
+/// Bounds of one run's vertices, padded by `1e-5 · max|coord| + 1e-6`; all of
+/// space when a coordinate is infinite or no vertex is given. A NaN coordinate
+/// never wins a compare, so it is left out: no triangle with a NaN coordinate
+/// can be hit (every Möller–Trumbore comparison against NaN fails). Six scalar
+/// compare-selects per vertex: `f32::min`/`max` and an indexed `[f32; 3]` loop
+/// cost wasm32 about 3x as much (NaN-aware sequences, stack round trips).
+fn run_bounds<'a>(vertices: impl Iterator<Item = &'a [f32; 3]>) -> [[f32; 3]; 2] {
+    let [mut lx, mut ly, mut lz] = [f32::INFINITY; 3];
+    let [mut hx, mut hy, mut hz] = [f32::NEG_INFINITY; 3];
+    for &[x, y, z] in vertices {
+        lx = if x < lx { x } else { lx };
+        ly = if y < ly { y } else { ly };
+        lz = if z < lz { z } else { lz };
+        hx = if x > hx { x } else { hx };
+        hy = if y > hy { y } else { hy };
+        hz = if z > hz { z } else { hz };
+    }
+    let (lo, hi) = ([lx, ly, lz], [hx, hy, hz]);
+    if !lo.iter().chain(&hi).all(|x| x.is_finite()) {
+        return [[f32::NEG_INFINITY; 3], [f32::INFINITY; 3]];
+    }
+    let pad = 1e-5 * lo.iter().chain(&hi).fold(0f32, |m, x| m.max(x.abs())) + 1e-6;
+    [lo.map(|x| x - pad), hi.map(|x| x + pad)]
+}
+
+/// Does the ray `o + t·d, t ≥ 0` touch the box `[lo, hi]` grown by `e` on
+/// every side? Slab test by division (exact for a tiny `d[i]`); a zero `d[i]`
+/// passes its axis iff `o[i]` lies in the grown range, so an axis-parallel ray
+/// never meets `0 · ∞`. NaN
 /// reads as a touch: `f32::max`/`min` drop a NaN slab bound (so `enter` and
 /// `exit` are never NaN), and a NaN comparison never rejects.
-fn ray_touches(o: [f32; 3], d: [f32; 3], [lo, hi]: &[[f32; 3]; 2]) -> bool {
+fn ray_touches(o: [f32; 3], d: [f32; 3], [lo, hi]: &[[f32; 3]; 2], e: f32) -> bool {
     let (mut enter, mut exit) = (0.0f32, f32::INFINITY);
     for (i, &di) in d.iter().enumerate() {
+        let (lo, hi) = (lo[i] - e, hi[i] + e);
         if di == 0.0 {
-            if o[i] < lo[i] || o[i] > hi[i] {
+            if o[i] < lo || o[i] > hi {
                 return false;
             }
         } else {
-            let (a, b) = ((lo[i] - o[i]) / di, (hi[i] - o[i]) / di);
+            let (a, b) = ((lo - o[i]) / di, (hi - o[i]) / di);
             enter = enter.max(a.min(b));
             exit = exit.min(a.max(b));
         }
@@ -805,18 +824,22 @@ mod tests {
             );
 
             // The `dir[i] == 0` arm: a downward probe starting exactly on a
-            // run's padded x or z plane still visits that run.
+            // run's grown x or z plane still visits that run. `y` is the
+            // origin's largest coordinate, so its share of the pad is `1e-5 · y`.
             let chunks = pick.0.chunks.get().expect("built by the first ray");
             assert_eq!(chunks.len(), tris / 64);
+            let y = hi.y + 1e4;
+            let e = 1e-5 * y;
             for c in [0, 7, chunks.len() - 1] {
                 let [blo, bhi] = chunks[c];
                 let mid = |i: usize| (blo[i] + bhi[i]) * 0.5;
                 for o in [
-                    Vec3::new(blo[0], hi.y + 5.0, mid(2)),
-                    Vec3::new(bhi[0], hi.y + 5.0, mid(2)),
-                    Vec3::new(mid(0), hi.y + 5.0, blo[2]),
-                    Vec3::new(mid(0), hi.y + 5.0, bhi[2]),
+                    Vec3::new(blo[0] - e, y, mid(2)),
+                    Vec3::new(bhi[0] + e, y, mid(2)),
+                    Vec3::new(mid(0), y, blo[2] - e),
+                    Vec3::new(mid(0), y, bhi[2] + e),
                 ] {
+                    assert_eq!(o.abs().max_element(), y);
                     let d = Vec3::NEG_Y;
                     let mut runs = Vec::new();
                     pick.for_each_visible_triangle_on_ray(o, d, |t, _| runs.push(t / 64));
@@ -831,6 +854,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Slab and Möller–Trumbore rounding grow with the ray's length: rays of
+    /// 5-20 km, scaled, aimed at vertices (a lone triangle's are its run's box
+    /// corners). From far away at a tile near its local origin (the origin's
+    /// share of the pad), and from near the local origin at a triangle 10 km
+    /// out on a diagonal, where rounding in x and y moves the hit sideways (the
+    /// box's share).
+    #[test]
+    fn long_rays_match_brute_force() {
+        let mut rng = Rng(0xFA5);
+        let n = 32;
+        let heights: Vec<f32> = (0..(n + 1) * (n + 1))
+            .map(|_| rng.range(0.0, 4.0))
+            .collect();
+        let (p, ix) = grid(n, |x, z| heights[z * (n + 1) + x]);
+        let lone = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let far = vec![[7e3, 7e3, 0.0], [7000.7, 6999.3, 0.0], [7e3, 7e3, 1.0]];
+        for (name, pick, far_origin) in [
+            ("lone triangle", TilePickMesh::new(lone, None, None), true),
+            ("hilly", TilePickMesh::new(p, Some(ix.into()), None), true),
+            (
+                "triangle 10 km out",
+                TilePickMesh::new(far, None, None),
+                false,
+            ),
+        ] {
+            let pos = pick.positions();
+            let mut hits = 0;
+            for i in 0..4000 {
+                let o = if far_origin {
+                    let (az, el) = (rng.range(0.0, std::f32::consts::TAU), rng.range(0.15, 1.4));
+                    rng.range(5e3, 2e4)
+                        * Vec3::new(el.cos() * az.cos(), el.sin(), el.cos() * az.sin())
+                } else {
+                    Vec3::new(
+                        rng.range(-5.0, 5.0),
+                        rng.range(-5.0, 5.0),
+                        rng.range(-5.0, 5.0),
+                    )
+                };
+                let v = Vec3::from(pos[rng.below(pos.len())]);
+                let d = (v - o) * rng.range(1e-4, 10.0);
+                let got = pick.raycast(o, d).map(|(h, t)| (h.to_bits(), t));
+                assert_eq!(got, brute(&pick, o, d), "{name} {i}: {o} {d}");
+                hits += usize::from(got.is_some());
+            }
+            assert!(hits > 1000, "{name}: only {hits} of 4000 hit");
+        }
+    }
+
+    /// An infinite coordinate, or a run with no vertex in range, makes the
+    /// run all of space; a NaN coordinate is left out of the bounds (no
+    /// triangle test hits its triangle). The walk stays exact either way.
+    #[test]
+    fn non_finite_vertices_keep_the_walk_exact() {
+        const ALL: [[f32; 3]; 2] = [[f32::NEG_INFINITY; 3], [f32::INFINITY; 3]];
+        let (mut p, mut ix) = grid(8, |x, z| ((x * 7 + z * 3) % 5) as f32 * 0.5);
+        // Four 8-cell rows per run of 64 triangles.
+        p[10][0] = f32::NAN; // row 1: run 0
+        p[60][1] = f32::INFINITY; // row 6: run 1
+        ix.extend([1000; 64 * 3]); // run 2: every index out of range
+        let pick = TilePickMesh::new(p.clone(), Some(ix.into()), None);
+        let mut rng = Rng(0x1AF);
+        let mut hits = 0;
+        for _ in 0..2000 {
+            let o = Vec3::new(
+                rng.range(-2.0, 10.0),
+                rng.range(3.0, 9.0),
+                rng.range(-2.0, 10.0),
+            );
+            let d = Vec3::new(rng.range(0.0, 8.0), 0.0, rng.range(0.0, 8.0)) - o;
+            let got = pick.raycast(o, d).map(|(h, t)| (h.to_bits(), t));
+            assert_eq!(got, brute(&pick, o, d), "{o} {d}");
+            hits += usize::from(got.is_some());
+        }
+        assert!(hits > 1000, "only {hits} of 2000 hit");
+        let chunks = pick.0.chunks.get().expect("built");
+        let [lo, hi] = chunks[0];
+        assert!(lo.iter().chain(&hi).all(|x| x.is_finite()), "NaN left out");
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(near(lo[0], 0.0) && near(hi[0], 8.0) && near(lo[2], 0.0) && near(hi[2], 4.0));
+        assert_eq!(chunks[1], ALL, "infinite coordinate");
+        assert_eq!(chunks[2], ALL, "no vertex in range");
     }
 
     #[test]
