@@ -5176,8 +5176,9 @@ mod tests {
 
     #[test]
     fn resident_cpu_bytes_counts_pick_copies() {
-        // 2 triangles = 6 vertices: positions 72 B + indices 24 B.
-        let pick_bytes = 6 * 12 + 6 * 4;
+        // 2 triangles = 6 vertices: positions 72 B + indices 24 B + one
+        // 24 B pick-run box.
+        let pick_bytes = 6 * 12 + 6 * 4 + 24;
         for main_world in [false, true] {
             let mut app = feature_app();
             app.world_mut().resource_mut::<Tiles3dSets>().sets[0].main_world_meshes = main_world;

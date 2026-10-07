@@ -14,7 +14,8 @@
 //! pick copy skips hidden triangles by ordinal instead of holding a cut copy.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use bevy::prelude::*;
 
@@ -40,7 +41,17 @@ pub(crate) struct PickMesh {
     /// [`crate::TileFeaturePick::feature_of_triangle`].
     feature_of_triangle: Option<Arc<[u32]>>,
     hidden: RwLock<Hidden>,
+    /// Padded bounds `[min, max]` of each run of [`PICK_CHUNK_TRIS`] pristine
+    /// triangles, built on the first ray-restricted walk and shared by every
+    /// clone. Hiding never touches it.
+    chunks: OnceLock<Box<[[[f32; 3]; 2]]>>,
 }
+
+/// Triangles per run in [`TilePickMesh::for_each_visible_triangle_on_ray`]:
+/// one padded box per run of this many consecutive triangles, in index order.
+// ponytail: one level. Two-level runs only if a profile shows a
+// multi-million-triangle tile (1 M triangles = ~15.6 k box tests, ~0.3 ms).
+const PICK_CHUNK_TRIS: usize = 64;
 
 /// One bit per local feature id (empty = nothing hidden), and the triangle
 /// count that leaves visible.
@@ -72,6 +83,7 @@ impl TilePickMesh {
                 features: Box::default(),
                 visible_tris: tris,
             }),
+            chunks: OnceLock::new(),
         }))
     }
 
@@ -121,33 +133,104 @@ impl TilePickMesh {
     /// Holds the mask's read lock for the walk; don't call back into the crate.
     pub fn for_each_visible_triangle(&self, mut f: impl FnMut(usize, [u32; 3])) {
         let hidden = self.read();
-        let mask = &hidden.features;
-        let p = &self.0;
-        for t in 0..self.pristine_triangle_count() {
-            if !mask.is_empty()
-                && let Some(fot) = &p.feature_of_triangle
-                && fot.get(t).is_some_and(|&fid| bit(mask, fid))
-            {
-                continue;
+        self.walk(0..self.pristine_triangle_count(), &hidden.features, &mut f);
+    }
+
+    /// [`Self::for_each_visible_triangle`] restricted to the runs of 64
+    /// triangles whose padded bounds the ray `origin + t·dir, t ≥ 0` touches.
+    /// Same order, same pristine ordinals, same hidden mask: runs are only
+    /// skipped, never reordered. A skipped run's box misses the ray by more
+    /// than a coordinate-relative epsilon (`1e-5 · max|coord| + 1e-6`), so a
+    /// nearest-hit search over this walk equals one over the full walk except,
+    /// at most, at Möller–Trumbore's own float-noise level on grazing rays
+    /// (the same exposure as an unpadded per-entity AABB test in front of the
+    /// walk). The bounds are built on the first call, O(triangles), and
+    /// counted in the pick copy's bytes from construction.
+    /// Holds the mask's read lock for the walk; don't call back into the crate.
+    pub fn for_each_visible_triangle_on_ray(
+        &self,
+        local_origin: Vec3,
+        local_dir: Vec3,
+        mut f: impl FnMut(usize, [u32; 3]),
+    ) {
+        let chunks = self.0.chunks.get_or_init(|| self.build_chunks());
+        let hidden = self.read();
+        let n = self.pristine_triangle_count();
+        let (o, d) = (local_origin.to_array(), local_dir.to_array());
+        for (c, b) in chunks.iter().enumerate() {
+            if ray_touches(o, d, b) {
+                let start = c * PICK_CHUNK_TRIS;
+                let end = (start + PICK_CHUNK_TRIS).min(n);
+                self.walk(start..end, &hidden.features, &mut f);
             }
-            let tri = match &p.indices {
-                Some(ix) => [ix[t * 3], ix[t * 3 + 1], ix[t * 3 + 2]],
-                None => {
-                    let v = (t * 3) as u32;
-                    [v, v + 1, v + 2]
-                }
-            };
-            f(t, tri);
         }
     }
 
+    /// `f` over the visible triangles of `range`, in order.
+    fn walk(&self, range: Range<usize>, mask: &[u64], f: &mut impl FnMut(usize, [u32; 3])) {
+        let fot = self
+            .0
+            .feature_of_triangle
+            .as_deref()
+            .filter(|_| !mask.is_empty());
+        for t in range {
+            if fot.is_some_and(|fot| fot.get(t).is_some_and(|&fid| bit(mask, fid))) {
+                continue;
+            }
+            f(t, self.tri(t));
+        }
+    }
+
+    fn tri(&self, t: usize) -> [u32; 3] {
+        match &self.0.indices {
+            Some(ix) => [ix[t * 3], ix[t * 3 + 1], ix[t * 3 + 2]],
+            None => {
+                let v = (t * 3) as u32;
+                [v, v + 1, v + 2]
+            }
+        }
+    }
+
+    /// Exact bounds of each run of [`PICK_CHUNK_TRIS`] pristine triangles
+    /// (out-of-range vertices skipped), padded by `1e-5 · max|coord| + 1e-6`.
+    /// A run with a non-finite vertex, or none in range, is all of space.
+    fn build_chunks(&self) -> Box<[[[f32; 3]; 2]]> {
+        const ALL: [[f32; 3]; 2] = [[f32::NEG_INFINITY; 3], [f32::INFINITY; 3]];
+        let n = self.pristine_triangle_count();
+        let pos = self.positions();
+        (0..n.div_ceil(PICK_CHUNK_TRIS))
+            .map(|c| {
+                let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+                let start = c * PICK_CHUNK_TRIS;
+                for t in start..(start + PICK_CHUNK_TRIS).min(n) {
+                    for p in self.tri(t).iter().filter_map(|&v| pos.get(v as usize)) {
+                        if !p.iter().all(|x| x.is_finite()) {
+                            return ALL;
+                        }
+                        for (i, &x) in p.iter().enumerate() {
+                            lo[i] = lo[i].min(x);
+                            hi[i] = hi[i].max(x);
+                        }
+                    }
+                }
+                if lo[0] > hi[0] {
+                    return ALL;
+                }
+                let pad = 1e-5 * lo.iter().chain(&hi).fold(0f32, |m, x| m.max(x.abs())) + 1e-6;
+                [lo.map(|x| x - pad), hi.map(|x| x + pad)]
+            })
+            .collect()
+    }
+
     /// Nearest visible hit of a ray in mesh-local space: `(t, pristine
-    /// ordinal)`, `t` in units of `local_dir`. Möller–Trumbore over every
-    /// visible triangle (no BVH); out-of-range indices are skipped.
+    /// ordinal)`, `t` in units of `local_dir`. Möller–Trumbore over the
+    /// visible triangles of the runs the ray touches
+    /// ([`Self::for_each_visible_triangle_on_ray`]); out-of-range indices are
+    /// skipped.
     pub fn raycast(&self, local_origin: Vec3, local_dir: Vec3) -> Option<(f32, usize)> {
         let pos = self.positions();
         let mut best: Option<(f32, usize)> = None;
-        self.for_each_visible_triangle(|t, [a, b, c]| {
+        self.for_each_visible_triangle_on_ray(local_origin, local_dir, |t, [a, b, c]| {
             let (Some(a), Some(b), Some(c)) = (
                 pos.get(a as usize),
                 pos.get(b as usize),
@@ -169,10 +252,14 @@ impl TilePickMesh {
         best
     }
 
-    /// Bytes of this copy: positions + pristine indices (the feature table is
-    /// shared with [`crate::TileFeaturePick`] and not counted here).
+    /// Bytes of this copy: positions + pristine indices + the ray-walk run
+    /// bounds (counted from construction, so the figure does not move when
+    /// they are built; the feature table is shared with
+    /// [`crate::TileFeaturePick`] and not counted here).
     pub(crate) fn cpu_bytes(&self) -> u64 {
-        (self.0.positions.len() * 12 + self.0.indices.as_ref().map_or(0, |i| i.len() * 4)) as u64
+        (self.0.positions.len() * 12
+            + self.0.indices.as_ref().map_or(0, |i| i.len() * 4)
+            + self.pristine_triangle_count().div_ceil(PICK_CHUNK_TRIS) * 24) as u64
     }
 
     pub(crate) fn pristine_indices(&self) -> Option<&Arc<[u32]>> {
@@ -227,6 +314,27 @@ fn cut(indices: &[u32], feature_of_triangle: &[u32], mask: &[u64]) -> Arc<[u32]>
         }
     }
     out.into()
+}
+
+/// Does the ray `o + t·d, t ≥ 0` touch the box `[lo, hi]`? Slab test by
+/// division (exact for a tiny `d[i]`); a zero `d[i]` passes its axis iff `o[i]`
+/// lies in `[lo[i], hi[i]]`, so an axis-parallel ray never meets `0 · ∞`. NaN
+/// reads as a touch: `f32::max`/`min` drop a NaN slab bound (so `enter` and
+/// `exit` are never NaN), and a NaN comparison never rejects.
+fn ray_touches(o: [f32; 3], d: [f32; 3], [lo, hi]: &[[f32; 3]; 2]) -> bool {
+    let (mut enter, mut exit) = (0.0f32, f32::INFINITY);
+    for (i, &di) in d.iter().enumerate() {
+        if di == 0.0 {
+            if o[i] < lo[i] || o[i] > hi[i] {
+                return false;
+            }
+        } else {
+            let (a, b) = ((lo[i] - o[i]) / di, (hi[i] - o[i]) / di);
+            enter = enter.max(a.min(b));
+            exit = exit.min(a.max(b));
+        }
+    }
+    enter <= exit
 }
 
 /// Möller–Trumbore; `None` for a miss, a hit behind the origin, or a
@@ -507,5 +615,254 @@ mod tests {
             owners.mask(&[a]).is_empty(),
             "nothing hidden normalizes to empty"
         );
+    }
+
+    /// Seeded splitmix64, uniform in `[0, 1)`.
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f32 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * self.f()
+        }
+        fn below(&mut self, n: usize) -> usize {
+            ((self.f() * n as f32) as usize).min(n - 1)
+        }
+    }
+
+    /// An `n × n` cell grid at `y = height(x, z)`, two triangles per cell, in
+    /// row order (coherent, like a Draco or meshopt index order): one row of
+    /// a 32-cell grid is exactly one run of 64.
+    fn grid(n: usize, height: impl Fn(usize, usize) -> f32) -> (Vec<[f32; 3]>, Vec<u32>) {
+        let w = n + 1;
+        let positions = (0..w * w)
+            .map(|i| [(i % w) as f32, height(i % w, i / w), (i / w) as f32])
+            .collect();
+        let mut indices = Vec::with_capacity(n * n * 6);
+        for z in 0..n {
+            for x in 0..n {
+                let (i, w) = ((z * w + x) as u32, w as u32);
+                indices.extend([i, i + w, i + 1, i + 1, i + w, i + w + 1]);
+            }
+        }
+        (positions, indices)
+    }
+
+    /// The full walk with the same Möller–Trumbore: the pre-run raycast.
+    fn brute(pick: &TilePickMesh, o: Vec3, d: Vec3) -> Option<(u32, usize)> {
+        let pos = pick.positions();
+        let mut best: Option<(f32, usize)> = None;
+        pick.for_each_visible_triangle(|t, [a, b, c]| {
+            let (Some(a), Some(b), Some(c)) = (
+                pos.get(a as usize),
+                pos.get(b as usize),
+                pos.get(c as usize),
+            ) else {
+                return;
+            };
+            if let Some(h) = moller_trumbore(o, d, (*a).into(), (*b).into(), (*c).into())
+                && best.is_none_or(|(bh, _)| h < bh)
+            {
+                best = Some((h, t));
+            }
+        });
+        best.map(|(h, t)| (h.to_bits(), t))
+    }
+
+    #[test]
+    fn chunked_walk_skips_triangles_off_the_ray() {
+        let (positions, indices) = grid(128, |_, _| 0.0);
+        let pick = TilePickMesh::new(positions, Some(indices.into()), None);
+        assert_eq!(pick.pristine_triangle_count(), 32_768);
+        let (o, d) = (Vec3::new(0.25, 10.0, 0.25), Vec3::NEG_Y);
+        let mut seen = Vec::new();
+        pick.for_each_visible_triangle_on_ray(o, d, |t, _| seen.push(t));
+        assert!(
+            seen.len() * 50 < 32_768,
+            "a corner-cell ray visits under 2%, visited {}",
+            seen.len()
+        );
+        assert!(seen.is_sorted(), "index order");
+        assert!(seen.starts_with(&[0, 1]), "the corner cell's triangles");
+        assert_eq!(pick.raycast(o, d).map(|(_, t)| t), Some(0));
+        assert_eq!(
+            pick.raycast(o, d).map(|(h, t)| (h.to_bits(), t)),
+            brute(&pick, o, d)
+        );
+    }
+
+    #[test]
+    fn chunked_raycast_matches_brute_force() {
+        let mut rng = Rng(0x5EED);
+        let n = 32;
+        let heights: Vec<f32> = (0..(n + 1) * (n + 1))
+            .map(|_| rng.range(0.0, 4.0))
+            .collect();
+        let hilly = || grid(n, |x, z| heights[z * (n + 1) + x]);
+        let tris = n * n * 2;
+
+        let mut meshes: Vec<(&str, TilePickMesh)> = Vec::new();
+        let (p, ix) = hilly();
+        meshes.push(("hilly", TilePickMesh::new(p, Some(ix.into()), None)));
+        let (p, ix) = grid(n, |_, _| 2.5);
+        meshes.push(("flat", TilePickMesh::new(p, Some(ix.into()), None)));
+        let (p, ix) = hilly();
+        let mut order: Vec<[u32; 3]> = ix.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.below(i + 1));
+        }
+        let shuffled = order.concat();
+        meshes.push((
+            "shuffled",
+            TilePickMesh::new(p, Some(shuffled.into()), None),
+        ));
+        let (p, ix) = hilly();
+        let fot: Vec<u32> = (0..tris as u32).map(|t| t / 37 % 9).collect();
+        meshes.push((
+            "hidden",
+            TilePickMesh::from_parts(p, Some(ix), Some(fot.into()), &[2, 5]),
+        ));
+        let (p, ix) = hilly();
+        let expanded = ix.iter().map(|&i| p[i as usize]).collect();
+        meshes.push(("non-indexed", TilePickMesh::new(expanded, None, None)));
+        let (p, ix) = hilly();
+        let far = p
+            .iter()
+            .map(|v| [v[0] + 1000.0, v[1] - 400.0, v[2] + 2500.0]);
+        meshes.push((
+            "offset",
+            TilePickMesh::new(far.collect(), Some(ix.into()), None),
+        ));
+
+        for (name, pick) in &meshes {
+            let pos = pick.positions();
+            let (lo, hi) = pos
+                .iter()
+                .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), &p| {
+                    (lo.min(p.into()), hi.max(p.into()))
+                });
+            // Sample above and below even a flat tile, not only in its plane.
+            let (lo, hi) = (lo - Vec3::Y * 2.0, hi + Vec3::Y * 2.0);
+            let span = hi - lo;
+            let pt = |rng: &mut Rng, pad: f32| {
+                lo - span * pad + span * (1.0 + 2.0 * pad) * Vec3::new(rng.f(), rng.f(), rng.f())
+            };
+            let vertex = |rng: &mut Rng| Vec3::from(pos[rng.below(pos.len())]);
+            let mut rays: Vec<(&str, Vec3, Vec3)> = Vec::new();
+            for _ in 0..150 {
+                let (o, target) = (pt(&mut rng, 0.3), pt(&mut rng, 0.0));
+                rays.push(("random", o, (target - o) * rng.range(0.01, 3.0)));
+            }
+            for _ in 0..100 {
+                let o = pt(&mut rng, 0.0).with_y(hi.y + 5.0);
+                rays.push(("downward probe", o, Vec3::NEG_Y));
+                let v = vertex(&mut rng);
+                rays.push(("probe through a vertex", v.with_y(hi.y + 5.0), Vec3::NEG_Y));
+            }
+            for _ in 0..150 {
+                // Scaled, a direction no longer reproduces the slab test's own
+                // arithmetic, so float noise lands between it and MT: the pad.
+                let (v, o, k) = (vertex(&mut rng), pt(&mut rng, 0.3), rng.range(0.1, 10.0));
+                rays.push(("aimed at a vertex", o, v - o));
+                rays.push(("aimed at a vertex, scaled", o, (v - o) * k));
+                let [a, b, _] = pick.tri(rng.below(tris));
+                let s = if rng.f() < 0.3 { 0.5 } else { rng.f() };
+                let target = Vec3::from(pos[a as usize]).lerp(pos[b as usize].into(), s);
+                rays.push(("aimed at an edge", o, target - o));
+                rays.push(("aimed at an edge, scaled", o, (target - o) * k));
+            }
+            for _ in 0..80 {
+                let o = pt(&mut rng, 0.1).with_y(vertex(&mut rng).y);
+                let d = Vec3::new(rng.range(-1.0, 1.0), 0.0, rng.range(-1.0, 1.0));
+                rays.push(("in a vertex's plane", o, d));
+                rays.push(("plane-grazing", o, d.with_y(-1e-4)));
+                let o =
+                    vertex(&mut rng) + Vec3::new(rng.range(-0.3, 0.3), 0.01, rng.range(-0.3, 0.3));
+                let d = Vec3::new(
+                    rng.range(-1.0, 1.0),
+                    rng.range(-1.0, 1.0),
+                    rng.range(-1.0, 1.0),
+                );
+                rays.push(("origin inside a run", o, d));
+            }
+            let hits = rays
+                .iter()
+                .filter(|&&(kind, o, d)| {
+                    let got = pick.raycast(o, d).map(|(h, t)| (h.to_bits(), t));
+                    assert_eq!(got, brute(pick, o, d), "{name}: {kind} {o} {d}");
+                    got.is_some()
+                })
+                .count();
+            assert!(
+                hits * 4 > rays.len(),
+                "{name}: only {hits} of {} hit",
+                rays.len()
+            );
+
+            // The `dir[i] == 0` arm: a downward probe starting exactly on a
+            // run's padded x or z plane still visits that run.
+            let chunks = pick.0.chunks.get().expect("built by the first ray");
+            assert_eq!(chunks.len(), tris / 64);
+            for c in [0, 7, chunks.len() - 1] {
+                let [blo, bhi] = chunks[c];
+                let mid = |i: usize| (blo[i] + bhi[i]) * 0.5;
+                for o in [
+                    Vec3::new(blo[0], hi.y + 5.0, mid(2)),
+                    Vec3::new(bhi[0], hi.y + 5.0, mid(2)),
+                    Vec3::new(mid(0), hi.y + 5.0, blo[2]),
+                    Vec3::new(mid(0), hi.y + 5.0, bhi[2]),
+                ] {
+                    let d = Vec3::NEG_Y;
+                    let mut runs = Vec::new();
+                    pick.for_each_visible_triangle_on_ray(o, d, |t, _| runs.push(t / 64));
+                    if *name != "hidden" {
+                        assert!(
+                            runs.contains(&c),
+                            "{name}: run {c} from {o} visited {runs:?}"
+                        );
+                    }
+                    let got = pick.raycast(o, d).map(|(h, t)| (h.to_bits(), t));
+                    assert_eq!(got, brute(pick, o, d), "{name}: padded plane {o}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_build_once_and_are_counted_from_construction() {
+        let (positions, indices) = grid(10, |_, _| 0.0);
+        let (v, i) = (positions.len(), indices.len());
+        let pick = TilePickMesh::new(positions, Some(indices.into()), Some(vec![0; 200].into()));
+        let bytes = pick.cpu_bytes();
+        assert_eq!(
+            bytes,
+            (v * 12 + i * 4 + 4 * 24) as u64,
+            "ceil(200 / 64) runs"
+        );
+        pick.for_each_visible_triangle(|_, _| {});
+        assert!(
+            pick.0.chunks.get().is_none(),
+            "the full walk builds nothing"
+        );
+
+        let clone = pick.clone();
+        clone.for_each_visible_triangle_on_ray(Vec3::new(0.5, 1.0, 0.5), Vec3::NEG_Y, |_, _| {});
+        let built = pick.0.chunks.get().expect("built by a clone's first ray");
+        assert_eq!(built.len(), 4);
+        pick.set_hidden(hide(&[0], 1));
+        assert_eq!(pick.raycast(Vec3::new(5.5, 1.0, 5.5), Vec3::NEG_Y), None);
+        assert!(
+            std::ptr::eq(built.as_ptr(), pick.0.chunks.get().unwrap().as_ptr()),
+            "built once; hiding does not rebuild"
+        );
+        assert_eq!(pick.cpu_bytes(), bytes, "the ledger does not move");
+
+        let sequential = TilePickMesh::new(vec![[0.0; 3]; 3 * 65], None, None);
+        assert_eq!(sequential.cpu_bytes(), (3 * 65 * 12 + 2 * 24) as u64);
     }
 }

@@ -119,7 +119,7 @@ optional seams wire it into a host app:
 | `Tiles3dCamera` (marker) | tag the camera SSE selection follows |
 | `TileOwner` (Component) | read it back — every spawned tile entity carries the attach's `owner_id`, so selection/highlight map to your domain |
 | `TileFeatureResolver` (Resource) | map `EXT_mesh_features` node paths to your own sub-entity ids |
-| `TilePickMesh` (Component) | read it back — the CPU geometry of every tile mesh entity (positions, visible triangles with stable ordinals, `raycast()`), since tile meshes are `RENDER_WORLD`-only |
+| `TilePickMesh` (Component) | read it back — the CPU geometry of every tile mesh entity (positions, visible triangles with stable ordinals, a ray-restricted walk, `raycast()`), since tile meshes are `RENDER_WORLD`-only |
 | `HiddenTileFeatures` (Resource) | hide `EXT_mesh_features` features by resolved owner id; affected tiles are re-cut on the GPU in place |
 | `TileSseMultiplier` (Component) | per-set refine-threshold dial on the anchor — coarsen ground/background sets without touching the twins |
 | `PointTileMaterial` (Resource, `points`) | own the point material (sizing/shading) |
@@ -256,6 +256,13 @@ mining site with ~450 resident tiles). Breaking changes:
   `None`: free it then. Without a hook such textures render untextured.
   `TileImage` and `ExtractOptions` are `#[non_exhaustive]`: match `TileImage`
   with a catch-all and build `ExtractOptions` from `Default`.
+- **`TilePickMesh` has a ray-restricted walk.**
+  `for_each_visible_triangle_on_ray(origin, dir, f)` visits only the runs of 64
+  triangles whose padded bounds the ray touches, in the same order with the
+  same ordinals and hidden mask, and `raycast()` uses it. A picker that runs its
+  own triangle test over `for_each_visible_triangle` can switch for the same
+  nearest hit. The bounds are built on a copy's first ray (24 B per 64
+  triangles) and counted in `resident_cpu_bytes()` from the start.
 - **Tile `StandardMaterial`s are shared.** Every untextured primitive with the
   same PBR factors (base color, metallic, roughness, unlit, double-sided) uses
   ONE material, across tiles and tilesets, so their draws share a bind group and
