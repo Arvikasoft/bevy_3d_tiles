@@ -1159,7 +1159,8 @@ fn receive_tiles3d(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut material_cache: ResMut<TileMaterialCache>,
     mut images: ResMut<Assets<Image>>,
-    // Read-only: host-decoded textures are bound through it as their tile lands.
+    // Read-only: host-decoded textures are bound through it as their tile
+    // lands, and released through it when their delivery is dropped.
     texture_hook: Res<TileTextureHook>,
     #[cfg(feature = "points")] mut clouds: ResMut<Assets<PointCloud>>,
     #[cfg(feature = "points")] point_material: Res<PointTileMaterial>,
@@ -1290,6 +1291,7 @@ fn receive_tiles3d(
                     ..
                 } = &mut *sets;
                 let Some(set) = active.iter_mut().find(|s| s.id == set_id) else {
+                    release_delivery(&texture_hook, &result);
                     continue;
                 };
                 // Resolve the slot by GENERATION, never the message's captured
@@ -1302,6 +1304,7 @@ fn receive_tiles3d(
                 let Some(tile) = set.slots.iter().position(
                     |s| matches!(s, TileSlot::InFlight { generation: g } if *g == generation),
                 ) else {
+                    release_delivery(&texture_hook, &result);
                     continue;
                 };
                 match result {
@@ -1392,6 +1395,7 @@ fn receive_tiles3d(
                         let Some(transform) =
                             tile_spawn_transform(set, tile, origin.world_from_ecef)
                         else {
+                            release_host_tokens(&texture_hook, &items);
                             set.slots[tile] = TileSlot::NotLoaded;
                             continue;
                         };
@@ -1751,15 +1755,17 @@ fn build_tile_cache(
 /// Add and bind every host-decoded texture of one tile, taking each such
 /// primitive's data-less `Image` out of its material: one asset and one hook
 /// call per token. Returns token → handle, or `None` if the hook refused one
-/// (the handles added so far drop, and with them the images). Without a hook
-/// the textures are dropped, so those primitives render untextured.
+/// (every token of the tile is released, and the handles added so far drop,
+/// and with them the images). Without a hook the textures are dropped, so
+/// those primitives render untextured.
 fn bind_host_textures(
     images: &mut Assets<Image>,
     hook: &TileTextureHook,
     items: &mut [DecodedItem],
 ) -> Option<std::collections::HashMap<u64, Handle<Image>>> {
     let mut bound = std::collections::HashMap::new();
-    for item in items {
+    let mut refused = false;
+    for item in items.iter_mut() {
         // Irrefutable with neither `points` nor `splats` (one variant).
         #[allow(irrefutable_let_patterns)]
         let DecodedItem::Mesh(p) = item else {
@@ -1769,7 +1775,7 @@ fn bind_host_textures(
             continue;
         };
         let image = p.material.base_color_image.take();
-        let Some(hook) = &hook.0 else {
+        let Some(bind) = &hook.0 else {
             warn_no_texture_hook_once();
             continue;
         };
@@ -1780,13 +1786,35 @@ fn bind_host_textures(
             continue;
         };
         let handle = images.add(image);
-        if !hook(token, handle.id()) {
+        if !bind(token, Some(handle.id())) {
             debug!("tiles3d: host texture {token} is gone; re-queueing its tile");
-            return None;
+            refused = true;
+            break;
         }
         bound.insert(token, handle);
     }
+    if refused {
+        release_host_tokens(hook, items);
+        return None;
+    }
     Some(bound)
+}
+
+/// Release every host texture token of a delivery the crate drops, so the
+/// host frees what it decoded for it now (see [`TileTextureHook`]).
+fn release_host_tokens(hook: &TileTextureHook, items: &[DecodedItem]) {
+    if let Some(hook) = &hook.0 {
+        for token in content::host_tokens(items) {
+            hook(token, None);
+        }
+    }
+}
+
+/// [`release_host_tokens`] for a tile message whose slot is gone.
+fn release_delivery(hook: &TileTextureHook, result: &Result<TileOutput, String>) {
+    if let Ok(TileOutput::Content(tile)) = result {
+        release_host_tokens(hook, &tile.items);
+    }
 }
 
 /// One-time warning for a host texture token with no [`TileTextureHook`] to
@@ -2198,11 +2226,13 @@ fn drive_tiles3d(
     // under a saturated pool, and is keyed by set id (not position) so it
     // stays sane when sets detach.
     mut rr_cursors: Local<std::collections::HashMap<u8, u64>>,
-    // Host off-thread prepare hook (S4). Cloned out of the Res BEFORE
-    // `fetch::spawn_io` — the task must not capture the Res.
-    prepare_hook: Res<TilePrepareHook>,
+    // Host off-thread prepare hook (S4), and the texture hook a failed decode
+    // releases its host tokens through. Cloned out of the Res BEFORE
+    // `fetch::spawn_io` — the task must not capture the Res. One tuple param:
+    // this system is at bevy's 16-param cap with `points`.
+    hooks: (Res<TilePrepareHook>, Res<TileTextureHook>),
 ) {
-    let prepare_hook = prepare_hook.0.clone();
+    let (prepare_hook, texture_hook) = (hooks.0.0.clone(), hooks.1.0.clone());
     let Tiles3dSets {
         sets,
         frame,
@@ -2876,6 +2906,7 @@ fn drive_tiles3d(
         let set_id = set.id;
         let georeferenced = matches!(set.frame, SetFrame::Ecef { .. });
         let hook = prepare_hook.clone();
+        let texture_hook = texture_hook.clone();
         fetch::spawn_io(async move {
             // Fetch + decode entirely inside the task (wasm: every IO step
             // awaits a JS future and yields; decode is small-tile CPU).
@@ -2886,10 +2917,15 @@ fn drive_tiles3d(
                 Ok(bytes) if looks_like_external_tileset(&bytes) => schema::parse_tileset(&bytes)
                     .map(|ts| TileOutput::Subtree(Box::new(ts)))
                     .map_err(|e| format!("parse external tileset: {e}")),
-                Ok(bytes) => content::decode_tile_with(&bytes, georeferenced, hook.as_ref())
-                    .await
-                    .map(|tile| TileOutput::Content(Box::new(tile)))
-                    .map_err(|e| e.to_string()),
+                Ok(bytes) => content::decode_tile_hooked(
+                    &bytes,
+                    georeferenced,
+                    hook.as_ref(),
+                    texture_hook.as_ref(),
+                )
+                .await
+                .map(|tile| TileOutput::Content(Box::new(tile)))
+                .map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             };
             fetch::unregister_abort(generation);
@@ -4242,7 +4278,7 @@ mod tests {
             copyright: None,
             features: None,
         };
-        block_on(content::decode_prepared(prepared, 0))
+        block_on(content::decode_prepared(prepared, 0, None))
             .expect("decode")
             .items
     }
@@ -4266,7 +4302,9 @@ mod tests {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = Arc::clone(&calls);
         app.insert_resource(TileTextureHook(Some(Arc::new(move |token, id| {
-            seen.lock().unwrap().push((token, id));
+            seen.lock()
+                .unwrap()
+                .push((token, id.expect("a landed tile binds, never releases")));
             true
         }))));
         land_tile(&mut app, 0, host_textured_items(7, 4, 2));
@@ -4360,6 +4398,140 @@ mod tests {
             "the second delivery lands"
         );
         assert_eq!(set.caches[tile].len(), 2);
+    }
+
+    /// Every delivery the crate drops before its tile spawns releases its host
+    /// tokens, bound ones included, so the host frees the decoded pixels now
+    /// instead of timing them out: a cancelled or reissued tile, a detached
+    /// set, a refused sibling token, an unresolved ECEF origin. A tile that
+    /// spawns releases nothing.
+    #[test]
+    fn dropped_deliveries_release_their_host_tokens() {
+        type Calls = Arc<std::sync::Mutex<Vec<(u64, bool)>>>;
+        // Records (token, bind?) and refuses token 22.
+        let app_with = |frame: SetFrame| -> (App, Calls) {
+            let mut app = despawn_test_app(Tiles3dConfig {
+                halt_new_loads: true,
+                ..test_config()
+            });
+            install_set(
+                &mut app,
+                synth_tree([100.0, 6.0, 0.0]),
+                frame,
+                Vec3::new(0.0, 0.0, 600.0),
+            );
+            let calls = Calls::default();
+            let seen = Arc::clone(&calls);
+            app.insert_resource(TileTextureHook(Some(Arc::new(move |token, id| {
+                seen.lock().unwrap().push((token, id.is_some()));
+                token != 22
+            }))));
+            (app, calls)
+        };
+        let released = |calls: &Calls| -> Vec<u64> {
+            let mut r: Vec<u64> = calls
+                .lock()
+                .unwrap()
+                .drain(..)
+                .filter(|&(_, bind)| !bind)
+                .map(|(token, _)| token)
+                .collect();
+            r.sort_unstable();
+            r
+        };
+        let send = |app: &mut App, set_id: u64, generation: u64, items| {
+            let tx = app.world().resource::<Tiles3dChannel>().tx.clone();
+            tx.send(Tiles3dMsg::TileContent {
+                set_id,
+                generation,
+                result: Ok(TileOutput::Content(Box::new(decoded(items)))),
+            })
+            .unwrap();
+        };
+
+        let (mut app, calls) = app_with(SetFrame::Anchored);
+        // No slot is in flight under generation 77 (cancelled or reissued),
+        // and there is no set 99 (detached).
+        send(&mut app, 1, 77, host_textured_items(11, 2, 2));
+        send(&mut app, 99, 78, host_textured_items(12, 2, 2));
+        app.update();
+        assert_eq!(released(&calls), [11, 12]);
+
+        // The hook binds 21, then refuses 22: both are released.
+        let mut items = host_textured_items(21, 2, 2);
+        items.extend(host_textured_items(22, 2, 2));
+        land_tile(&mut app, 0, items);
+        app.update();
+        assert_eq!(released(&calls), [21, 22]);
+
+        land_tile(&mut app, 1, host_textured_items(31, 2, 2));
+        app.update();
+        assert!(matches!(
+            app.world().resource::<Tiles3dSets>().sets[0].slots[1],
+            TileSlot::Ready { .. }
+        ));
+        assert_eq!(*calls.lock().unwrap(), [(31, true)], "spawned: bound only");
+
+        let (mut app, calls) = app_with(SetFrame::Ecef { built: None });
+        land_tile(&mut app, 0, host_textured_items(41, 2, 2));
+        app.update();
+        assert_eq!(*calls.lock().unwrap(), [(41, false)], "origin unresolved");
+    }
+
+    /// A decode that cannot deliver a host token releases it: a failed decode
+    /// releases every token, a successful one those no primitive draws.
+    #[test]
+    fn decode_releases_host_tokens_it_cannot_deliver() {
+        use prepare::{
+            ExtractedMaterial, ExtractedMeshes, ExtractedPrimitive, ExtractedTexture, PreparedTile,
+            TextureWrap, TileImage,
+        };
+        let released = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&released);
+        let hook: Arc<TileTextureFn> = Arc::new(move |token, id| {
+            assert!(id.is_none(), "decode only releases");
+            seen.lock().unwrap().push(token);
+            true
+        });
+        // Material 0 draws texture 0 (token 1), or names a texture that does
+        // not exist; material 1, which no primitive uses, has texture 1 (token 2).
+        let prepared = |texture_of_material_0| PreparedTile {
+            glb: Vec::new(),
+            meshes: Some(ExtractedMeshes {
+                primitives: vec![ExtractedPrimitive {
+                    transform: Mat4::IDENTITY.to_cols_array(),
+                    positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    material: Some(0),
+                    ..Default::default()
+                }],
+                materials: [texture_of_material_0, 1]
+                    .map(|t| ExtractedMaterial {
+                        base_color_texture: Some(t),
+                        ..Default::default()
+                    })
+                    .to_vec(),
+                textures: [1, 2]
+                    .map(|token| ExtractedTexture {
+                        image: TileImage::Host {
+                            token,
+                            width: 2,
+                            height: 2,
+                        },
+                        wrap_s: TextureWrap::Repeat,
+                        wrap_t: TextureWrap::Repeat,
+                    })
+                    .to_vec(),
+            }),
+            rtc_center: None,
+            copyright: None,
+            features: None,
+        };
+        let tile = block_on(content::decode_prepared(prepared(0), 0, Some(&hook))).expect("decode");
+        assert_eq!(content::host_tokens(&tile.items), [1]);
+        assert_eq!(std::mem::take(&mut *released.lock().unwrap()), [2]);
+
+        assert!(block_on(content::decode_prepared(prepared(5), 0, Some(&hook))).is_err());
+        assert_eq!(*released.lock().unwrap(), [1, 2]);
     }
 
     /// A host token with no hook installed renders untextured (the shared

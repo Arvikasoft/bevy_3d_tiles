@@ -45,7 +45,12 @@ const IDENTITY: Mat4 = [
 /// Which optional work the off-thread extraction does. Each field is a switch a
 /// host can turn off without losing the tile: the work then happens where it
 /// did before. `Copy`, passed by value. [`Default`] turns both on.
+///
+/// `#[non_exhaustive]` so a later switch is not a breaking change: start from
+/// [`Default`] and set the fields (`let mut o = ExtractOptions::default();
+/// o.textures = false;`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtractOptions {
     /// Extract textured content, carrying base-colour textures in
     /// [`ExtractedMeshes::textures`]. Off = any image or texture declines the
@@ -94,8 +99,10 @@ impl TextureWrap {
     }
 }
 
-/// The pixels of one extracted texture.
+/// The pixels of one extracted texture. `#[non_exhaustive]`: a consumer
+/// declines (or fails the tile on) a kind it does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TileImage {
     /// Encoded bytes as stored in the tile (`image/png`, `image/jpeg` or
     /// `image/ktx2`); the consumer decodes them.

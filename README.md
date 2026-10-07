@@ -250,8 +250,12 @@ mining site with ~450 resident tiles). Breaking changes:
 - **Host-decoded textures need a `TileTextureHook`.** A hook may decode a
   texture itself and hand the crate an opaque `TileImage::Host` token; the
   crate builds a data-less destination `Image` and calls the hook once per
-  token with its `AssetId`. Return `false` for a token you no longer hold and
-  the tile is decoded again. Without a hook such textures render untextured.
+  token with `Some(AssetId)`. Return `false` for a token you no longer hold and
+  the tile is decoded again. A token whose tile will not spawn (cancelled,
+  detached, waiting for the origin, failed, refused) comes back once with
+  `None`: free it then. Without a hook such textures render untextured.
+  `TileImage` and `ExtractOptions` are `#[non_exhaustive]`: match `TileImage`
+  with a catch-all and build `ExtractOptions` from `Default`.
 - **Tile `StandardMaterial`s are shared.** Every untextured primitive with the
   same PBR factors (base color, metallic, roughness, unlit, double-sided) uses
   ONE material, across tiles and tilesets, so their draws share a bind group and

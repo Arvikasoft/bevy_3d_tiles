@@ -74,7 +74,7 @@ use bevy_3d_tiles_prepare::{
 // `lib.rs` sniffs external tilesets with it (`looks_like_external_tileset`).
 pub(crate) use bevy_3d_tiles_prepare::memmem;
 
-use crate::api::TilePrepareFn;
+use crate::api::{TilePrepareFn, TileTextureFn};
 
 /// Adapter-supported GPU-compressed texture formats (BC on desktop WebGPU,
 /// ASTC/ETC on mobile, NONE headless/native-before-init). Latched ONCE at
@@ -387,9 +387,23 @@ pub async fn decode_tile_with(
     georeferenced: bool,
     hook: Option<&Arc<TilePrepareFn>>,
 ) -> Result<DecodedTile, DecodeError> {
+    decode_tile_hooked(bytes, georeferenced, hook, None).await
+}
+
+/// [`decode_tile_with`], plus the texture hook through which a prepared tile's
+/// host tokens are released when this decode cannot deliver them (see
+/// [`decode_prepared`]).
+pub(crate) async fn decode_tile_hooked(
+    bytes: &[u8],
+    georeferenced: bool,
+    hook: Option<&Arc<TilePrepareFn>>,
+    texture_hook: Option<&Arc<TileTextureFn>>,
+) -> Result<DecodedTile, DecodeError> {
     if let Some(hook) = hook {
         match hook(bytes, georeferenced).await {
-            Ok(Some(prepared)) => return decode_prepared(prepared, bytes.len() as u64).await,
+            Ok(Some(prepared)) => {
+                return decode_prepared(prepared, bytes.len() as u64, texture_hook).await;
+            }
             Ok(None) => {} // declined (Draco/splat) — the inline path handles those
             Err(e) => warn_prepare_hook_once(&e.to_string()),
         }
@@ -416,7 +430,53 @@ fn warn_prepare_hook_once(detail: &str) {
 ///   moved into the hook and read 0;
 /// * **prepared GLB (S4)** — the glb is already vanilla glTF, so spans 1-3
 ///   run here and only span 0 moved.
+///
+/// A host texture token that does not come out on an item (the decode failed,
+/// or no primitive draws that texture) reaches nothing downstream, so it is
+/// released here through `texture_hook`.
 pub(crate) async fn decode_prepared(
+    prepared: PreparedTile,
+    content_bytes: u64,
+    texture_hook: Option<&Arc<TileTextureFn>>,
+) -> Result<DecodedTile, DecodeError> {
+    let tokens: Vec<u64> = prepared
+        .meshes
+        .iter()
+        .flat_map(|m| &m.textures)
+        .filter_map(|t| match t.image {
+            TileImage::Host { token, .. } => Some(token),
+            _ => None,
+        })
+        .collect();
+    let result = decode_prepared_items(prepared, content_bytes).await;
+    if let Some(hook) = texture_hook {
+        let kept = result
+            .as_ref()
+            .map(|tile| host_tokens(&tile.items))
+            .unwrap_or_default();
+        for token in tokens.into_iter().filter(|t| !kept.contains(t)) {
+            hook(token, None);
+        }
+    }
+    result
+}
+
+/// The host texture tokens `items` carry, each once.
+#[allow(irrefutable_let_patterns)] // one variant with neither `points` nor `splats`
+pub(crate) fn host_tokens(items: &[DecodedItem]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for item in items {
+        if let DecodedItem::Mesh(p) = item
+            && let Some(token) = p.material.base_color_host
+            && !out.contains(&token)
+        {
+            out.push(token);
+        }
+    }
+    out
+}
+
+async fn decode_prepared_items(
     prepared: PreparedTile,
     content_bytes: u64,
 ) -> Result<DecodedTile, DecodeError> {
@@ -1059,6 +1119,7 @@ fn resolve_texture(t: &ExtractedTexture) -> Result<ResolvedTexture, String> {
             out.image = Some(host_texture(width, height, sampler));
             out.host = Some(token);
         }
+        _ => return Err("texture image kind this crate version cannot draw".into()),
     }
     Ok(out)
 }
@@ -2664,7 +2725,7 @@ pub(crate) mod tests {
         prepared.features.as_mut().expect("features").vertex_ids =
             vec![((0, 0), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])];
 
-        let tile = block_on(decode_prepared(prepared, glb.len() as u64)).expect("decode");
+        let tile = block_on(decode_prepared(prepared, glb.len() as u64, None)).expect("decode");
         let DecodedItem::Mesh(p) = &tile.items[0] else {
             panic!("expected mesh")
         };
@@ -2722,14 +2783,12 @@ pub(crate) mod tests {
     /// container route, where it decodes exactly as inline (the kill switch
     /// that restores the pre-0.5 texture path).
     #[test]
-    fn textures_off_keeps_the_s4_route() {
+    fn textures_off_keeps_the_prepared_glb_route() {
         use bevy::tasks::block_on;
 
         set_supported_compressed_formats(CompressedImageFormats::BC);
-        let off = ExtractOptions {
-            textures: false,
-            ..Default::default()
-        };
+        let mut off = ExtractOptions::default();
+        off.textures = false;
         let hook: Arc<crate::api::TilePrepareFn> = Arc::new(move |bytes, geo| {
             Box::pin(async move {
                 bevy_3d_tiles_prepare::prepare_tile_extracting_with(bytes, geo, None, off)

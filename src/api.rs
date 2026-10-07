@@ -95,10 +95,13 @@ unsafe impl Send for TilePrepareHook {}
 #[cfg(target_arch = "wasm32")]
 unsafe impl Sync for TilePrepareHook {}
 
-/// The texture-hook signature: `(host token, the texture's asset id)` → whether
-/// the host still holds that token and will fill the texture.
+/// The texture-hook signature. `(token, Some(texture))` binds: the return says
+/// whether the host still holds that token and will fill the texture.
+/// `(token, None)` releases: the crate dropped the delivery that carried the
+/// token and will never bind it, so the host can free it now; the return is
+/// ignored.
 pub type TileTextureFn =
-    dyn Fn(u64, bevy::asset::AssetId<bevy::image::Image>) -> bool + Send + Sync;
+    dyn Fn(u64, Option<bevy::asset::AssetId<bevy::image::Image>>) -> bool + Send + Sync;
 
 /// Fills tile textures the host decoded itself
 /// ([`bevy_3d_tiles_prepare::TileImage::Host`], e.g. a browser `ImageBitmap`
@@ -113,6 +116,14 @@ pub type TileTextureFn =
 /// never draws an unfilled texture. Without a hook such a texture renders
 /// untextured and the crate warns once. `None` (the default) = no hook. Insert
 /// before `add_plugins(Tiles3dPlugin)`, like [`TilePrepareHook`].
+///
+/// Every token the crate receives ends in a bind of a tile that spawns or in
+/// a release, so a host never has to time tokens out. A delivery the crate
+/// drops releases all of its tokens, bound ones included: its tile was
+/// cancelled or left the cut, its tileset detached, the ECEF origin was not
+/// resolved yet, its decode failed, the hook refused one of its tokens, or no
+/// primitive draws that texture. Releasing a token the host no longer holds
+/// (one it just refused) must be a no-op.
 #[derive(Resource, Default, Clone)]
 pub struct TileTextureHook(pub Option<Arc<TileTextureFn>>);
 
