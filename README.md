@@ -174,6 +174,23 @@ attribution lines whenever tiles are visible, and bring your own API key
 A performance release for large multi-tileset scenes (measured on a large
 mining site with ~450 resident tiles). Breaking changes:
 
+- **Tile meshes are `RenderAssetUsages::RENDER_WORLD`-only.** After their first
+  upload `Assets<Mesh>` holds no vertex data for them: `Mesh::attribute()`,
+  `indices()` and `morph_targets()` panic, the `try_*` variants return `Err`,
+  and bevy's `MeshPickingPlugin` skips them. Read tile geometry from the new
+  `TilePickMesh` component on every tile mesh entity instead (positions, the
+  visible triangles with their stable ordinals, `triangle_count()`,
+  `raycast()`). Attach with `Tiles3dAttach { main_world_meshes: true, .. }` for
+  a set whose meshes you must read in full (an outline through
+  `build_submesh`, a physics proxy, bevy_picking); even then the main-world
+  indices stay pristine while hidden features are cut on the GPU only, so pick
+  through `TilePickMesh`.
+- **bevy_mod_outline ≤ 0.13 panics on a `RENDER_WORLD` tile entity that carries
+  an `OutlineVolume`** (its pipeline key calls `morph_targets()`). Use
+  `main_world_meshes: true` for those sets, or a bevy_mod_outline that reads
+  `try_morph_targets()`.
+- **`build_submesh` needs a `main_world_meshes` source**; on an extracted mesh it
+  returns an empty mesh instead of panicking.
 - **Every tile mesh entity spawns with `Aabb` + `NoAutoAabb`**, computed at
   decode, so `calculate_bounds` never recomputes tile bounds. Don't rely on it
   to (re)compute them.

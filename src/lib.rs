@@ -1666,6 +1666,9 @@ fn build_tile_cache(
                     _ => (None, None),
                 };
                 let (pick_mesh, aabb) = pick_copy(&mut mesh, bounds, pick.as_ref());
+                if !set.main_world_meshes {
+                    mesh.asset_usage = bevy::asset::RenderAssetUsages::RENDER_WORLD;
+                }
                 cpu += pick_mesh.cpu_bytes() + if set.main_world_meshes { cost } else { 0 };
                 let mesh = meshes.add(mesh);
                 if let Some(owner_ix) = &owner_ix {
@@ -4628,6 +4631,20 @@ mod tests {
             let reapply: Vec<bool> = queued(&app).iter().map(|q| q.2).collect();
             assert_eq!(reapply, vec![false], "pristine never reapplies");
         }
+    }
+
+    #[test]
+    fn tile_mesh_is_render_world_only_by_default() {
+        let mut app = feature_app();
+        land_tile(&mut app, LEAF, vec![plain_prim(Default::default())]);
+        app.update();
+        let (mesh, _) = mesh_item(&app, LEAF, 0);
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        assert_eq!(
+            meshes.get(&mesh).unwrap().asset_usage,
+            bevy::asset::RenderAssetUsages::RENDER_WORLD,
+            "no second, main-world copy of every tile"
+        );
     }
 
     #[test]
