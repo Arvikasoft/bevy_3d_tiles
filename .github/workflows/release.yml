@@ -1,7 +1,8 @@
 # Publishes to crates.io via Trusted Publishing (OIDC — no long-lived token).
 # One-time setup on crates.io (crate Settings → Trusted Publishing): authorize
 # this repository + the `release` environment for `bevy_3d_tiles`.
-# Release flow: bump version in Cargo.toml → tag `vX.Y.Z` → push the tag.
+# Release flow: bump version in Cargo.toml → `git tag -a vX.Y.Z` (annotated: its
+# message is the release note; the gate refuses a lightweight tag) → push the tag.
 name: Release
 
 on:
@@ -22,6 +23,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      # Before anything is published or announced: the tag must be annotated (the
+      # announcement posts its message, and a lightweight tag would post the raw
+      # commit message), and nothing this release makes public may hold a name on
+      # the private deny list: the files of both packages, the tag message, and the
+      # messages of the commits since the previous v* tag. .github/deny-scan.sh
+      # prints only where a name is, never the name.
+      - name: release gate
+        env:
+          DENY: ${{ secrets.PUBLISH_DENY_REGEX }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -o pipefail
+          # Re-fetch the tag so its local ref is the pushed object, not a lightweight copy.
+          git fetch -q --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+          if [ "$(git cat-file -t "refs/tags/$TAG")" != tag ]; then
+            echo "::error::$TAG is a lightweight tag. Delete it and push an annotated one: git tag -a $TAG"
+            exit 1
+          fi
+          T="$RUNNER_TEMP/release-text"; mkdir -p "$T"
+          git cat-file tag "refs/tags/$TAG" | sed '1,/^$/d' > "$T/tag-message"
+          PREV=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          for c in $(git rev-list "$TAG" ${PREV:+--not "$PREV"}); do
+            git log -1 --format=%B "$c" > "$T/commit-$c"
+          done
+          L="$RUNNER_TEMP/package-files"
+          cargo package --list --allow-dirty --manifest-path prepare/Cargo.toml | sed 's|^|prepare/|' > "$L"
+          # The root resolves prepare from crates.io, so its list fails until that
+          # version is published. Then scan every tracked file: a superset of the
+          # package, and ci.yml holds all of them to this scan already.
+          cargo package --list --allow-dirty >> "$L" 2>/dev/null || git ls-files >> "$L"
+          # --list also names files cargo generates (Cargo.toml.orig, .cargo_vcs_info.json).
+          mapfile -t files < <(sort -u "$L" | while read -r f; do [ -f "$f" ] && echo "$f"; done)
+          bash .github/deny-scan.sh "${files[@]}" "$T"/*
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       # Lockstep pair: the prepare crate must land FIRST or the root publish
@@ -67,8 +101,9 @@ jobs:
           # No GitHub Release object is created for this crate — crates.io is the
           # distribution channel and a library has no binaries to attach. Link
           # there instead. The release note is the ANNOTATED TAG's message, so
-          # it lives with the tag and there is no CHANGELOG file to rot; a
-          # lightweight tag just falls back to the commit range. 3500 bytes keeps
+          # it lives with the tag and there is no CHANGELOG file to rot. For a
+          # lightweight tag %(contents) is the raw commit message, so the release
+          # gate refuses one before this step can run. 3500 bytes keeps
           # a full release note (0.5.0's is ~2.3 KB) plus the links below under
           # Discord's 4096-character embed description limit.
           NOTE=$(git for-each-ref --format='%(contents)' "refs/tags/$VERSION" | head -c 3500)

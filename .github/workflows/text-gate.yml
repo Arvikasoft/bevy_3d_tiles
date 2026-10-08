@@ -1,0 +1,29 @@
+# Fails when an issue's title or body holds a name on the private deny list
+# (PUBLISH_DENY_REGEX). A run cannot hide the text, so the red run is the alert:
+# edit the issue at once and delete the old revision from its edit history.
+# PR titles and bodies are scanned by ci.yml.
+name: Text gate
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    # Only for issues written by people with ties to the repo: a public run's
+    # red/green would otherwise let anyone test a guessed name against the list.
+    if: contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: scan the issue title and body
+        env:
+          DENY: ${{ secrets.PUBLISH_DENY_REGEX }}
+        run: |
+          jq -r '.issue.title, (.issue.body // "")' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/issue-title-body"
+          bash .github/deny-scan.sh "$RUNNER_TEMP/issue-title-body"

@@ -9,6 +9,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Private names must never reach this public repo. Scans the commit messages
+  # this push or PR adds, every tracked file, and the PR title and body against
+  # the PUBLISH_DENY_REGEX secret; .github/deny-scan.sh prints only where a name
+  # is. Fork PRs get no secrets, so they skip with a notice; a push to main fails.
+  # A red run is the alert: the text is already public, so remove it at once.
+  deny-scan:
+    name: deny-list scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: scan
+        env:
+          DENY: ${{ secrets.PUBLISH_DENY_REGEX }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          if [ -z "$DENY" ]; then
+            if [ "$GITHUB_EVENT_NAME" = push ]; then echo "::error::set the PUBLISH_DENY_REGEX secret"; exit 1; fi
+            echo "::notice::PUBLISH_DENY_REGEX is not available to this run (fork PRs get no secrets): deny-list scan skipped"
+            exit 0
+          fi
+          T="$RUNNER_TEMP/scan-text"; mkdir -p "$T"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            range=("$BASE..$HEAD")
+            jq -r '.pull_request.title, (.pull_request.body // "")' "$GITHUB_EVENT_PATH" > "$T/pr-title-body"
+          elif git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range=("$BEFORE..$GITHUB_SHA")
+          else   # a new branch (before is all zeros) or a force push: the last 50 commits
+            range=(-50 "$GITHUB_SHA")
+          fi
+          for c in $(git rev-list "${range[@]}"); do
+            git log -1 --format=%B "$c" > "$T/commit-$c"
+          done
+          mapfile -t files < <(git ls-files)
+          shopt -s nullglob
+          bash .github/deny-scan.sh "${files[@]}" "$T"/*
+
   test:
     name: fmt · clippy · test · wasm · features
     runs-on: ubuntu-latest
