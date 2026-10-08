@@ -26,9 +26,9 @@ jobs:
       # Before anything is published or announced: the tag must be annotated (the
       # announcement posts its message, and a lightweight tag would post the raw
       # commit message), and nothing this release makes public may hold a name on
-      # the private deny list: the files of both packages, the tag message, and the
-      # messages of the commits since the previous v* tag. .github/deny-scan.sh
-      # prints only where a name is, never the name.
+      # the private deny list: the tag name, the names and files of both packages,
+      # the tag message, and the messages of the commits since the previous v* tag.
+      # .github/deny-scan.sh prints only where a name is, never the name.
       - name: release gate
         env:
           DENY: ${{ secrets.PUBLISH_DENY_REGEX }}
@@ -55,6 +55,9 @@ jobs:
           cargo package --list --allow-dirty >> "$L" 2>/dev/null || git ls-files >> "$L"
           # --list also names files cargo generates (Cargo.toml.orig, .cargo_vcs_info.json).
           mapfile -t files < <(sort -u "$L" | while read -r f; do [ -f "$f" ] && echo "$f"; done)
+          # Names first and alone: the content scan prints file paths.
+          printf '%s\n' "$TAG" "${files[@]}" > "$RUNNER_TEMP/release-names"
+          bash .github/deny-scan.sh "$RUNNER_TEMP/release-names"
           bash .github/deny-scan.sh "${files[@]}" "$T"/*
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth

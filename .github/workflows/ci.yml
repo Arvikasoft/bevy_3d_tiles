@@ -9,8 +9,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Private names must never reach this public repo. Scans the commit messages
-  # this push or PR adds, every tracked file, and the PR title and body against
+  # Private names must never reach this public repo. Scans the branch name, every
+  # file path, the commit messages this push or PR adds, every tracked file, and
+  # the PR title and body (edits: text-gate.yml) against
   # the PUBLISH_DENY_REGEX secret; .github/deny-scan.sh prints only where a name
   # is. Fork PRs get no secrets, so they skip with a notice; a push to main fails.
   # A red run is the alert: the text is already public, so remove it at once.
@@ -47,6 +48,10 @@ jobs:
             git log -1 --format=%B "$c" > "$T/commit-$c"
           done
           mapfile -t files < <(git ls-files)
+          # Names first and alone: the content scan prints file paths.
+          git ls-files > "$T/file-paths"
+          printf '%s\n' "$GITHUB_REF_NAME" "${GITHUB_HEAD_REF:-}" > "$T/ref-names"
+          bash .github/deny-scan.sh "$T/file-paths" "$T/ref-names"
           shopt -s nullglob
           bash .github/deny-scan.sh "${files[@]}" "$T"/*
 
