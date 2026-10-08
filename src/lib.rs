@@ -4277,6 +4277,7 @@ mod tests {
             rtc_center: None,
             copyright: None,
             features: None,
+            extract_declined: None,
         };
         block_on(content::decode_prepared(prepared, 0, None))
             .expect("decode")
@@ -4525,6 +4526,7 @@ mod tests {
             rtc_center: None,
             copyright: None,
             features: None,
+            extract_declined: None,
         };
         let tile = block_on(content::decode_prepared(prepared(0), 0, Some(&hook))).expect("decode");
         assert_eq!(content::host_tokens(&tile.items), [1]);

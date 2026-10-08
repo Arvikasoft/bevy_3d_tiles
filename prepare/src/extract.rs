@@ -254,6 +254,9 @@ pub struct ExtractedMeshes {
 ///   read). The caller falls back too; the inline decode surfaces it with full
 ///   diagnostics.
 ///
+/// The reason for a decline reaches a host through
+/// [`crate::PreparedTile::extract_declined`].
+///
 /// Normals are NOT filled here (feature ids may still add indices);
 /// [`crate::prepare_tile_extracting_with`] does that last.
 pub fn extract_tile_meshes(
@@ -261,24 +264,68 @@ pub fn extract_tile_meshes(
     bin: Option<&[u8]>,
     opts: ExtractOptions,
 ) -> Result<Option<ExtractedMeshes>, DecodeError> {
+    Ok(extract_tile_meshes_why(json, bin, opts)?.ok())
+}
+
+/// [`extract_tile_meshes`] with the reason of a decline: `Ok(Err(why))`, `why`
+/// a short stable phrase naming the first rule the document failed.
+pub(crate) fn extract_tile_meshes_why(
+    json: &Value,
+    bin: Option<&[u8]>,
+    opts: ExtractOptions,
+) -> Result<Result<ExtractedMeshes, &'static str>, DecodeError> {
+    match extract(json, bin, opts) {
+        Ok(m) => Ok(Ok(m)),
+        Err(Stop::Decline(why)) => Ok(Err(why)),
+        Err(Stop::Fail(e)) => Err(e),
+    }
+}
+
+/// How extraction stops early: a decline with its reason, or a malformed
+/// document.
+#[derive(Debug)]
+enum Stop {
+    Decline(&'static str),
+    Fail(DecodeError),
+}
+use Stop::Decline;
+
+impl From<DecodeError> for Stop {
+    fn from(e: DecodeError) -> Self {
+        Self::Fail(e)
+    }
+}
+
+impl From<String> for Stop {
+    fn from(e: String) -> Self {
+        Self::Fail(e.into())
+    }
+}
+
+fn extract(
+    json: &Value,
+    bin: Option<&[u8]>,
+    opts: ExtractOptions,
+) -> Result<ExtractedMeshes, Stop> {
     // A surviving required extension is something no pass here handled, and
     // the `gltf` crate would reject it. Except `KHR_materials_unlit`: the
     // consumer's `gltf` enables it, both routes read it the same way, and a
     // photorealistic layer requires it on every tile.
-    let non_empty = |key: &str| json[key].as_array().is_some_and(|a| !a.is_empty());
-    let required_unhandled = json["extensionsRequired"]
+    if let Some(ext) = json["extensionsRequired"]
         .as_array()
-        .is_some_and(|a| a.iter().any(|e| e != "KHR_materials_unlit"));
-    if required_unhandled
-        || (!opts.textures && (non_empty("images") || non_empty("textures")))
-        || !textures_valid(json)
+        .and_then(|a| a.iter().find(|e| *e != "KHR_materials_unlit"))
     {
-        return Ok(None);
+        return Err(Decline(required_why(ext.as_str())));
+    }
+    let non_empty = |key: &str| json[key].as_array().is_some_and(|a| !a.is_empty());
+    if !opts.textures && (non_empty("images") || non_empty("textures")) {
+        return Err(Decline("textures off (ExtractOptions::textures)"));
+    }
+    if !textures_valid(json) {
+        return Err(Decline("a texture setup the gltf crate rejects"));
     }
 
-    let Some((materials, textures)) = extract_materials(json, bin) else {
-        return Ok(None);
-    };
+    let (materials, textures) = extract_materials(json, bin)?;
     let mut out = ExtractedMeshes {
         primitives: Vec::new(),
         materials,
@@ -287,9 +334,7 @@ pub fn extract_tile_meshes(
 
     // Default scene, resolved exactly like `Document::default_scene()` then
     // `.or(scenes().next())`: the `scene` index if present, else scene 0.
-    let Some(scene_ix) = opt_index(&json["scene"]) else {
-        return Ok(None);
-    };
+    let scene_ix = opt_index(&json["scene"]).ok_or(Decline("scene: not an integer"))?;
     // To serde `scenes` is a `Vec<Scene>` and `scene` an `Index`, and
     // `Scene::nodes` carries NO `#[serde(default)]` — it is required. So only
     // two shapes here legally draw nothing: a document with neither `scenes`
@@ -297,23 +342,28 @@ pub fn extract_tile_meshes(
     // Every other shape errors the inline route, and returning an empty tile
     // instead would render a blank where the tile should have failed.
     let Value::Array(scenes) = &json["scenes"] else {
-        return Ok((json["scenes"].is_null() && scene_ix.is_none()).then_some(out));
+        return if json["scenes"].is_null() && scene_ix.is_none() {
+            Ok(out)
+        } else {
+            Err(Decline("scenes: not an array, or a scene named with none"))
+        };
     };
     let Some(scene) = scenes.get(scene_ix.unwrap_or(0) as usize) else {
         // An empty `scenes` list has no scene 0 to default to, which is legal;
         // an explicit `scene` naming nothing is an out-of-range `Index`.
-        return Ok(scene_ix.is_none().then_some(out));
-    };
-    let Some(roots) = scene["nodes"].as_array() else {
-        return Ok(None);
-    };
-    for root in roots {
-        let Some(ix) = root.as_u64() else {
-            return Ok(None);
+        return match scene_ix {
+            None => Ok(out),
+            Some(_) => Err(Decline("scene: index out of range")),
         };
-        if !extract_node(json, bin, ix as usize, IDENTITY, 0, &mut out.primitives)? {
-            return Ok(None);
-        }
+    };
+    let roots = scene["nodes"]
+        .as_array()
+        .ok_or(Decline("scene: nodes missing or not an array"))?;
+    for root in roots {
+        let ix = root
+            .as_u64()
+            .ok_or(Decline("scene: a root node index is not an integer"))?;
+        extract_node(json, bin, ix as usize, IDENTITY, 0, &mut out.primitives)?;
     }
     // An out-of-range `material` index fails the `gltf` crate's
     // `validate_minimally`, i.e. the inline route errors the whole tile.
@@ -324,9 +374,30 @@ pub fn extract_tile_meshes(
         .iter()
         .any(|p| p.material.is_some_and(|ix| ix >= out.materials.len()))
     {
-        return Ok(None);
+        return Err(Decline("primitive: material index out of range"));
     }
-    Ok(Some(out))
+    Ok(out)
+}
+
+/// The decline reason for a surviving required extension, by name for the
+/// ones the `gltf` crate can be built to accept (the inline route then draws
+/// the tile and only extraction declines it) and for quantized geometry.
+fn required_why(name: Option<&str>) -> &'static str {
+    match name {
+        Some("KHR_texture_transform") => "extensionsRequired: KHR_texture_transform",
+        Some("KHR_mesh_quantization") => "extensionsRequired: KHR_mesh_quantization",
+        Some("KHR_lights_punctual") => "extensionsRequired: KHR_lights_punctual",
+        Some("KHR_materials_pbrSpecularGlossiness") => {
+            "extensionsRequired: KHR_materials_pbrSpecularGlossiness"
+        }
+        Some("KHR_materials_transmission") => "extensionsRequired: KHR_materials_transmission",
+        Some("KHR_materials_ior") => "extensionsRequired: KHR_materials_ior",
+        Some("KHR_materials_emissive_strength") => {
+            "extensionsRequired: KHR_materials_emissive_strength"
+        }
+        Some("EXT_texture_webp") => "extensionsRequired: EXT_texture_webp",
+        _ => "extensionsRequired: another extension",
+    }
 }
 
 /// An OPTIONAL JSON index. `None` = **decline**: present but not an unsigned
@@ -419,16 +490,20 @@ fn textures_valid(json: &Value) -> bool {
 }
 
 /// Every material of the document, in index order, plus the base-colour
-/// textures they use (one entry per glTF texture). `None` = decline (a
-/// material shape this cannot reproduce). Runs after [`textures_valid`].
+/// textures they use (one entry per glTF texture). A decline is a material
+/// shape this cannot reproduce. Runs after [`textures_valid`].
 fn extract_materials(
     json: &Value,
     bin: Option<&[u8]>,
-) -> Option<(Vec<ExtractedMaterial>, Vec<ExtractedTexture>)> {
+) -> Result<(Vec<ExtractedMaterial>, Vec<ExtractedTexture>), Stop> {
     let Some(materials) = json["materials"].as_array() else {
         // Absent is "no materials"; present-but-not-an-array fails serde, so it
         // declines rather than rendering everything with the default material.
-        return json["materials"].is_null().then(Default::default);
+        return if json["materials"].is_null() {
+            Ok(Default::default())
+        } else {
+            Err(Decline("materials: not an array"))
+        };
     };
     let mut out = Vec::with_capacity(materials.len());
     let mut textures = Vec::new();
@@ -451,10 +526,13 @@ fn extract_materials(
                 .filter_map(|x| x.as_f64())
                 .map(|x| x as f32)
                 .collect();
-            mat.base_color = <[f32; 4]>::try_from(v).ok()?;
+            mat.base_color = <[f32; 4]>::try_from(v)
+                .map_err(|_| Decline("material: baseColorFactor is not 4 numbers"))?;
         }
-        mat.metallic = opt_f32(&pbr["metallicFactor"], mat.metallic)?;
-        mat.roughness = opt_f32(&pbr["roughnessFactor"], mat.roughness)?;
+        mat.metallic = opt_f32(&pbr["metallicFactor"], mat.metallic)
+            .ok_or(Decline("material: metallicFactor is not a number"))?;
+        mat.roughness = opt_f32(&pbr["roughnessFactor"], mat.roughness)
+            .ok_or(Decline("material: roughnessFactor is not a number"))?;
         if let Some(tex) = pbr["baseColorTexture"]["index"].as_u64() {
             let ix = match seen.get(&tex) {
                 Some(&ix) => ix,
@@ -469,41 +547,54 @@ fn extract_materials(
         }
         out.push(mat);
     }
-    Some((out, textures))
+    Ok((out, textures))
 }
 
-/// One base-colour texture, encoded bytes copied out of the BIN chunk. `None`
-/// = decline: the inline decode errors on a URI image, a buffer outside the
-/// BIN chunk and a MIME type it cannot decode, so the tile goes S4 and inline
+/// One base-colour texture, encoded bytes copied out of the BIN chunk. It
+/// declines where the inline decode errors (a URI image, a buffer outside the
+/// BIN chunk, a MIME type it cannot decode), so the tile goes S4 and inline
 /// reproduces that error.
-fn base_color_texture(json: &Value, bin: Option<&[u8]>, tex: usize) -> Option<ExtractedTexture> {
+fn base_color_texture(
+    json: &Value,
+    bin: Option<&[u8]>,
+    tex: usize,
+) -> Result<ExtractedTexture, Stop> {
     let texture = &json["textures"][tex];
-    let image = &json["images"][texture["source"].as_u64()? as usize];
-    let view = image["bufferView"].as_u64()? as usize;
-    let mime = image["mimeType"].as_str()?;
-    if !matches!(mime, "image/png" | "image/jpeg" | "image/ktx2")
-        || !json["buffers"][0]["uri"].is_null()
-    {
-        return None;
+    let source = texture["source"]
+        .as_u64()
+        .ok_or(Decline("base colour texture: no source"))?;
+    let image = &json["images"][source as usize];
+    let view = image["bufferView"]
+        .as_u64()
+        .ok_or(Decline("base colour image: a URI, not a bufferView"))? as usize;
+    let mime = image["mimeType"]
+        .as_str()
+        .ok_or(Decline("base colour image: no mimeType"))?;
+    if !matches!(mime, "image/png" | "image/jpeg" | "image/ktx2") {
+        return Err(Decline("base colour image: not png, jpeg or ktx2"));
     }
-    let bytes = crate::buffer_view_slice(json, bin, view).ok()?.to_vec();
+    if !json["buffers"][0]["uri"].is_null() {
+        return Err(Decline("buffer 0: an external uri"));
+    }
+    let bytes = crate::buffer_view_slice(json, bin, view)
+        .map_err(|_| Decline("base colour image: bufferView outside the BIN chunk"))?
+        .to_vec();
     let sampler = match texture["sampler"].as_u64() {
         Some(s) => &json["samplers"][s as usize],
         None => &Value::Null,
     };
-    Some(ExtractedTexture {
+    Ok(ExtractedTexture {
         image: TileImage::Encoded {
             mime: mime.to_string(),
             bytes,
         },
-        wrap_s: TextureWrap::of(&sampler["wrapS"])?,
-        wrap_t: TextureWrap::of(&sampler["wrapT"])?,
+        wrap_s: TextureWrap::of(&sampler["wrapS"]).ok_or(Decline("sampler: invalid wrapS"))?,
+        wrap_t: TextureWrap::of(&sampler["wrapT"]).ok_or(Decline("sampler: invalid wrapT"))?,
     })
 }
 
 /// Walk one node: its own mesh primitives first, then its children — the
 /// inline route's order, which is the order the consumer spawns entities in.
-/// `Ok(false)` = decline.
 fn extract_node(
     json: &Value,
     bin: Option<&[u8]>,
@@ -511,26 +602,23 @@ fn extract_node(
     parent: Mat4,
     depth: usize,
     out: &mut Vec<ExtractedPrimitive>,
-) -> Result<bool, DecodeError> {
+) -> Result<(), Stop> {
     if depth > MAX_NODE_DEPTH {
-        return Ok(false);
+        return Err(Decline("node graph deeper than 256 levels"));
     }
     let node = &json["nodes"][node_ix];
     if node.is_null() {
-        return Ok(false); // dangling index — the gltf crate rejects the file
+        // The gltf crate rejects the file.
+        return Err(Decline("node: dangling index"));
     }
-    let Some(local) = node_matrix(node) else {
-        return Ok(false);
-    };
+    let local = node_matrix(node).ok_or(Decline("node: malformed matrix or TRS"))?;
     let global = mat4_mul(&parent, &local);
 
-    let Some(mesh) = opt_index(&node["mesh"]) else {
-        return Ok(false);
-    };
+    let mesh = opt_index(&node["mesh"]).ok_or(Decline("node: mesh index not an integer"))?;
     if let Some(mesh_ix) = mesh {
-        let Some(prims) = json["meshes"][mesh_ix as usize]["primitives"].as_array() else {
-            return Ok(false);
-        };
+        let prims = json["meshes"][mesh_ix as usize]["primitives"]
+            .as_array()
+            .ok_or(Decline("mesh: missing, or no primitives array"))?;
         for (prim_ix, prim) in prims.iter().enumerate() {
             // Non-TRIANGLES content (POINTS/LINES, and the splat/point
             // renderers behind them) is the consumer's business.
@@ -538,14 +626,16 @@ fn extract_node(
             // integer declines rather than defaulting to 4 (see `opt_index`).
             match opt_index(&prim["mode"]) {
                 Some(None) | Some(Some(4)) => {}
-                _ => return Ok(false),
+                _ => return Err(Decline("primitive: mode is not TRIANGLES")),
             }
-            let Some(extracted) =
-                extract_primitive(json, bin, prim, global, mesh_ix, prim_ix as u64)?
-            else {
-                return Ok(false);
-            };
-            out.push(extracted);
+            out.push(extract_primitive(
+                json,
+                bin,
+                prim,
+                global,
+                mesh_ix,
+                prim_ix as u64,
+            )?);
         }
     }
 
@@ -553,22 +643,41 @@ fn extract_node(
     // not-an-array fails serde. Ignoring it would drop the whole subtree and
     // render a partial scene where the inline route errors.
     if !node["children"].is_null() {
-        let Some(children) = node["children"].as_array() else {
-            return Ok(false);
-        };
+        let children = node["children"]
+            .as_array()
+            .ok_or(Decline("node: children not an array"))?;
         for child in children {
-            let Some(ix) = child.as_u64() else {
-                return Ok(false);
-            };
-            if !extract_node(json, bin, ix as usize, global, depth + 1, out)? {
-                return Ok(false);
-            }
+            let ix = child
+                .as_u64()
+                .ok_or(Decline("node: a child index is not an integer"))?;
+            extract_node(json, bin, ix as usize, global, depth + 1, out)?;
         }
     }
-    Ok(true)
+    Ok(())
 }
 
-/// One TRIANGLES primitive → typed buffers. `Ok(None)` = decline.
+/// Decline reasons of one vertex attribute: `[integer components, any other
+/// shape]`. Core glTF allows normalized integer `TEXCOORD_n`/`COLOR_n`
+/// without any extension, so that case has its own reason.
+type AttrWhy = [&'static str; 2];
+const POSITION_WHY: AttrWhy = [
+    "POSITION: integer (quantized) components",
+    "POSITION: not a plain FLOAT VEC3 accessor",
+];
+const NORMAL_WHY: AttrWhy = [
+    "NORMAL: integer (quantized) components",
+    "NORMAL: not a plain FLOAT VEC3 accessor",
+];
+const TEXCOORD_WHY: AttrWhy = [
+    "TEXCOORD_0: integer (normalized) components",
+    "TEXCOORD_0: not a plain FLOAT VEC2 accessor",
+];
+const COLOR_WHY: AttrWhy = [
+    "COLOR_0: integer (normalized) components",
+    "COLOR_0: not a plain FLOAT VEC4 accessor",
+];
+
+/// One TRIANGLES primitive → typed buffers.
 fn extract_primitive(
     json: &Value,
     bin: Option<&[u8]>,
@@ -576,38 +685,32 @@ fn extract_primitive(
     transform: Mat4,
     mesh_ix: u64,
     prim_ix: u64,
-) -> Result<Option<ExtractedPrimitive>, DecodeError> {
+) -> Result<ExtractedPrimitive, Stop> {
     let attrs = &prim["attributes"];
     // A primitive whose geometry hangs off an extension (Draco) has no plain
     // POSITION accessor to read.
-    let Some(pos_ix) = attrs["POSITION"].as_u64() else {
-        return Ok(None);
-    };
-    let Some(positions) = float_attribute::<3>(json, bin, pos_ix as usize, "VEC3")? else {
-        return Ok(None);
-    };
+    let pos_ix = attrs["POSITION"]
+        .as_u64()
+        .ok_or(Decline("POSITION: missing (geometry in an extension)"))?;
+    let positions = float_attribute::<3>(json, bin, pos_ix as usize, "VEC3", POSITION_WHY)?;
 
     // Optional attributes. Present-but-unreadable DECLINES — it must never
     // fall through as absent: a missing NORMAL means "smooth-compute", which
     // is a different mesh from one whose normals we simply failed to read.
-    let Some(normals) = optional_float::<3>(json, bin, attrs, "NORMAL", "VEC3")? else {
-        return Ok(None);
-    };
-    let Some(uvs) = optional_float::<2>(json, bin, attrs, "TEXCOORD_0", "VEC2")? else {
-        return Ok(None);
-    };
-    let Some(colors) = optional_float::<4>(json, bin, attrs, "COLOR_0", "VEC4")? else {
-        return Ok(None);
-    };
+    let normals = optional_float::<3>(json, bin, attrs, "NORMAL", "VEC3", NORMAL_WHY)?;
+    let uvs = optional_float::<2>(json, bin, attrs, "TEXCOORD_0", "VEC2", TEXCOORD_WHY)?;
+    let colors = optional_float::<4>(json, bin, attrs, "COLOR_0", "VEC4", COLOR_WHY)?;
     let indices = match &prim["indices"] {
         Value::Null => None,
-        v => match v.as_u64() {
-            Some(ix) => match read_indices(json, bin, ix as usize)? {
-                Some(v) => Some(v),
-                None => return Ok(None),
-            },
-            None => return Ok(None),
-        },
+        v => {
+            let ix = v
+                .as_u64()
+                .ok_or(Decline("indices: accessor index not an integer"))?;
+            Some(
+                read_indices(json, bin, ix as usize)?
+                    .ok_or(Decline("indices: not a plain u8/u16/u32 SCALAR accessor"))?,
+            )
+        }
     };
 
     // bevy's `compute_normals` panics on an index past the vertex count, and
@@ -617,14 +720,13 @@ fn extract_primitive(
         .as_ref()
         .is_some_and(|ix| ix.iter().any(|&i| i as usize >= positions.len()))
     {
-        return Ok(None);
+        return Err(Decline("indices: an index past the vertex count"));
     }
 
-    let Some(material) = opt_index(&prim["material"]) else {
-        return Ok(None);
-    };
+    let material =
+        opt_index(&prim["material"]).ok_or(Decline("primitive: material index not an integer"))?;
 
-    Ok(Some(ExtractedPrimitive {
+    Ok(ExtractedPrimitive {
         transform,
         mesh_ix,
         prim_ix,
@@ -638,47 +740,49 @@ fn extract_primitive(
         // Filled by `prepare_tile_inner` once the feature table is read.
         feature_uv1: None,
         feature_of_triangle: None,
-    }))
+    })
 }
 
-/// An OPTIONAL `FLOAT` vertex attribute, with the decline arm folded in:
-/// `Ok(None)` = decline the tile, `Ok(Some(None))` = the attribute is absent,
-/// `Ok(Some(Some(v)))` = read.
-#[allow(clippy::type_complexity)]
+/// An OPTIONAL `FLOAT` vertex attribute: `Ok(None)` = absent.
 fn optional_float<const N: usize>(
     json: &Value,
     bin: Option<&[u8]>,
     attrs: &Value,
     name: &str,
     dims: &str,
-) -> Result<Option<Option<Vec<[f32; N]>>>, DecodeError> {
+    why: AttrWhy,
+) -> Result<Option<Vec<[f32; N]>>, Stop> {
     match &attrs[name] {
-        Value::Null => Ok(Some(None)),
-        v => match v.as_u64() {
-            Some(ix) => Ok(float_attribute::<N>(json, bin, ix as usize, dims)?.map(Some)),
-            None => Ok(None),
-        },
+        Value::Null => Ok(None),
+        v => {
+            let ix = v.as_u64().ok_or(Decline(why[1]))?;
+            float_attribute::<N>(json, bin, ix as usize, dims, why).map(Some)
+        }
     }
 }
 
-/// Read a `FLOAT` vertex attribute. `Ok(None)` = decline: any other component
-/// type (normalized u8/u16, quantized) or a sparse accessor is a conversion
-/// whose rounding would have to match the `gltf` crate's exactly, and "close
+/// Read a `FLOAT` vertex attribute. Any other component type (normalized
+/// u8/u16, quantized) or a sparse accessor declines: it is a conversion whose
+/// rounding would have to match the `gltf` crate's exactly, and "close
 /// enough" is not a thing this seam can offer.
 fn float_attribute<const N: usize>(
     json: &Value,
     bin: Option<&[u8]>,
     acc_ix: usize,
     dims: &str,
-) -> Result<Option<Vec<[f32; N]>>, DecodeError> {
+    why: AttrWhy,
+) -> Result<Vec<[f32; N]>, Stop> {
     let acc = &json["accessors"][acc_ix];
-    if acc["componentType"].as_u64() != Some(5126)
-        || acc["type"].as_str() != Some(dims)
-        || !acc["sparse"].is_null()
-    {
-        return Ok(None);
+    match acc["componentType"].as_u64() {
+        Some(5126) => {}
+        // BYTE, UNSIGNED_BYTE, SHORT, UNSIGNED_SHORT.
+        Some(5120..=5123) => return Err(Decline(why[0])),
+        _ => return Err(Decline(why[1])),
     }
-    Ok(Some(read_accessor::<N>(json, bin, acc_ix)?))
+    if acc["type"].as_str() != Some(dims) || !acc["sparse"].is_null() {
+        return Err(Decline(why[1]));
+    }
+    Ok(read_accessor::<N>(json, bin, acc_ix)?)
 }
 
 /// Read an index accessor widened to u32 (u8/u16/u32 — the same set the `gltf`
@@ -924,6 +1028,67 @@ mod tests {
             extract_tile_meshes(&json, Some(&bin), ExtractOptions::default())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Each decline names its rule, so a host can say why a layer stays on
+    /// the main thread: a surviving required extension by name, normalized
+    /// integer UVs (legal core glTF), a non-TRIANGLES mode. Every reason here
+    /// is checked against a control that extracts.
+    #[test]
+    fn declines_name_their_rule() {
+        let why = |json: &Value, bin: &[u8]| {
+            extract_tile_meshes_why(json, Some(bin), ExtractOptions::default())
+                .unwrap()
+                .err()
+        };
+        let bin = vec![0u8; 36];
+        let ok = doc(serde_json::json!({ "attributes": { "POSITION": 0 } }));
+        assert_eq!(why(&ok, &bin), None, "control extracts");
+
+        let mut required = ok.clone();
+        required["extensionsRequired"] =
+            serde_json::json!(["KHR_materials_unlit", "KHR_texture_transform"]);
+        assert_eq!(
+            why(&required, &bin),
+            Some("extensionsRequired: KHR_texture_transform")
+        );
+        required["extensionsRequired"] = serde_json::json!(["KHR_something_new"]);
+        assert_eq!(
+            why(&required, &bin),
+            Some("extensionsRequired: another extension")
+        );
+
+        // Accessor 1 is UNSIGNED_SHORT; made VEC2 it is a normalized UV set.
+        let mut uv16 = doc(serde_json::json!({ "attributes": { "POSITION": 0, "TEXCOORD_0": 1 } }));
+        uv16["accessors"][1]["type"] = serde_json::json!("VEC2");
+        uv16["accessors"][1]["normalized"] = serde_json::json!(true);
+        assert_eq!(
+            why(&uv16, &bin),
+            Some("TEXCOORD_0: integer (normalized) components")
+        );
+        let mut uv_sparse = uv16.clone();
+        uv_sparse["accessors"][1]["componentType"] = serde_json::json!(5126);
+        uv_sparse["accessors"][1]["sparse"] = serde_json::json!({ "count": 0 });
+        assert_eq!(
+            why(&uv_sparse, &bin),
+            Some("TEXCOORD_0: not a plain FLOAT VEC2 accessor")
+        );
+
+        let points = doc(serde_json::json!({ "mode": 0, "attributes": { "POSITION": 0 } }));
+        assert_eq!(why(&points, &bin), Some("primitive: mode is not TRIANGLES"));
+
+        let off = ExtractOptions {
+            textures: false,
+            ..Default::default()
+        };
+        let mut textured = ok.clone();
+        textured["images"] = serde_json::json!([{ "mimeType": "image/png", "bufferView": 0 }]);
+        assert_eq!(
+            extract_tile_meshes_why(&textured, Some(&bin), off)
+                .unwrap()
+                .err(),
+            Some("textures off (ExtractOptions::textures)")
         );
     }
 

@@ -1070,6 +1070,13 @@ pub struct PreparedTile {
     pub copyright: Option<String>,
     /// Feature-picking data, when the tile carries `EXT_mesh_features`.
     pub features: Option<PreparedFeatures>,
+    /// Why extraction declined this tile (`meshes` is `None` although it was
+    /// asked for): a short, stable phrase naming the first rule the content
+    /// failed, e.g. `"extensionsRequired: KHR_texture_transform"` or
+    /// `"TEXCOORD_0: integer (normalized) components"`. `None` when the tile
+    /// extracted or extraction was not asked for. Diagnostics only: the tile
+    /// renders the same either way.
+    pub extract_declined: Option<&'static str>,
 }
 
 /// Would [`prepare_tile`] hand these bytes straight back — either declined
@@ -1272,6 +1279,7 @@ fn prepare_tile_inner(
             rtc_center: b3dm_rtc.map(tile_rtc_to_content_frame),
             copyright: None,
             features: None,
+            extract_declined: None,
         }));
     }
 
@@ -1353,9 +1361,12 @@ fn prepare_tile_inner(
     // S5: geometry off the document we already hold. Runs BEFORE the feature
     // pass (which consumes `json`) and before the container rebuild — when it
     // succeeds there is no container to rebuild, because nobody will parse one.
-    let mut meshes = match extract {
-        Some(opts) => extract_tile_meshes(&json, bin, opts)?,
-        None => None,
+    let (mut meshes, extract_declined) = match extract {
+        Some(opts) => match extract::extract_tile_meshes_why(&json, bin, opts)? {
+            Ok(m) => (Some(m), None),
+            Err(why) => (None, Some(why)),
+        },
+        None => (None, None),
     };
 
     let glb = if meshes.is_some() {
@@ -1413,6 +1424,7 @@ fn prepare_tile_inner(
         rtc_center,
         copyright,
         features,
+        extract_declined,
     }))
 }
 
@@ -1764,7 +1776,7 @@ mod tests {
         let jpeg = [0xFFu8, 0xD8, 0xFF, 0xD9];
         let mut bin = draco_payload.to_vec();
         bin.extend_from_slice(&jpeg);
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "asset": { "version": "2.0", "copyright": "Data A;Data B" },
             "extensionsUsed": ["KHR_draco_mesh_compression", "KHR_materials_unlit"],
             "extensionsRequired": ["KHR_draco_mesh_compression", "KHR_materials_unlit"],
@@ -1808,8 +1820,12 @@ mod tests {
                 .unwrap()
                 .expect("prepared");
             let Some(m) = p.meshes else {
-                panic!("declined to S4 (georeferenced {georeferenced})");
+                panic!(
+                    "declined to S4 (georeferenced {georeferenced}): {:?}",
+                    p.extract_declined
+                );
             };
+            assert_eq!(p.extract_declined, None);
             assert_eq!(m.primitives.len(), 1);
             let prim = &m.primitives[0];
             assert_eq!(prim.uvs.as_ref().map(Vec::len), Some(4));
@@ -1830,6 +1846,21 @@ mod tests {
             assert_eq!(m.textures[0].wrap_s, TextureWrap::ClampToEdge);
             assert_eq!(p.rtc_center.is_some(), georeferenced, "planetary offset");
         }
+        // The same tile with one more required extension goes S4, and says why.
+        json["extensionsRequired"] = serde_json::json!([
+            "KHR_draco_mesh_compression",
+            "KHR_materials_unlit",
+            "KHR_texture_transform"
+        ]);
+        let glb = assemble_glb(&serde_json::to_vec(&json).unwrap(), &bin);
+        let p = prepare_tile_extracting_with_draco(&glb, true, vec![quad()])
+            .unwrap()
+            .expect("prepared");
+        assert!(p.meshes.is_none() && !p.glb.is_empty(), "S4");
+        assert_eq!(
+            p.extract_declined,
+            Some("extensionsRequired: KHR_texture_transform")
+        );
     }
 
     /// The worker fills every missing normal (prepare 0.3), so the consumer

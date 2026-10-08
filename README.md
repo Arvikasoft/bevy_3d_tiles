@@ -246,7 +246,11 @@ mining site with ~450 resident tiles). Breaking changes:
   `Mesh::compute_normals` bit for bit). `extract_tile_meshes` takes an
   `ExtractOptions` (both on by default; the `prepare_tile_extracting*`
   functions keep their signatures, `prepare_tile_extracting_with` takes the
-  options). `DecodedMaterial` gains `base_color_host`.
+  options). `DecodedMaterial` gains `base_color_host`. A document that
+  requires only `KHR_materials_unlit` extracts too (photorealistic layers
+  require it on every tile). `PreparedTile` gains `extract_declined`, a short
+  stable phrase naming why extraction declined a tile (`None` when it
+  extracted), so a hook that builds one by struct literal sets it to `None`.
 - **Host-decoded textures need a `TileTextureHook`.** A hook may decode a
   texture itself and hand the crate an opaque `TileImage::Host` token; the
   crate builds a data-less destination `Image` and calls the hook once per
