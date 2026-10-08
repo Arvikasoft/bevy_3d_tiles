@@ -1086,9 +1086,9 @@ pub struct PreparedTile {
 ///
 /// For callers that pay to ship the tile somewhere else (a Web Worker
 /// transfer, an IPC hop): the answer costs one header read plus a marker scan
-/// of the kilobyte JSON chunk, and saves a round trip that learns nothing. A
-/// Google P3DT layer is Draco on every tile, so that is a per-tile saving for
-/// a whole session. Both answers route the tile to the caller's own inline
+/// of the kilobyte JSON chunk, and saves a round trip that learns nothing. For
+/// a layer that is Draco on every tile, that is a per-tile saving for a whole
+/// session. Both answers route the tile to the caller's own inline
 /// decode, which is what `Ok(None)` does too.
 ///
 /// Bytes that are not a container at all answer `false` — let [`prepare_tile`]
@@ -1135,10 +1135,11 @@ pub fn extract_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
 /// [`extract_would_decline`] for a host whose worker owns a Draco decoder and
 /// prepares via [`prepare_tile_extracting_with_draco`]: Draco tiles ARE worth
 /// dispatching there (the decode itself moves off-thread), so only splats and
-/// the unextractable-vanilla case still decline. A Google P3DT layer is Draco
-/// (and textured) on every tile, so under this predicate its tiles round-trip
-/// with the Draco decode + splice done worker-side, and (prepare 0.3) come
-/// back extracted, textures included.
+/// the unextractable-vanilla case still decline. A Draco, textured layer then
+/// round-trips with the Draco decode + splice done worker-side and (prepare
+/// 0.3) comes back extracted, textures included. A photorealistic layer can
+/// also arrive as plain glTF (pre-decoded for a client without Draco); that is
+/// the vanilla case and extracts the same way.
 pub fn extract_would_decline_with_draco(bytes: &[u8], georeferenced: bool) -> bool {
     extract_triage(bytes, georeferenced, true)
 }
