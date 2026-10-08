@@ -1,14 +1,14 @@
-//! KTX2 / Basis (UASTC) tile-texture transcode for wasm (BEVY-3D-TILES T7).
+//! KTX2 / Basis (UASTC) tile-texture transcode for wasm.
 //!
 //! bevy's basis transcoder is C++ (`basis-universal-sys`) and won't build for
-//! `wasm32-unknown-unknown` (no libc — the "no C toolchain in the wasm build"
-//! locked decision, the same reason meshopt is a pure-Rust port). So on wasm we
+//! `wasm32-unknown-unknown` (no libc — the wasm build takes no C toolchain, by
+//! design, the same reason meshopt is a pure-Rust port). So on wasm we
 //! transcode `KHR_texture_basisu` KTX2 textures through the
-//! `window.__tt_ktx2_transcode` shim (see `index.html`), which lazy-loads
+//! `window.__tt_ktx2_transcode` shim (see `wasm/shims.js`), which lazy-loads
 //! KTX-Software's vendored `libktx_read.wasm` and returns transcoded bytes
 //! (KTX2 container + zstd + UASTC → BC7 or RGBA8, in one call). Native builds
 //! use bevy's `basis-universal` feature directly (see `content.rs`), so this
-//! module is wasm-only (declared `#[cfg(target_arch = "wasm32")]` in `mod.rs`).
+//! module is wasm-only (declared `#[cfg(target_arch = "wasm32")]` in `lib.rs`).
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;

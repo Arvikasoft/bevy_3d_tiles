@@ -296,7 +296,7 @@ Behavioral:
   the missing normals run on the preparing thread. Encoded base-colour
   textures still decode on the main thread unless a `TileTextureHook` takes
   them as host-decoded tokens. `ExtractOptions { textures: false, .. }` keeps
-  the 0.4 route for textured content.
+  textured content on the prepared route, as in 0.4.
 - `TilePickMesh::raycast()` visits only the runs of 64 triangles whose padded
   bounds the ray touches, for the same nearest hit. A copy's first ray builds
   those bounds (under one full walk); every later ray costs a small fraction
@@ -319,7 +319,8 @@ Behavioral:
 - Extraction **declines** (`meshes: None`) anything it cannot reproduce
   byte-identically to the in-engine decode — textured tiles, non-triangle
   content, quantized/integer vertex attributes, a surviving `extensionsRequired`
-  — and those tiles take the previous route with identical output.
+  — and those tiles take the prepared route (the 0.3 behaviour) with identical
+  output.
 - `DecodedTile::stage_ms[1]` (the glTF parse) reads **0** on the extracted
   route, and `[2]` measures the `Mesh` build alone.
 

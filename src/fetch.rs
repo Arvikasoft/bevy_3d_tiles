@@ -1,4 +1,4 @@
-//! Byte-source IO for 3D Tiles content (BEVY-3D-TILES-PLAN T0).
+//! Byte-source IO for 3D Tiles content.
 //!
 //! Adapts the basemap fetch layer's discipline to tile streaming:
 //!
@@ -11,15 +11,15 @@
 //!   exploded tilesets fetch whole entries ([`ByteSource::read_all_abortable`] /
 //!   [`TilesetSource::Exploded`]).
 //! * Native gets a real implementation (filesystem + blocking reqwest on a
-//!   worker thread) instead of basemap's fail-fast stub, because the T0 gate
-//!   requires the fixture to render natively too.
+//!   worker thread) instead of basemap's fail-fast stub, because the fixture
+//!   must render natively too.
 //!
-//! T1 additions:
+//! On top of that:
 //! * **Cache-Storage CAS** for whole-entry reads ([`TilesetSource::read_entry_cached`]):
 //!   keyed by the SAS-stripped archive/base URL + entry path (asset blobs are
-//!   hash-named and immutable, mirroring `asset_loader::remote_source`). The
-//!   ranged *open* path (index/suffix reads) is never cached — only complete
-//!   entries are.
+//!   hash-named and immutable, mirroring the host's whole-file asset cache).
+//!   The ranged *open* path (index/suffix reads) is never cached — only
+//!   complete entries are.
 //! * **Abort plumbing** ([`AbortHandle`] + the generation-keyed registry): the
 //!   scheduler cancels the actual network transfer of a request that fell out
 //!   of the cut, not just its slot state. wasm wires a real `AbortController`
@@ -371,17 +371,16 @@ impl ByteSource {
     }
 }
 
-// ── Live sessioned sources (Google P3DT, T4) ─────────────────────────────────
+// ── Live sessioned sources (Google P3DT) ─────────────────────────────────────
 
 /// Per-day budget of **billable session-opening (root) requests** for a live
 /// source. Google meters Photorealistic 3D Tiles on root tileset requests
 /// only — requests carrying a `session` token are free and unmetered — so
 /// that is the unit counted here (charging every fetch tripped a 2000 cap in
-/// one world load, 2026-08-07). The denormalized `daily_request_cap` from the
-/// layer row is a HARD client-side stop (BEVY-3D-TILES D7 — the 2026-05-30
-/// cost-incident lesson); `cap == 0` means no client-side limit. On wasm the
-/// count persists across reloads in `localStorage` under a UTC-date key, so
-/// "daily" survives a refresh.
+/// one world load). The denormalized `daily_request_cap` from the layer row is
+/// a HARD client-side stop (a guard against runaway API cost); `cap == 0`
+/// means no client-side limit. On wasm the count persists across reloads in
+/// `localStorage` under a UTC-date key, so "daily" survives a refresh.
 #[derive(Debug)]
 pub struct BudgetCounter {
     used: std::sync::atomic::AtomicU32,
@@ -484,7 +483,7 @@ fn local_storage_set_u32(key: &str, value: u32) {
 }
 
 /// A live, sessioned, budget-capped tileset endpoint — Google Photorealistic
-/// 3D Tiles (plan D7). Every entry request carries the org's API key and the
+/// 3D Tiles. Every entry request carries the org's API key and the
 /// session token (extracted from the first content URI the root tileset
 /// returns; all subsequent requests must echo it). Content is **never**
 /// CAS-cached and never stored — the ToS forbids persistence; the renderer
@@ -660,14 +659,14 @@ impl TilesetSource {
     /// Cache key = SAS-stripped source URL + `/` + entry path. Asset blobs are
     /// hash-named (`…/whole/<hash>.3tz`) and mirror prefixes are
     /// version-scoped, so the key is content-addressed and survives SAS
-    /// rotation — same scheme as `asset_loader::remote_source`.
+    /// rotation — same scheme as the host's whole-file asset cache.
     pub async fn read_entry_cached(
         &self,
         uri: &str,
         abort: Option<&AbortHandle>,
     ) -> Result<Vec<u8>, FetchError> {
         // Live sources (Google P3DT) BYPASS the CAS entirely: the ToS forbids
-        // persisting tile content (plan D7) — gate-tested, don't "optimize".
+        // persisting tile content — a test pins this, don't "optimize".
         if matches!(self, TilesetSource::Live(_)) {
             return self.read_entry_raw(uri, abort).await;
         }
@@ -740,8 +739,8 @@ impl TilesetSource {
     }
 }
 
-/// Cache Storage bucket shared with the whole-file asset path
-/// (`asset_loader::remote_source`) — one CAS, one invalidation knob.
+/// Cache Storage bucket shared with the host's whole-file asset path — one
+/// CAS, one invalidation knob.
 #[cfg(target_arch = "wasm32")]
 const CONTENT_CACHE: &str = "tt-asset-cas-v1";
 
@@ -1169,8 +1168,8 @@ mod tests {
         assert!(!unlimited.exhausted());
     }
 
-    /// The CAS-bypass gate (D7): a Live source never produces a cache key,
-    /// and a budget-exhausted source refuses a session-OPENING request
+    /// The CAS-bypass guard (Google ToS): a Live source never produces a cache
+    /// key, and a budget-exhausted source refuses a session-OPENING request
     /// outright (no session adopted yet ⇒ the request would be billable).
     #[test]
     fn live_source_bypasses_cas_and_enforces_budget() {

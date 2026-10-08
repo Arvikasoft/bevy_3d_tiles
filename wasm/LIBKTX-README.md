@@ -4,11 +4,11 @@
 [KTX-Software](https://github.com/KhronosGroup/KTX-Software) **v4.4.2**
 (Apache-2.0), from the release asset `KTX-Software-4.4.2-Web-libktx_read.zip`.
 
-It is lazy-loaded by the `__tt_ktx2_transcode` shim in `index.html` to transcode
+It is lazy-loaded by the `__tt_ktx2_transcode` shim in `shims.js` to transcode
 `KHR_texture_basisu` KTX2/UASTC tile textures → BC7 (or RGBA8) on the wasm
 viewer — bevy's own basis transcoder is C++ and won't build for
-`wasm32-unknown-unknown` (the locked "no C toolchain in the wasm build"
-decision), so we transcode in JS exactly like the Draco shim. Native builds use
+`wasm32-unknown-unknown` (the wasm build takes no C toolchain, by design), so
+we transcode in JS exactly like the Draco shim. Native builds use
 bevy's `basis-universal` feature instead (C++ compiles fine off-wasm).
 
 To update: download the matching `-Web-libktx_read.zip` from the KTX-Software

@@ -1,12 +1,12 @@
-//! Pure-Rust `EXT_meshopt_compression` decoder for tile content (BEVY-3D-TILES
-//! T6, decision D12 — we EMIT meshopt, never Draco, and decode it on the CPU).
+//! Pure-Rust `EXT_meshopt_compression` decoder for tile content (we EMIT
+//! meshopt, never Draco, and decode it on the CPU).
 //!
 //! A faithful port of the reference decoder bundled with the writer's encoder
 //! (`meshoptimizer/meshopt_decoder_reference.js`, by Jasper St. Pierre / Arseny
 //! Kapoulkine, MIT) — chosen over the `meshopt` FFI crate so the wasm build
-//! stays C-toolchain-free (the plan's "(T6) meshopt C FFI complicates the wasm
-//! build" risk). The codec decodes at GB/s and is small and self-contained, so
-//! the port is ~one screen per stage:
+//! stays C-toolchain-free (a meshopt C FFI would complicate the wasm build).
+//! The codec decodes at GB/s and is small and self-contained, so the port is
+//! ~one screen per stage:
 //!
 //! * [`decode_vertex_buffer`] — `ATTRIBUTES` mode (v0 `0xa0` + v1 `0xa1`),
 //! * [`decode_index_buffer`] — `TRIANGLES` mode (`0xe1`),
@@ -720,8 +720,7 @@ mod tests {
     use super::*;
 
     /// Decode a compact hex string into bytes (test vectors are captured from
-    /// the bundled `meshoptimizer` encoder + reference decoder; see
-    /// `gen_meshopt_vectors` notes in the BEVY-3D-TILES T6 commit).
+    /// the bundled `meshoptimizer` encoder + reference decoder).
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)

@@ -1,8 +1,8 @@
 //! Deterministic generator for the committed 3D Tiles fixture
-//! (BEVY-3D-TILES-PLAN T0 unit-test bed + dev-viewer gate).
+//! (the unit-test bed and the dev-viewer check).
 //!
 //! ```bash
-//! cargo run --example gen_tiles3d_fixture   # from bevy-client/
+//! cargo run --example gen_tiles3d_fixture   # from the crate root
 //! ```
 //!
 //! Emits `assets/fixtures/tiles3d-demo/` (exploded: tileset.json + 21 GLBs)
@@ -25,7 +25,7 @@
 //! authored in the shifted local frame — exercising the runtime's transform
 //! composition: if the math is right the quadrant lands 3 m above the rest.
 //!
-//! **Georeferenced mode (T4 verification, not committed):**
+//! **Georeferenced mode (georeference verification, not committed):**
 //!
 //! ```bash
 //! cargo run --example gen_tiles3d_fixture -- --geo <lon> <lat> <h> [out_dir]

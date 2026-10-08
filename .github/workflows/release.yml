@@ -24,9 +24,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      # Lockstep pair (offthread-decode plan §6): the prepare crate must land
-      # FIRST or the root publish cannot resolve its path+version dependency.
-      # Idempotent across re-runs: skip if this exact version already exists.
+      # Lockstep pair: the prepare crate must land FIRST or the root publish
+      # cannot resolve its path+version dependency. Idempotent across re-runs:
+      # skip if this exact version already exists.
       #
       # ONE-TIME SETUP, AND IT MUST HAPPEN BEFORE THE FIRST TAG: crates.io
       # attaches Trusted Publishing to an EXISTING crate, so it cannot be

@@ -4,7 +4,7 @@
 //   __tt_draco_decode  — Draco read for foreign tilesets (lazy gstatic decoder)
 //   __tt_ktx2_transcode — KTX2/Basis texture transcode via libktx_read.wasm
 // Without them: KTX2 tiles render untextured, Draco tiles fail cleanly.
-      // Draco decode shim for 3D Tiles content (tiles3d/draco.rs — Google
+      // Draco decode shim for 3D Tiles content (src/draco.rs — Google
       // Photorealistic 3D Tiles ship Draco-compressed meshes). Lazy-loads
       // Google's official glTF-subset decoder (Apache-2.0) from the
       // versioned gstatic CDN on FIRST use — non-P3DT sessions never pay.
@@ -86,11 +86,11 @@
         };
       })();
       // KTX2 / Basis (UASTC) transcode shim for 3D Tiles textures
-      // (tiles3d/ktx2.rs, BEVY-3D-TILES-PLAN T7). bevy's basis transcoder is
-      // C++ and won't build for wasm (the "no C toolchain in the wasm build"
-      // locked decision), so we transcode in JS via KTX-Software's
-      // libktx_read.wasm (vendored, copy-filed to the dist root; lazy-loaded on
-      // the FIRST KTX2 tile — PNG/JPEG tilesets never pay). Native builds use
+      // (src/ktx2.rs). bevy's basis transcoder is C++ and won't build for
+      // wasm (the wasm build takes no C toolchain, by design), so we
+      // transcode in JS via KTX-Software's libktx_read.wasm (vendored,
+      // copy-filed to the dist root; lazy-loaded on the FIRST KTX2 tile —
+      // PNG/JPEG tilesets never pay). Native builds use
       // bevy's `basis-universal` feature instead.
       // Contract: __tt_ktx2_transcode(Uint8Array ktx2, bool wantBc)
       //   -> Promise<{ format: "bc7" | "rgba8", width, height, data: Uint8Array }>

@@ -1,5 +1,5 @@
-//! CPU-side tile preparation for `bevy_3d_tiles` — the S4 seam of the
-//! offthread-decode plan: everything between "3D Tiles GLB bytes" and "plain
+//! CPU-side tile preparation for `bevy_3d_tiles` — the seam a prepare hook
+//! moves off-thread: everything between "3D Tiles GLB bytes" and "plain
 //! glTF bytes" that is pure CPU work with **no bevy dependency**, so a host
 //! can run it inside a Web Worker's own wasm module (or any other thread) and
 //! hand the result back through [`prepare_tile`]'s [`PreparedTile`].
@@ -355,7 +355,7 @@ pub fn strip_handled_extensions(json: &mut serde_json::Value) {
     }
 }
 
-// ── Draco / CESIUM_RTC preprocessing (T4 — Google P3DT content) ──────────────
+// ── Draco / CESIUM_RTC preprocessing (Google P3DT content) ───────────────────
 
 /// One `KHR_draco_mesh_compression` primitive found in the document. The
 /// Draco *decode* is a platform shim (main-thread JS on wasm) and stays in
@@ -607,7 +607,7 @@ fn push_json(json: &mut serde_json::Value, key: &str, value: serde_json::Value) 
     arr.len() - 1
 }
 
-// ── EXT_meshopt_compression preprocessing (T6 — our emitted geometry) ────────
+// ── EXT_meshopt_compression preprocessing (our emitted geometry) ─────────────
 
 /// Rewrite an `EXT_meshopt_compression` document into vanilla glTF: decode
 /// every meshopt buffer view on the CPU ([`meshopt::decode_buffer_view`]),
@@ -713,7 +713,7 @@ pub fn decode_meshopt_views(
     Ok(new_bin)
 }
 
-// ── KHR_texture_basisu preprocessing (T7 — KTX2 tile textures) ───────────────
+// ── KHR_texture_basisu preprocessing (KTX2 tile textures) ────────────────────
 
 /// Rewrite `KHR_texture_basisu` textures so the `gltf` crate (which doesn't
 /// resolve the extension) finds the KTX2 image: move each texture's
@@ -746,12 +746,12 @@ pub fn preprocess_basisu(json: &mut serde_json::Value) {
     }
 }
 
-// ── Feature metadata (T8 — EXT_mesh_features + EXT_structural_metadata) ─────
+// ── Feature metadata (EXT_mesh_features + EXT_structural_metadata) ──────────
 
-/// Decoded `EXT_mesh_features` + `EXT_structural_metadata` context for a tile
-/// (T8). Owns the parsed JSON so `_FEATURE_ID_0` accessors can be read lazily
-/// per primitive against the BIN chunk. `bevy_3d_tiles` builds `TileFeatures`
-/// from it on the inline path; [`prepare_tile`] materializes it into
+/// Decoded `EXT_mesh_features` + `EXT_structural_metadata` context for a tile.
+/// Owns the parsed JSON so `_FEATURE_ID_0` accessors can be read lazily per
+/// primitive against the BIN chunk. `bevy_3d_tiles` builds `TileFeatures` from
+/// it on the inline path; [`prepare_tile`] materializes it into
 /// [`PreparedFeatures`] so the main thread never re-parses the JSON.
 pub struct FeatureCtx {
     json: serde_json::Value,
@@ -1023,12 +1023,12 @@ pub fn read_accessor<const N: usize>(
     Ok(out)
 }
 
-// ── prepare_tile — the S4 hook payload ───────────────────────────────────────
+// ── prepare_tile — the prepared-route hook payload ───────────────────────────
 
-/// Feature-picking side-band of a [`PreparedTile`]: everything the main
-/// thread would otherwise re-split + re-parse the tile JSON to rebuild
+/// Feature-picking side-band of a [`PreparedTile`]: everything the main thread
+/// would otherwise re-split + re-parse the tile JSON to rebuild
 /// (`EXT_mesh_features` + `EXT_structural_metadata`). Rides the worker reply
-/// header, per the offthread-decode plan's "decide before S4 starts" risk item.
+/// header.
 pub struct PreparedFeatures {
     /// featureId → source-node path, shared by all of the tile's primitives.
     pub node_of_feature: Vec<String>,
@@ -1044,12 +1044,13 @@ pub struct PreparedFeatures {
 /// The output of [`prepare_tile`]: a plain (extension-free) glTF binary the
 /// strict `gltf` crate accepts, plus the side-band data extracted on the way.
 ///
-/// Geometry travels one of two ways, and `meshes` says which:
-/// * `meshes: None` (S4) — `glb` holds the prepared container and the consumer
-///   parses it with the `gltf` crate;
-/// * `meshes: Some(_)` (S5, [`prepare_tile_extracting`]) — the geometry is
-///   already typed buffers (base-colour textures still encoded, missing
-///   normals filled), the consumer never parses glTF at all, and `glb`
+/// Geometry travels one of two ways — the two routes of a host prepare hook,
+/// named as in `bevy_3d_tiles::TilePrepareHook` — and `meshes` says which:
+/// * `meshes: None` (the prepared route) — `glb` holds the prepared container
+///   and the consumer parses it with the `gltf` crate;
+/// * `meshes: Some(_)` (the extracted route, [`prepare_tile_extracting`]) — the
+///   geometry is already typed buffers (base-colour textures still encoded,
+///   missing normals filled), the consumer never parses glTF at all, and `glb`
 ///   is **empty** (rebuilding a container nobody reads is pure cost, on both
 ///   the producing thread and the wire).
 pub struct PreparedTile {
@@ -1058,9 +1059,10 @@ pub struct PreparedTile {
     /// rewrite these are the input bytes unchanged; **empty** when `meshes`
     /// carries the geometry instead.
     pub glb: Vec<u8>,
-    /// Extracted geometry (S5). `None` = the consumer decodes `glb` itself,
-    /// either because extraction was not asked for ([`prepare_tile`]) or
-    /// because [`extract_tile_meshes`] declined this tile's content.
+    /// Extracted geometry (the extracted route). `None` = the consumer decodes
+    /// `glb` itself, either because extraction was not asked for
+    /// ([`prepare_tile`]) or because [`extract_tile_meshes`] declined this
+    /// tile's content.
     pub meshes: Option<ExtractedMeshes>,
     /// Rtc offset (ECEF metres) the consumer composes innermost, in the glTF
     /// content frame: `CESIUM_RTC` center, extracted planetary root offset,
@@ -1107,20 +1109,20 @@ pub fn prepare_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
 
 /// [`prepare_would_decline`] for [`prepare_tile_extracting`], relaxed by
 /// exactly one case: a vanilla tile — nothing to rewrite, so nothing for
-/// `prepare_tile` to do — IS worth the trip under S5, because the parse +
-/// attribute collect its geometry extraction saves is the cost S5 exists to
-/// move. Textured vanilla tiles included (since prepare 0.3 they extract, and
-/// the image decode can move with them).
+/// `prepare_tile` to do — IS worth the trip on the extracted route, because the
+/// parse + attribute collect its geometry extraction saves is the cost that
+/// route exists to move. Textured vanilla tiles included (since prepare 0.3
+/// they extract, and the image decode can move with them).
 ///
 /// The relaxation is conditional on the tile being extractable at all: a
 /// vanilla tile [`extract_tile_meshes`] will decline anyway would pay a full
 /// round trip (two worker-side copies of a multi-MB GLB) to get its own bytes
-/// back and decode inline — strictly worse than S4. The one decline reason a
-/// marker scan can see, a surviving `extensionsRequired` (`KHR_mesh_quantization`
-/// and anything else no pass here handles), keeps declining here. The scan
-/// cannot see WHICH extension, so a tile requiring only `KHR_materials_unlit`
-/// (which extracts) declines here too: one skipped extraction, never a wasted
-/// trip.
+/// back and decode inline — strictly worse than [`prepare_would_decline`]'s
+/// answer, which never dispatches it. The one decline reason a marker scan can
+/// see, a surviving `extensionsRequired` (`KHR_mesh_quantization` and anything
+/// else no pass here handles), keeps declining here. The scan cannot see WHICH
+/// extension, so a tile requiring only `KHR_materials_unlit` (which extracts)
+/// declines here too: one skipped extraction, never a wasted trip.
 ///
 /// Ceiling: the decline reasons that live in *values* rather than keys — a
 /// non-TRIANGLES `mode`, a sparse or non-`FLOAT` attribute, a VEC3 `COLOR_0`, a
@@ -1154,10 +1156,10 @@ fn extract_triage(bytes: &[u8], georeferenced: bool, draco_ok: bool) -> bool {
         return false;
     };
     let marks = Marks::scan(json_chunk);
-    // Marker scan, not a parse: `"extensionsRequired":[]` reads as required
-    // and keeps the S4 answer, which is the safe direction (one skipped
-    // extraction, never a wasted trip). Images and textures extract since
-    // prepare 0.3, so they no longer count.
+    // Marker scan, not a parse: `"extensionsRequired":[]` reads as required and
+    // keeps `prepare_would_decline`'s answer, which is the safe direction (one
+    // skipped extraction, never a wasted trip). Images and textures extract
+    // since prepare 0.3, so they no longer count.
     let unextractable = memmem(json_chunk, b"\"extensionsRequired\"");
     let undecodable = if draco_ok {
         marks.splat
@@ -1167,7 +1169,7 @@ fn extract_triage(bytes: &[u8], georeferenced: bool, draco_ok: bool) -> bool {
     // Minimal form of `(undecodable || vanilla-echo) && (unextractable ||
     // undecodable)`: undecodable content always declines; the vanilla
     // non-georeferenced echo declines only when it is also unextractable
-    // (the S5 relaxation — see `extract_would_decline`'s doc).
+    // (the extraction relaxation — see `extract_would_decline`'s doc).
     undecodable || (!georeferenced && marks.vanilla() && unextractable)
 }
 
@@ -1180,8 +1182,8 @@ fn declines(marks: &Marks, georeferenced: bool) -> bool {
 
 /// Run every synchronous, bevy-free decode pass of a tile: marker scan, ONE
 /// JSON parse, meshopt BIN decode, basisu/RTC/planetary rewrites, feature
-/// extraction, ONE container rebuild — the exact movable set of the
-/// offthread-decode plan's S4 seam.
+/// extraction, ONE container rebuild — the exact set the prepared route moves
+/// off-thread.
 ///
 /// * `Ok(Some(_))` — prepared; the caller decodes the vanilla GLB.
 /// * `Ok(None)` — declined: the tile needs a platform decoder (Draco per
@@ -1196,7 +1198,7 @@ pub fn prepare_tile(
     prepare_tile_inner(bytes, georeferenced, None, None)
 }
 
-/// [`prepare_tile`] plus geometry extraction (offthread-decode plan S5): the
+/// [`prepare_tile`] plus geometry extraction (the extracted route): the
 /// same single JSON parse also yields [`ExtractedMeshes`], so the consumer
 /// builds meshes straight from typed buffers and skips the `gltf` parse and
 /// the per-primitive attribute collect entirely (the dominant remaining
@@ -1205,8 +1207,9 @@ pub fn prepare_tile(
 /// Same three outcomes as [`prepare_tile`], plus one shade: extraction is
 /// best-effort. Content it cannot reproduce byte-identically (non-triangle
 /// primitives, quantized attributes, textures the consumer cannot decode — see
-/// [`extract_tile_meshes`]) comes back as an ordinary S4 [`PreparedTile`] with
-/// `meshes: None`, which the consumer decodes exactly as before.
+/// [`extract_tile_meshes`]) comes back as an ordinary prepared-route
+/// [`PreparedTile`] with `meshes: None`, which the consumer decodes exactly as
+/// before.
 ///
 /// [`ExtractOptions::default`]: textures extract, missing normals are filled.
 pub fn prepare_tile_extracting(
@@ -1270,8 +1273,9 @@ fn prepare_tile_inner(
         return Ok(None); // needs a platform decoder/renderer the caller has not got
     }
     // Vanilla and not georeferenced: no rewrite, nothing to extract from the
-    // JSON side-band. Without S5 there is no reason to parse it at all; WITH
-    // S5 the geometry is the whole point of the trip, so it falls through.
+    // JSON side-band. Without extraction there is no reason to parse it at
+    // all; WITH extraction the geometry is the whole point of the trip, so it
+    // falls through.
     // `!marks.draco` guards the echo: `declines` counts the Draco mark, but a
     // tile arriving WITH decoded meshes must splice below, never echo.
     if extract.is_none() && !marks.draco && declines(&marks, georeferenced) {
@@ -1360,9 +1364,10 @@ fn prepare_tile_inner(
     }
     let bin = new_bin.as_deref().or(bin);
 
-    // S5: geometry off the document we already hold. Runs BEFORE the feature
-    // pass (which consumes `json`) and before the container rebuild — when it
-    // succeeds there is no container to rebuild, because nobody will parse one.
+    // Extraction: geometry off the document we already hold. Runs BEFORE the
+    // feature pass (which consumes `json`) and before the container rebuild —
+    // when it succeeds there is no container to rebuild, because nobody will
+    // parse one.
     let (mut meshes, extract_declined) = match extract {
         Some(opts) => match extract::extract_tile_meshes_why(&json, bin, opts)? {
             Ok(m) => (Some(m), None),
@@ -1614,12 +1619,12 @@ mod tests {
         }
     }
 
-    /// The S5 triage relaxes `prepare_would_decline` for vanilla tiles, whose
-    /// geometry extraction is the whole point — textured ones included since
-    /// prepare 0.3, when textures started extracting too. What a marker scan can
-    /// see `extract_tile_meshes` declining (a surviving `extensionsRequired`)
-    /// must still be rejected, or the host pays a full round trip (two
-    /// multi-MB copies) to get its own bytes back.
+    /// The extraction triage relaxes `prepare_would_decline` for vanilla tiles,
+    /// whose geometry extraction is the whole point — textured ones included
+    /// since prepare 0.3, when textures started extracting too. What a marker
+    /// scan can see `extract_tile_meshes` declining (a surviving
+    /// `extensionsRequired`) must still be rejected, or the host pays a full
+    /// round trip (two multi-MB copies) to get its own bytes back.
     #[test]
     fn triage_dispatches_vanilla_textured_tiles() {
         for json in [
@@ -1633,7 +1638,7 @@ mod tests {
             assert!(prepare_would_decline(json.as_bytes(), false), "{json}");
             assert!(
                 !extract_would_decline(json.as_bytes(), false),
-                "S5 dispatches: {json}"
+                "extraction dispatches: {json}"
             );
         }
 
@@ -1657,7 +1662,7 @@ mod tests {
         assert!(!extract_would_decline(basisu, false));
 
         // A meshopt tile declares EXT_meshopt_compression REQUIRED (our tiler
-        // does: `setRequired(true)` in tile_mesh.mjs), so the
+        // does: `setRequired(true)` on the extension), so the
         // `extensionsRequired` marker above DOES match it — it is only the
         // `declines()` short-circuit that saves the dispatch, because a meshopt
         // tile has real prep waiting. It must keep dispatching: the decode
@@ -1823,7 +1828,7 @@ mod tests {
                 .expect("prepared");
             let Some(m) = p.meshes else {
                 panic!(
-                    "declined to S4 (georeferenced {georeferenced}): {:?}",
+                    "declined to the prepared route (georeferenced {georeferenced}): {:?}",
                     p.extract_declined
                 );
             };
@@ -1848,7 +1853,8 @@ mod tests {
             assert_eq!(m.textures[0].wrap_s, TextureWrap::ClampToEdge);
             assert_eq!(p.rtc_center.is_some(), georeferenced, "planetary offset");
         }
-        // The same tile with one more required extension goes S4, and says why.
+        // The same tile with one more required extension takes the prepared
+        // route, and says why.
         json["extensionsRequired"] = serde_json::json!([
             "KHR_draco_mesh_compression",
             "KHR_materials_unlit",
@@ -1858,7 +1864,7 @@ mod tests {
         let p = prepare_tile_extracting_with_draco(&glb, true, vec![quad()])
             .unwrap()
             .expect("prepared");
-        assert!(p.meshes.is_none() && !p.glb.is_empty(), "S4");
+        assert!(p.meshes.is_none() && !p.glb.is_empty(), "prepared route");
         assert_eq!(
             p.extract_declined.as_deref(),
             Some("extensionsRequired: KHR_texture_transform")
@@ -1997,13 +2003,13 @@ mod tests {
 
     /// The worker builds the feature tables (UV1 `[fid, 0]` + the per-triangle
     /// ids, in INDEX order) so the main thread does no per-vertex pass. They
-    /// must equal what the consumer derives from the S4 route's raw per-vertex
-    /// ids, and the raw ids are then not sent a second time.
+    /// must equal what the consumer derives from the prepared route's raw
+    /// per-vertex ids, and the raw ids are then not sent a second time.
     #[test]
     fn extracted_feature_tables_match_inline() {
         let glb = feature_tile(true);
         let s4 = prepare_tile(&glb, false).unwrap().expect("prepared");
-        let mut s4_ids = s4.features.expect("S4 features").vertex_ids;
+        let mut s4_ids = s4.features.expect("prepared-route features").vertex_ids;
         assert_eq!(s4_ids.len(), 1);
         let (key, raw) = s4_ids.remove(0);
         assert_eq!(key, (0, 0));
@@ -2011,7 +2017,7 @@ mod tests {
         let s5 = prepare_tile_extracting(&glb, false)
             .unwrap()
             .expect("prepared");
-        let feats = s5.features.expect("S5 features");
+        let feats = s5.features.expect("extracted-route features");
         assert_eq!(feats.node_of_feature, ["A", "B/c"]);
         assert!(
             feats.vertex_ids.is_empty(),

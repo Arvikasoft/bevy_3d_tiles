@@ -1,7 +1,7 @@
-//! Tile content decode: GLB bytes → renderable data for the three content
-//! types (plan D5) — triangle meshes (T0/T1), point clouds (T2), Gaussian
-//! splats (T3). One decoder, three outputs, feeding the existing renderers
-//! (`Mesh3d`, vendored `PointCloud`, `PlanarGaussian3d`).
+//! Tile content decode: GLB bytes → renderable data for the three content types
+//! — triangle meshes, point clouds, Gaussian splats. One decoder, three
+//! outputs, feeding the existing renderers (`Mesh3d`, vendored `PointCloud`,
+//! `PlanarGaussian3d`).
 //!
 //! Mesh + point tiles decode via the `gltf` crate (no `import` feature — that
 //! would pull the `image` crate; embedded textures decode through Bevy's
@@ -11,8 +11,8 @@
 //! `KHR_gaussian_splatting:ROTATION` etc. — not `_`-prefixed — which
 //! `gltf-json` rejects as invalid semantics at validation. Splat tiles get a
 //! minimal raw JSON+BIN decoder instead ([`decode_splat_gltf`]); our tiler
-//! (D3/D4) emits float accessors and single-node scenes, and the decoder
-//! checks enough structure to fail cleanly on anything else.
+//! emits float accessors and single-node scenes, and the decoder checks enough
+//! structure to fail cleanly on anything else.
 //!
 //! Everything runs inside the loader task: outputs are plain `Send` data the
 //! ECS drain turns into entities. That task is an OS thread on native, but on
@@ -20,7 +20,7 @@
 //! between `.await` points is frame time, which is why this module works hard
 //! to parse the JSON chunk once and rebuild the GLB container at most once.
 //!
-//! Tile GLBs are self-contained by construction (D1/D3: our tilers emit
+//! Tile GLBs are self-contained by construction (our tilers emit
 //! GLB-with-BIN-chunk). External buffer/image URIs are rejected with a clear
 //! error rather than fetched — a tile that needs side files defeats the
 //! one-blob range-read design.
@@ -56,8 +56,8 @@ use bevy_pointcloud::point_cloud::PointCloudData;
 use super::draco;
 
 // The bevy-free CPU half of tile decode lives in the sibling
-// `bevy_3d_tiles_prepare` crate (offthread-decode plan S4) — moved, never
-// copied, and re-exported here so `content::DecodeError` etc. keep working.
+// `bevy_3d_tiles_prepare` crate — moved, never copied, and re-exported here so
+// `content::DecodeError` etc. keep working.
 pub use bevy_3d_tiles_prepare::{
     DecodeError, DecodeStage, ExtractOptions, ExtractedMaterial, ExtractedMeshes,
     ExtractedPrimitive, ExtractedTexture, PreparedTile, TextureWrap, TileImage,
@@ -81,7 +81,7 @@ use crate::api::{TilePrepareFn, TileTextureFn};
 /// startup ([`set_supported_compressed_formats`]) — the adapter never changes,
 /// and the MSAA lesson is latch-don't-toggle. Read by KTX2 transcode in
 /// [`decode_material`]: UASTC transcodes to a member format (BC7…) or, when the
-/// set is empty, to uncompressed RGBA8 — so KTX2 tiles render everywhere (T7).
+/// set is empty, to uncompressed RGBA8 — so KTX2 tiles render everywhere.
 static SUPPORTED_FORMATS: OnceLock<CompressedImageFormats> = OnceLock::new();
 
 /// Latch the adapter's supported compressed formats — call once at startup from
@@ -97,7 +97,7 @@ fn supported_formats() -> CompressedImageFormats {
         .unwrap_or(CompressedImageFormats::NONE)
 }
 
-/// Resolve deferred KTX2 base-color textures (T7): transcode each pending
+/// Resolve deferred KTX2 base-color textures: transcode each pending
 /// `image/ktx2` payload to a GPU `Image`. Async because the transcoder is a JS
 /// shim on wasm; on native it's bevy's basis transcoder. A failed transcode
 /// degrades cleanly to the base-color factor (untextured) — never fatal.
@@ -158,7 +158,7 @@ fn warn_ktx2_once(detail: &str) {
     });
 }
 
-/// Per-feature picking data for one mesh primitive (T8): `EXT_mesh_features`
+/// Per-feature picking data for one mesh primitive: `EXT_mesh_features`
 /// (`_FEATURE_ID_0`) + the tile's `EXT_structural_metadata` property table.
 ///
 /// The per-VERTEX ids live on the mesh itself, as `ATTRIBUTE_UV_1` (`[fid, 0]`),
@@ -185,7 +185,7 @@ pub struct DecodedPrimitive {
     pub transform: Mat4,
     pub mesh: Mesh,
     pub material: DecodedMaterial,
-    /// Feature metadata when the tile carries `EXT_mesh_features` (T8); `None`
+    /// Feature metadata when the tile carries `EXT_mesh_features`; `None`
     /// for plain/scenery tiles. Drives feature → node → twin picking.
     pub features: Option<TileFeatures>,
     /// Axis-aligned bounds `[min, max]` of the mesh positions, in the
@@ -221,7 +221,7 @@ pub struct DecodedMaterial {
     pub base_color: [f32; 4],
     pub base_color_image: Option<Image>,
     /// Raw `image/ktx2` (KHR_texture_basisu) base-color bytes awaiting transcode
-    /// in the async resolve pass (T7) — the transcoder is a JS shim on wasm /
+    /// in the async resolve pass — the transcoder is a JS shim on wasm /
     /// bevy basis on native, neither callable from the sync decode. Mutually
     /// exclusive with `base_color_image`.
     pub base_color_ktx2: Option<Vec<u8>>,
@@ -297,7 +297,8 @@ pub(crate) fn item_cost_bytes(item: &DecodedItem) -> u64 {
     }
 }
 
-/// A fully decoded tile: renderable items plus the side-band data T4 needs.
+/// A fully decoded tile: renderable items plus the side-band data georeferenced
+/// (Google P3DT) tiles need.
 pub struct DecodedTile {
     pub items: Vec<DecodedItem>,
     /// Raw content (GLB) byte length — the memory-pressure proxy the traversal
@@ -308,16 +309,17 @@ pub struct DecodedTile {
     /// data or a f32 transform (planetary magnitudes only cancel in f64).
     pub rtc_center: Option<DVec3>,
     /// glTF `asset.copyright` — aggregated into the attribution overlay
-    /// (required by the Google ToS, plan D7/L-D5).
+    /// (required by the Google ToS).
     pub copyright: Option<String>,
-    /// Per-span decode cost in ms, cut ALONG THE S4 SEAM (offthread-decode
-    /// plan S1(b)) — the boundaries are load-bearing for the S4 go/no-go gate:
+    /// Per-span decode cost in ms, cut ALONG THE PREPARED-ROUTE SEAM (what a
+    /// prepare hook moves off-thread vs what stays) — the boundaries are
+    /// load-bearing for deciding whether moving the prep off-thread pays:
     /// * `[0]` prep — `split_glb` + `Marks::scan` + parse 1
     ///   (`serde_json::from_slice`) + `decode_meshopt_views` +
     ///   `serde_json::to_vec` + `assemble_glb`. Exactly the movable set.
     /// * `[1]` parse 2 — `gltf::Gltf::from_slice`. Its OWN span, never merged
-    ///   into `[0]`: it does not move under S4, and merging would make
-    ///   "span 0 dominant ⇒ build S4" unfalsifiable.
+    ///   into `[0]`: it does not move on the prepared route, and merging would
+    ///   make "span 0 dominant ⇒ move the prep off-thread" unfalsifiable.
     /// * `[2]` geometry — `decode_node`/`decode_primitive` attribute collect +
     ///   `compute_normals` + inline PNG/JPEG decode.
     /// * `[3]` textures — `resolve_pending_textures` (KTX2 transcode). **Wall
@@ -327,11 +329,11 @@ pub struct DecodedTile {
     ///   counted here too. It therefore over-reads, without bound, whenever
     ///   more than one tile is in flight. The CPU truth for transcode is the
     ///   host's `window.__tt_ktx2_stats` counter; span 3 alone must never
-    ///   decide the S2/S4 gate.
+    ///   decide where decode work runs.
     ///
     /// No inflate span: `.3tz` entries are STORED.
     ///
-    /// On the **extracted** route (S5 — the hook returned
+    /// On the **extracted** route (the hook returned
     /// [`PreparedTile::meshes`]) spans `[0]` and `[1]` read 0 because both ran
     /// on the hook's thread, and `[2]` measures ONLY the `Mesh` build from the
     /// hook's buffers (`insert_attribute`, plus `compute_normals` when the hook
@@ -364,9 +366,9 @@ pub async fn decode_tile(bytes: &[u8], georeferenced: bool) -> Result<DecodedTil
     decode_tile_with(bytes, georeferenced, None).await
 }
 
-/// [`decode_tile`], but the prep half (the S4 movable set — container split,
-/// marker scan, JSON parse 1, meshopt BIN decode, rewrites, container
-/// rebuild, feature extraction) can be delegated to a host
+/// [`decode_tile`], but the prep half (what the prepared route moves —
+/// container split, marker scan, JSON parse 1, meshopt BIN decode, rewrites,
+/// container rebuild, feature extraction) can be delegated to a host
 /// [`crate::api::TilePrepareHook`] — typically a Web Worker running
 /// `bevy_3d_tiles_prepare` in its own wasm module.
 ///
@@ -425,10 +427,10 @@ fn warn_prepare_hook_once(detail: &str) {
 /// Decode a hook-prepared tile.
 ///
 /// Two routes, and the hook picks by what it put in [`PreparedTile::meshes`]:
-/// * **extracted (S5)** — typed vertex buffers; only the `Mesh` build (and the
-///   decode of textures that arrived encoded) runs here (span 2), spans 0-1
+/// * **the extracted route** — typed vertex buffers; only the `Mesh` build (and
+///   the decode of textures that arrived encoded) runs here (span 2), spans 0-1
 ///   moved into the hook and read 0;
-/// * **prepared GLB (S4)** — the glb is already vanilla glTF, so spans 1-3
+/// * **the prepared route** — the glb is already vanilla glTF, so spans 1-3
 ///   run here and only span 0 moved.
 ///
 /// A host texture token that does not come out on an item (the decode failed,
@@ -654,9 +656,9 @@ fn rewrite_and_decode(
     json_dirty: bool,
     stage_ms: &mut [f32; 4],
 ) -> Result<Vec<DecodedItem>, DecodeError> {
-    // meshopt first (T6/D12 — what our mesh tiler emits, and POINTS tiles
-    // too): it REBUILDS the BIN, so every later pass reads decoded bytes.
-    // Buffer-view indices are preserved, so nothing else has to move.
+    // meshopt first (what our mesh tiler emits — meshopt, never Draco — and
+    // POINTS tiles too): it REBUILDS the BIN, so every later pass reads decoded
+    // bytes. Buffer-view indices are preserved, so nothing else has to move.
     let mut new_bin: Option<Vec<u8>> = if marks.meshopt {
         let t = Instant::now();
         let b = decode_meshopt_views(&mut json, bin).map_err(DecodeError::meshopt)?;
@@ -669,7 +671,7 @@ fn rewrite_and_decode(
         let current = new_bin.as_deref().or(bin);
         new_bin = Some(splice_draco(&mut json, current, &prims, decoded)?);
     }
-    // KTX2/Basis textures (T7): the gltf crate (1.4) doesn't resolve
+    // KTX2/Basis textures: the gltf crate (1.4) doesn't resolve
     // KHR_texture_basisu — the KTX2 image hangs off the texture *extension*,
     // not the standard `source`. JSON-only; the KTX2 bytes stay put and
     // `decode_material` hands them to the transcoder.
@@ -705,7 +707,7 @@ fn rewrite_and_decode(
         original
     };
 
-    // Feature metadata (T8): EXT_mesh_features + EXT_structural_metadata. The
+    // Feature metadata: EXT_mesh_features + EXT_structural_metadata. The
     // gltf crate models neither, so they read from the JSON we already parsed —
     // post-rewrite, so the property-table + `_FEATURE_ID_0` accessors line up
     // with the rebuilt BIN. Built once per tile; attached per primitive.
@@ -731,7 +733,8 @@ fn decode_vanilla(
     feat: Option<&FeatSource>,
     stage_ms: &mut [f32; 4],
 ) -> Result<Vec<DecodedItem>, DecodeError> {
-    // Span 1 (parse 2): its own cut — this parse does NOT move under S4.
+    // Span 1 (parse 2): its own cut — this parse does NOT move on the
+    // prepared route.
     let t = Instant::now();
     let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| {
         // Diagnostic: a parse failure here means the bytes reaching the gltf
@@ -896,7 +899,7 @@ fn decode_primitive(
 
     // Collected into the SAME buffer struct the off-thread extraction
     // produces, so both routes then run one shared `Mesh` build and cannot
-    // drift (offthread-decode plan S5).
+    // drift.
     let mut buffers = ExtractedPrimitive {
         transform: transform.to_cols_array(),
         mesh_ix,
@@ -914,7 +917,7 @@ fn decode_primitive(
     };
     buffers.bounds = bounds_of(&buffers.positions);
 
-    // T8: per-feature picking — the tables from `_FEATURE_ID_0` (raw JSON) in
+    // Per-feature picking — the tables from `_FEATURE_ID_0` (raw JSON) in
     // the SAME index order as the mesh below.
     let features = match feat {
         Some(ctx) => {
@@ -937,7 +940,7 @@ fn decode_primitive(
 
 /// Build one `Mesh` from plain typed vertex buffers — the ONE place a tile
 /// mesh is assembled, shared by the inline `gltf` route and the off-thread
-/// extracted route (S5). Consumes the buffers (`take`), so nothing is copied:
+/// extracted route. Consumes the buffers (`take`), so nothing is copied:
 /// the feature UV1 the worker built is moved in as-is.
 fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
     let vertex_count = p.positions.len();
@@ -979,7 +982,7 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
         // extracted route the hook already did (`prepare::compute_normals`,
         // pinned bit for bit against this call by
         // `compute_normals_matches_bevy_bit_for_bit`), so this runs only
-        // inline, on the S4 route, or for a hook that turned
+        // inline, on the prepared route, or for a hook that turned
         // `ExtractOptions::normals` off. On wasm the decode task IS the frame
         // thread (`spawn_local`), so it is frame time, counted in
         // `DecodedTile::stage_ms[2]`.
@@ -988,7 +991,7 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
     mesh
 }
 
-/// The extracted route (S5): meshes straight from the hook's typed buffers —
+/// The extracted route: meshes straight from the hook's typed buffers —
 /// no `gltf` parse, no attribute collect, just `Mesh` assembly. Item order is
 /// the extraction's node-traversal order, which is the inline route's.
 ///
@@ -1277,7 +1280,7 @@ fn decode_material(
                     .get(view.offset()..view.offset() + view.length())
                     .ok_or("texture bufferView out of bounds")?;
                 if mime_type == "image/ktx2" {
-                    // T7: defer the UASTC transcode to the async resolve pass
+                    // Defer the UASTC transcode to the async resolve pass
                     // (JS shim on wasm / bevy basis on native) — neither is
                     // callable from this sync decode. The sampler rides
                     // `base_color_sampler` and is stamped on after transcode.
@@ -1606,7 +1609,7 @@ pub(crate) mod tests {
         assert!((rtc - DVec3::new(6_378_137.0, 1000.5, -2000.25)).length() < 1e-9);
     }
 
-    /// S1(b): `Tiles3dDecodeStats::record` accumulates spans across two
+    /// `Tiles3dDecodeStats::record` accumulates spans across two
     /// decoded tiles — count, per-span sums, worst-tile total, averages.
     #[test]
     fn decode_stats_accumulate_across_two_tiles() {
@@ -1889,14 +1892,13 @@ pub(crate) mod tests {
         assert_eq!(g1.rotation.rotation, [0.0, 1.0, 0.0, 0.0]);
     }
 
-    /// End-to-end T6: an `EXT_meshopt_compression` GLB produced by the exact
-    /// writer config (`tile_mesh.mjs`: QUANTIZE method, no quantization → filter
-    /// NONE → lossless) decodes through `decode_meshopt_views` + the strict gltf
-    /// path to **byte-identical** positions/colors and the same triangle set.
-    /// The GLB bytes are captured from `@gltf-transform` + `meshoptimizer` (see
-    /// the BEVY-3D-TILES T6 commit notes).
-    /// The T6 meshopt fixture, shared by the byte-identity test and the
-    /// combined single-pass rewrite test below.
+    /// End-to-end meshopt: an `EXT_meshopt_compression` GLB produced by the
+    /// exact writer config (our tiler's: QUANTIZE method, no quantization →
+    /// filter NONE → lossless) decodes through `decode_meshopt_views` + the
+    /// strict gltf path to **byte-identical** positions/colors and the same
+    /// triangle set. The GLB bytes are captured from `@gltf-transform` +
+    /// `meshoptimizer`. The meshopt fixture, shared by the byte-identity test
+    /// and the combined single-pass rewrite test below.
     fn meshopt_fixture() -> Vec<u8> {
         use base64::Engine;
 
@@ -1978,7 +1980,7 @@ pub(crate) mod tests {
     /// against the wrong chunk.
     /// The meshopt fixture wrapped in copyright + a required `CESIUM_RTC` —
     /// exercises every synchronous rewrite at once. Shared by the one-pass
-    /// test and the S4 hook-parity test.
+    /// test and the prepared-route hook-parity test.
     fn combined_fixture() -> Vec<u8> {
         let fixture = meshopt_fixture();
         let (json, bin) = split_glb(&fixture).unwrap();
@@ -2022,7 +2024,7 @@ pub(crate) mod tests {
         assert_eq!(pos, &MESHOPT_POSITIONS);
     }
 
-    /// T8: a GLB with `EXT_mesh_features` (`_FEATURE_ID_0`, FLOAT) + a minimal
+    /// A GLB with `EXT_mesh_features` (`_FEATURE_ID_0`, FLOAT) + a minimal
     /// `EXT_structural_metadata` STRING property table (the exact shape our
     /// tiler injects). Two triangles, two features; decode must produce a
     /// per-triangle featureId array (index-buffer order) and the node-path
@@ -2265,8 +2267,8 @@ pub(crate) mod tests {
 
     /// A GLB whose base-color texture is a `KHR_texture_basisu` KTX2 (UASTC,
     /// the writer's exact output). GLB captured from `@gltf-transform` +
-    /// `ktx create --encode uastc` (BEVY-3D-TILES T7). Shared by the transcode
-    /// test and the S5 decline lattice (a textured tile takes the S4 route).
+    /// `ktx create --encode uastc`. Shared by the transcode test and the
+    /// extraction decline lattice (a textured tile takes the prepared route).
     fn basisu_fixture() -> Vec<u8> {
         use base64::Engine;
 
@@ -2276,7 +2278,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// T7: the basisu tile decodes through `preprocess_basisu`, the gltf path
+    /// The basisu tile decodes through `preprocess_basisu`, the gltf path
     /// and the async texture-resolve pass. The `gltf` crate can't resolve the
     /// extension and the transcoder isn't callable from the sync decode, so
     /// this proves the source rewrite plus deferred transcode work end-to-end.
@@ -2336,7 +2338,7 @@ pub(crate) mod tests {
         assert_eq!(resident_cost_bytes(&items), 36 + 24 + 12);
     }
 
-    // ── S4 hook seam (offthread-decode plan): hook path ≡ inline path ───────
+    // ── Prepared route: hook path ≡ inline path ─────────────────────────────
 
     /// Canned in-process prepare hook — exactly what the real worker does
     /// minus the postMessage: `bevy_3d_tiles_prepare::prepare_tile`.
@@ -2418,9 +2420,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// S4 gate test (a): the hook path — a canned in-process hook running
-    /// `prepare_tile`, the same function the real worker wasm links — decodes
-    /// the meshopt+RTC+copyright fixture byte-identically to the inline path.
+    /// Prepared-route parity test (a): the hook path — a canned in-process hook
+    /// running `prepare_tile`, the same function the real worker wasm links —
+    /// decodes the meshopt+RTC+copyright fixture byte-identically to the inline
+    /// path.
     #[test]
     fn hook_path_matches_inline_on_meshopt_fixture() {
         use bevy::tasks::block_on;
@@ -2440,9 +2443,9 @@ pub(crate) mod tests {
         assert_tiles_equal(&inline, &hooked);
     }
 
-    /// S4 feature side-band: the hook reply's `PreparedFeatures` — not a JSON
-    /// re-parse — must rebuild picking data identical to the inline path's
-    /// `FeatureCtx` route.
+    /// Prepared-route feature side-band: the hook reply's `PreparedFeatures` —
+    /// not a JSON re-parse — must rebuild picking data identical to the inline
+    /// path's `FeatureCtx` route.
     #[test]
     fn hook_path_consumes_prepared_features() {
         use bevy::tasks::block_on;
@@ -2469,9 +2472,9 @@ pub(crate) mod tests {
         assert_eq!(feature_ids_of(&p.mesh), [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
     }
 
-    /// S4 gate test (b): a declining hook (`Ok(None)` — the Draco/splat
-    /// platform-decoder answer) falls back to the inline path and decodes the
-    /// same tile.
+    /// Prepared-route parity test (b): a declining hook (`Ok(None)` — the
+    /// Draco/splat platform-decoder answer) falls back to the inline path and
+    /// decodes the same tile.
     #[test]
     fn declining_hook_falls_back_inline() {
         use bevy::tasks::block_on;
@@ -2487,9 +2490,9 @@ pub(crate) mod tests {
         assert!(fallen.stage_ms[0] > 0.0, "inline prep span recorded");
     }
 
-    // ── S5 extracted route (offthread-decode plan): buffers ≡ inline ────────
+    // ── Extracted route: buffers ≡ inline ───────────────────────────────────
 
-    /// Canned in-process S5 hook: `prepare_tile_extracting` — prep AND
+    /// Canned in-process extracting hook: `prepare_tile_extracting` — prep AND
     /// geometry extraction, the pair the real worker runs in its own wasm.
     fn canned_extract_hook() -> Arc<crate::api::TilePrepareFn> {
         Arc::new(|bytes, geo| Box::pin(async move { prepare_tile_extracting(bytes, geo) }))
@@ -2597,16 +2600,17 @@ pub(crate) mod tests {
         assert!(p.mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_some());
     }
 
-    /// S5 gate test (a): the extracted route — typed vertex buffers, no glTF
-    /// parse on this side at all — decodes byte-identically to the inline
-    /// path, on the meshopt fixture (COLOR_0, u32 indices, a TRS node) and on
-    /// the meshopt+RTC+copyright+georeferenced one.
+    /// Extracted-route parity test (a): the extracted route — typed vertex
+    /// buffers, no glTF parse on this side at all — decodes byte-identically to
+    /// the inline path, on the meshopt fixture (COLOR_0, u32 indices, a TRS
+    /// node) and on the meshopt+RTC+copyright+georeferenced one.
     ///
     /// Both fixtures declare `EXT_meshopt_compression` **required**, like our
     /// own tiler's output, so the `meshes.is_some()` guards below are also what
     /// pins `decode_meshopt_views`' extension strip: leave the extension in
     /// `extensionsRequired` and `extract_tile_meshes` declines the document,
-    /// silently costing a meshopt scene the whole S5 geometry saving.
+    /// silently costing a meshopt scene the whole extracted-route geometry
+    /// saving.
     #[test]
     fn extracted_route_matches_inline_on_meshopt_fixtures() {
         use bevy::tasks::block_on;
@@ -2665,14 +2669,15 @@ pub(crate) mod tests {
         );
         // Node translation [10,0,0] flattened into the primitive transform.
         assert_eq!(&p.transform[12..15], &[10.0, 0.0, 0.0]);
-        // `prepare_tile` (S4) still returns a container and no buffers.
+        // `prepare_tile` (the prepared route) still returns a container and no
+        // buffers.
         let s4 = prepare_tile(&glb, false).unwrap().expect("accepted");
         assert!(!s4.glb.is_empty() && s4.meshes.is_none());
     }
 
-    /// S5 gate test (c): feature picking survives the extracted route — the
-    /// per-vertex ids ride the same side-band, and the triangle table is built
-    /// from the extracted index buffer.
+    /// Extracted-route parity test (c): feature picking survives the extracted
+    /// route — the per-vertex ids ride the same side-band, and the triangle
+    /// table is built from the extracted index buffer.
     #[test]
     fn extracted_route_keeps_feature_picking() {
         use bevy::tasks::block_on;
@@ -2779,9 +2784,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// `ExtractOptions::textures` off keeps a textured tile on the S4
-    /// container route, where it decodes exactly as inline (the kill switch
-    /// that restores the pre-0.5 texture path).
+    /// `ExtractOptions::textures` off keeps a textured tile on the prepared
+    /// route, where it decodes exactly as inline (the kill switch that restores
+    /// the pre-0.5 texture path).
     #[test]
     fn textures_off_keeps_the_prepared_glb_route() {
         use bevy::tasks::block_on;
@@ -2795,7 +2800,8 @@ pub(crate) mod tests {
             })
         });
         for glb in [basisu_fixture(), textured_fixture()] {
-            // Declined: buffers absent, container present — the S4 payload.
+            // Declined: buffers absent, container present — the prepared-route
+            // payload.
             let prepared =
                 bevy_3d_tiles_prepare::prepare_tile_extracting_with(&glb, false, None, off)
                     .unwrap()
@@ -2804,7 +2810,7 @@ pub(crate) mod tests {
             assert!(!prepared.glb.is_empty(), "declining still prepares the glb");
 
             let inline = block_on(decode_tile(&glb, false)).expect("inline decode");
-            let hooked = block_on(decode_tile_with(&glb, false, Some(&hook))).expect("S4 decode");
+            let hooked = block_on(decode_tile_with(&glb, false, Some(&hook))).expect("hook decode");
             assert_tiles_equal(&inline, &hooked);
             let DecodedItem::Mesh(p) = &hooked.items[0] else {
                 panic!("expected mesh")
@@ -2967,7 +2973,7 @@ pub(crate) mod tests {
 
         let extracts = |glb: &[u8]| match prepare_tile_extracting(glb, false) {
             Ok(Some(p)) => p.meshes.is_some(),
-            other => panic!("prepare must succeed (S4 at worst): {:?}", other.err()),
+            other => panic!("prepare must succeed (glb at worst): {:?}", other.err()),
         };
         let inline_rejects = |glb: &[u8]| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3221,7 +3227,8 @@ pub(crate) mod tests {
                 "{json}"
             );
         }
-        // ...and a vanilla tile is NOT declined by the S5 triage, unlike S4's:
+        // ...and a vanilla tile is NOT declined by the extraction triage,
+        // unlike the prepared route's:
         // its geometry is exactly what the trip is for.
         let vanilla = br#"{"asset":{"version":"2.0"}}"#;
         assert!(bevy_3d_tiles_prepare::prepare_would_decline(vanilla, false));

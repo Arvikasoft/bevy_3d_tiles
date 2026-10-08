@@ -1,30 +1,29 @@
-//! 3D Tiles 1.1 streaming plugin (BEVY-3D-TILES-PLAN, phases T0/T1).
+//! 3D Tiles 1.1 streaming plugin.
 //!
-//! One traversal engine for tiled meshes (T0/T1), point clouds (T2), and
-//! splats (T3) — the generalization of the basemap streamer's proven
-//! selection/fetch machinery from quadtree arithmetic to tileset-defined
-//! trees (plan D5):
+//! One traversal engine for tiled meshes, point clouds, and splats — the
+//! generalization of the basemap streamer's proven selection/fetch machinery
+//! from quadtree arithmetic to tileset-defined trees:
 //!
 //! * [`schema`] — `tileset.json` serde model.
 //! * [`archive`] — `.3tz` ranged reader (tail-scan → `@3dtilesIndex1@` →
-//!   two range-GETs per entry; D2's one-blob-per-asset artifact).
+//!   two range-GETs per entry; one blob per tileset asset).
 //! * [`traversal`] — flattened tile tree + the per-frame selection algorithm
 //!   (per-tile geometricError SSE, zoom-out protection, frame-history
-//!   kicking, Urgent/Normal/Preload priorities — plan §7).
+//!   kicking, Urgent/Normal/Preload priorities).
 //! * [`fetch`] — byte sources (HTTP range / file / memory), Cache-Storage CAS
 //!   for tile entries, abort plumbing, and the never-block-the-executor task
 //!   spawning discipline.
-//! * [`content`] — tile GLB → mesh / point / splat data (plan D5: one
-//!   decoder, three renderers).
+//! * [`content`] — tile GLB → mesh / point / splat data (one decoder, three
+//!   renderers).
 //! * [`pick`] — what a host reads and steers instead of tile meshes, which
 //!   are `RENDER_WORLD`-only: the CPU pick copy on every tile mesh entity
 //!   ([`TilePickMesh`]) and crate-owned feature hiding ([`HiddenTileFeatures`]).
 //! * this module — ECS wiring: per-frame selection, the request scheduler
 //!   (priorities recomputed each frame, out-of-cut requests aborted),
 //!   time-boxed content spawning, visibility cut, eviction, and the
-//!   attach/detach surface the asset loader drives (D6).
+//!   attach/detach surface the host's asset loader drives.
 //!
-//! **Anchoring (T1)**: a tileset attaches to an *anchor entity* — the twin
+//! **Anchoring**: a tileset attaches to an *anchor entity* — the twin
 //! entity (ENU placement + per-frame twin transform) or a preview root. The
 //! tileset's root entity is parented under the anchor with the rendition
 //! correction as its local transform, so tiles inherit world placement the
@@ -61,7 +60,7 @@ pub mod fetch;
 pub mod geo;
 pub mod geodesy;
 mod index_writes;
-// wasm-only KTX2 transcode shim binding (T7); native uses bevy basis-universal.
+// wasm-only KTX2 transcode shim binding; native uses bevy basis-universal.
 #[cfg(target_arch = "wasm32")]
 pub mod ktx2;
 pub mod pick;
@@ -74,7 +73,7 @@ pub mod traversal;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-// The bevy-free CPU half of tile decode (offthread-decode plan S4) — split
+// The bevy-free CPU half of tile decode — split
 // into the sibling `bevy_3d_tiles_prepare` crate so a host worker can link it
 // without bevy. Re-exported wholesale (and `meshopt` at its old path) so
 // nothing downstream breaks.
@@ -109,7 +108,7 @@ use bevy_pointcloud::point_cloud::{PointCloud, PointCloud3d};
 #[cfg(feature = "points")]
 use bevy_pointcloud::point_cloud_material::PointCloudMaterial3d;
 
-/// The Google Photorealistic 3D Tiles root tileset (D7). The org's API key
+/// The Google Photorealistic 3D Tiles root tileset. The org's API key
 /// is appended per request, never stored in the row.
 pub const GOOGLE_P3DT_ROOT_URL: &str = "https://tile.googleapis.com/v1/3dtiles/root.json";
 
@@ -255,19 +254,19 @@ impl Default for Tiles3dConfig {
     }
 }
 
-/// Google P3DT per-layer config, denormalized from the project row (L3).
+/// Google P3DT per-layer config, denormalized from the project row.
 #[derive(Debug, Clone)]
 pub struct P3dtParams {
-    /// Org's Map Tiles API key (client-visible by design, L-D4).
+    /// Org's Map Tiles API key (client-visible by design).
     pub api_key: String,
     /// Hard per-day stop on billable session-opening (root) requests; 0 = no
-    /// client-side cap (D7 guardrail). Sessioned tile requests are unmetered
-    /// by Google and never charged against this.
+    /// client-side cap (a cost guardrail). Sessioned tile requests are
+    /// unmetered by Google and never charged against this.
     pub daily_request_cap: u32,
 }
 
-/// Attach a streaming tileset under an anchor entity (D6 resolver routing —
-/// sent by the asset loader for `"3dtiles"` renditions, and by the layers
+/// Attach a streaming tileset under an anchor entity (resolver routing — sent
+/// by the host's asset loader for `"3dtiles"` renditions, and by the layers
 /// resolver for world layers).
 #[derive(Message, Debug, Clone)]
 pub struct Tiles3dAttach {
@@ -288,7 +287,7 @@ pub struct Tiles3dAttach {
     /// Display label for logs/debug (asset id, twin id…).
     pub label: String,
     /// Google P3DT session config: routes the open through a live, keyed,
-    /// budget-capped, never-cached source (D7). `None` = a normal tileset.
+    /// budget-capped, never-cached source. `None` = a normal tileset.
     pub p3dt: Option<P3dtParams>,
     /// Per-tileset screen-space-error refine threshold (physical px), overriding
     /// [`Tiles3dConfig::sse_threshold_px`] for this set only. `None` = use the
@@ -429,9 +428,9 @@ enum CachedItem {
 enum SetFrame {
     /// Set-local frame: the root entity's `GlobalTransform` (anchor chain ×
     /// rendition correction) places the set; selection pulls the camera into
-    /// set-local coordinates (T1).
+    /// set-local coordinates.
     Anchored,
-    /// Tree coordinates are ECEF (T4): placement = the ENU frame at the
+    /// Tree coordinates are ECEF: placement = the ENU frame at the
     /// project origin, recomputed from absolutes in f64 on origin change
     /// (basemap's rebase model — no accumulated drift; one view, true world
     /// positions — a spaceborne anchor puts ground tiles at their real
@@ -474,7 +473,8 @@ pub struct ActiveTileset {
     /// once the tree has grown ≥50% past this (amortizes its O(tree) cost).
     compact_high_water: usize,
     root_entity: Entity,
-    /// Anchor entity when attached via D6 (None = world-anchored dev set).
+    /// Anchor entity when attached via [`Tiles3dAttach`] (None = world-anchored
+    /// dev set).
     anchor: Option<Entity>,
     /// Owning entity id ([`TileOwner`] tagging + placeholder clearing).
     owner_id: Option<String>,
@@ -489,12 +489,12 @@ pub struct ActiveTileset {
     /// Last logged render-cut shape `(tiles, min_depth, max_depth)` —
     /// transitions are the observable trace of LOD swaps.
     last_cut: Option<(usize, u32, u32)>,
-    /// Placement frame (T4): anchored set-local vs georeferenced ECEF.
+    /// Placement frame: anchored set-local vs georeferenced ECEF.
     frame: SetFrame,
     /// Per-tile `CESIUM_RTC` centers (ECEF) — composed into the spawn
     /// transform in f64, kept for origin rebases.
     rtc_centers: Vec<Option<DVec3>>,
-    /// Aggregated tile `asset.copyright` fragments (P3DT attribution, D7).
+    /// Aggregated tile `asset.copyright` fragments (P3DT attribution).
     copyrights: BTreeSet<String>,
     /// Budget-exhausted warning emitted (log once, not per frame).
     budget_warned: bool,
@@ -522,20 +522,21 @@ pub struct TilesetCredits {
     pub google_visible: bool,
     /// A georeferenced (ECEF) tileset is rendering a cut — it IS the ground,
     /// so the metric ground grid should hide exactly like it does for the
-    /// basemap (read by `basemap::toggle_ground_grid`).
+    /// basemap (read by the host's ground-grid toggle).
     pub ground_covering: bool,
 }
 
-/// Cumulative tile-decode span stats (offthread-decode plan S1(b)) — the
-/// host's F3 instrument. Accumulated per landed tile in `receive_tiles3d`
-/// from [`content::DecodedTile::stage_ms`]; see that field's doc for the
-/// exact span boundaries (they are load-bearing for the S4 go/no-go gate).
+/// Cumulative tile-decode span stats — the host's F3 instrument. Accumulated
+/// per landed tile in `receive_tiles3d` from
+/// [`content::DecodedTile::stage_ms`]; see that field's doc for the exact span
+/// boundaries (they are load-bearing for deciding where decode work runs).
 ///
 /// **Read spans 0–2, never span 3 alone.** Span 3 (tex) is wall time around an
 /// `.await`, so on wasm it absorbs whatever other tiles decode while it is
-/// suspended and over-reads by an unbounded amount. The S2/S4 gate inputs are
-/// spans 0–2 plus `window.__tt_ktx2_stats` (the host's synchronous-transcode
-/// counter), which is the CPU truth for what span 3 is trying to measure.
+/// suspended and over-reads by an unbounded amount. The inputs for that
+/// decision are spans 0–2 plus `window.__tt_ktx2_stats` (the host's
+/// synchronous-transcode counter), which is the CPU truth for what span 3 is
+/// trying to measure.
 #[derive(Resource, Default, Clone, Copy, Debug)]
 pub struct Tiles3dDecodeStats {
     /// Content tiles decoded (subtree grafts don't decode geometry).
@@ -760,7 +761,7 @@ impl Tiles3dSets {
 
     /// Root entity of the **anchored** tileset on `anchor`, whose local
     /// `Transform` is the rendition correction (the asset loader re-applies a
-    /// changed correction to it for live alignment — Phase 1 hot-reload). ECEF
+    /// changed correction to it for live alignment — hot-reload). ECEF
     /// (world-layer / P3DT) sets place themselves via the project origin, so
     /// their root carries no editable correction and is excluded.
     pub fn root_entity_for_anchor(&self, anchor: Entity) -> Option<Entity> {
@@ -900,7 +901,7 @@ impl Plugin for Tiles3dPlugin {
 }
 
 /// Latch the adapter's supported GPU-compressed texture formats for KTX2 tile
-/// decode (T7). `CompressedImageFormatSupport` is inserted into the main world
+/// decode. `CompressedImageFormatSupport` is inserted into the main world
 /// by `RenderPlugin::finish` from the render device; absent on a headless build,
 /// where KTX2/UASTC transcodes to RGBA8 instead. One-shot — the OnceLock ignores
 /// later sets (the latch-don't-toggle discipline from the MSAA work).
@@ -940,7 +941,7 @@ fn init_dev_tileset(channel: Res<Tiles3dChannel>) {
     spawn_tileset_open(spec, None, None, channel.tx.clone());
 }
 
-/// Drain attach/detach messages from the asset loader (D6 routing).
+/// Drain attach/detach messages from the host's asset loader.
 fn apply_attach_detach(
     mut attaches: MessageReader<Tiles3dAttach>,
     mut detaches: MessageReader<Tiles3dDetach>,
@@ -1094,7 +1095,7 @@ async fn open_tileset(
     p3dt: Option<P3dtParams>,
 ) -> Result<(TilesetSource, Box<schema::Tileset>), String> {
     if let Some(p3dt) = p3dt {
-        // Live sessioned endpoint (Google P3DT, D7): keyed, budget-capped,
+        // Live sessioned endpoint (Google P3DT): keyed, budget-capped,
         // never CAS-cached. The root fetch is the billed "root request".
         let budget = BudgetCounter::new(p3dt.daily_request_cap, Some("p3dt"));
         let live = Arc::new(LiveSession::new(spec, p3dt.api_key, budget));
@@ -1141,7 +1142,7 @@ async fn open_tileset(
 // ── ECS drain: tilesets + decoded tile content ───────────────────────────────
 
 /// Drain async results into the ECS, time-boxed: at most
-/// `max_spawns_per_frame` content spawns per frame (§7's main-thread budget);
+/// `max_spawns_per_frame` content spawns per frame (the main-thread budget);
 /// the rest stay queued in the channel for the next frame.
 #[allow(clippy::too_many_arguments)]
 fn receive_tiles3d(
@@ -1190,7 +1191,7 @@ fn receive_tiles3d(
                         }
                     }
                     let anchor = attach.as_ref().map(|a| a.anchor);
-                    // Frame decision (T4): live P3DT and detected
+                    // Frame decision: live P3DT and detected
                     // georeferenced tilesets are ECEF trees placed via the
                     // project origin's ENU frame; everything else is a
                     // local-metres Z-up set placed by its anchor entity.
@@ -1616,11 +1617,11 @@ fn build_tile_cache(
 ) -> Option<(Vec<CachedItem>, u64, u64)> {
     let host_textures = bind_host_textures(images, texture_hook, &mut items)?;
     let anchor = set.owner_id.as_deref();
-    // T8 highlight: a feature tile under an owner resolves its feature paths to
-    // host sub-owners via the host [`TileFeatureResolver`], so the host's
-    // click/hover/outline machinery can treat each feature as its own thing.
-    // `has_resolver` gates the work: with no resolver every feature resolves to
-    // the anchor anyway.
+    // Feature highlight: a feature tile under an owner resolves its feature
+    // paths to host sub-owners via the host [`TileFeatureResolver`], so the
+    // host's click/hover/outline machinery can treat each feature as its own
+    // thing. `has_resolver` gates the work: with no resolver every feature
+    // resolves to the anchor anyway.
     let has_resolver = anchor.is_some() && resolver.0.is_some();
     let mut cache = Vec::with_capacity(items.len());
     let (mut resident, mut cpu) = (0u64, 0u64);
@@ -1670,7 +1671,7 @@ fn build_tile_cache(
                 // tile) was measured at seconds of main-thread hang per refine
                 // wave even capped, while pure-decode tilesets only
                 // micro-stuttered. Per-feature hover highlight moves to
-                // render-state (a feature-id tint — Phase B); selection
+                // render-state (a feature-id tint); selection
                 // correctness is carried entirely by the pick table.
                 let (pick, owner_ix) = match (features, has_resolver) {
                     (Some(f), true) => {
@@ -1959,7 +1960,7 @@ fn spawn_tile_entities(
 
 /// Build a sub-mesh from a subset of `mesh`'s triangles (by triangle ordinal),
 /// remapped to a compact vertex range — splits a feature tile into per-section-
-/// twin pieces at spawn (T8 highlight). Copies POSITION plus whatever of
+/// twin pieces at spawn (feature highlight). Copies POSITION plus whatever of
 /// NORMAL/UV0/COLOR the source carries; `MAIN_WORLD | RENDER_WORLD` usage.
 /// Public since 0.1.9: the lazy-extraction seam for hosts. Per-feature render
 /// styling is a material concern ([`TileFeaturePick`] + the UV1 feature ids),
@@ -2226,7 +2227,7 @@ fn drive_tiles3d(
     // under a saturated pool, and is keyed by set id (not position) so it
     // stays sane when sets detach.
     mut rr_cursors: Local<std::collections::HashMap<u8, u64>>,
-    // Host off-thread prepare hook (S4), and the texture hook a failed decode
+    // Host off-thread prepare hook, and the texture hook a failed decode
     // releases its host tokens through. Cloned out of the Res BEFORE
     // `fetch::spawn_io` — the task must not capture the Res. One tuple param:
     // this system is at bevy's 16-param cap with `points`.
@@ -2405,7 +2406,7 @@ fn drive_tiles3d(
         // correction (the root entity's GlobalTransform — last frame's
         // propagation, fine for streaming decisions); selection runs in
         // set-local coordinates so SSE is exact under rigid/uniform anchor
-        // transforms. ECEF (T4): world_from_set = the ENU frame at the
+        // transforms. ECEF: world_from_set = the ENU frame at the
         // project origin, recomputed from absolutes in f64 — one view, true
         // world positions (the one-view atmosphere model).
         // `planet_radius`: Some(R) for ECEF/globe sets enables horizon culling
@@ -2721,7 +2722,7 @@ fn drive_tiles3d(
         }
 
         // Scheduler. Cancel first: an in-flight tile that fell out of this
-        // frame's wanted loads aborts its network transfer (T1) and frees its
+        // frame's wanted loads aborts its network transfer and frees its
         // slot now; a landed stale payload is dropped by the
         // InFlight/generation guard in `receive_tiles3d`.
         let mut wanted = vec![false; tree.len()];
@@ -2747,7 +2748,7 @@ fn drive_tiles3d(
                 TileSlot::NotLoaded | TileSlot::Failed => {}
             }
         }
-        // Budget guardrail (D7): the cap counts billable session-opening
+        // Budget guardrail: the cap counts billable session-opening
         // (root) requests. A set holding a live session keeps streaming —
         // its tile requests are unmetered by Google — so the hard stop only
         // applies when the cap is spent AND there is no session to ride.
@@ -2938,7 +2939,7 @@ fn drive_tiles3d(
         });
     }
 
-    // Attribution side-band (D7/L-D5): aggregated tile copyrights + the
+    // Attribution side-band (Google ToS): aggregated tile copyrights + the
     // Google-logo flag, consumed by the basemap overlay system. Change-gated
     // to avoid resource churn.
     let mut lines: BTreeSet<&String> = BTreeSet::new();
@@ -2956,8 +2957,8 @@ fn drive_tiles3d(
 
     // Keep the reactive loop awake while content streams (or while a respawn
     // still has to be shown) — without this the idle 200 ms tick would crawl
-    // through the decode queue (the same lesson as `keep_awake_while_loading`
-    // in the asset loader).
+    // through the decode queue (the same lesson as the host asset loader's
+    // keep-awake while loading).
     if any_in_flight || pending_respawns {
         redraw.write(RequestRedraw);
     }
@@ -3117,8 +3118,9 @@ mod tests {
         );
     }
 
-    /// `build_submesh` (T8 highlight) extracts a triangle subset into a compact
-    /// mesh, copying the attributes the source has and remapping indices.
+    /// `build_submesh` (feature highlight) extracts a triangle subset into a
+    /// compact mesh, copying the attributes the source has and remapping
+    /// indices.
     #[test]
     fn build_submesh_extracts_triangle_subset() {
         use bevy::mesh::{Indices, PrimitiveTopology};

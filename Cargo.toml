@@ -20,20 +20,20 @@ all-features = true
 [features]
 default = []
 # Point-cloud tile content (glb POINTS) via bevy_pointcloud_x (our published
-# fork of rlamarche/bevy_pointcloud). Heavy renderer — opt-in (the plan's
-# "feature-gate heavy renderers" rule).
+# fork of rlamarche/bevy_pointcloud). Heavy renderer — opt-in (heavy
+# renderers are feature-gated).
 points = ["dep:bevy_pointcloud"]
 # Gaussian-splat tile content (KHR_gaussian_splatting) via bevy_gaussian_splatting.
 splats = ["dep:bevy_gaussian_splatting"]
 
 [dependencies]
-# The bevy-free CPU half of tile decode (offthread-decode plan S4): container
-# split/rebuild, meshopt codec, basisu/RTC rewrites, feature extraction,
-# `prepare_tile`. Everything is re-exported here so downstream never notices
-# the split; a host's Web Worker links the prepare crate ALONE (no bevy).
+# The bevy-free CPU half of tile decode: container split/rebuild, meshopt
+# codec, basisu/RTC rewrites, feature extraction, `prepare_tile`. Everything
+# is re-exported here so downstream never notices the split; a host's Web
+# Worker links the prepare crate ALONE (no bevy).
 # Version-lockstep: publish both crates together (see prepare/Cargo.toml).
 bevy_3d_tiles_prepare = { version = "0.3.0", path = "prepare" }
-# Exact-pin, in lockstep with bevy-client and bevy_pointcloud_x (which pins
+# Exact-pin, in lockstep with TurboTwin and bevy_pointcloud_x (which pins
 # `=0.19.0` per-subcrate), so no bevy patch release enters the tree without
 # someone deciding to. It is NOT what keeps `Assets<PointCloud>` typechecking
 # across the `points` boundary — cargo unifies caret ranges too, and that only

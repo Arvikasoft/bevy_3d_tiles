@@ -1,4 +1,4 @@
-//! Georeferenced-tileset geometry (BEVY-3D-TILES T4).
+//! Georeferenced-tileset geometry.
 //!
 //! External tilesets (Google P3DT, national open data) arrive in EPSG:4978
 //! (ECEF metres) — `region` bounding volumes in EPSG:4979 geodetic radians,

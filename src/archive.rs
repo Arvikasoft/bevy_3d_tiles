@@ -1,4 +1,4 @@
-//! `.3tz` ranged reader (BEVY-3D-TILES-PLAN T0, decision D2).
+//! `.3tz` ranged reader (a tileset ships as one `.3tz` blob per asset).
 //!
 //! A `.3tz` is a ZIP archive whose **last** entry is an uncompressed index
 //! file `@3dtilesIndex1@`: 24-byte records (`MD5(path)` 16 bytes + u64 LE
@@ -20,10 +20,10 @@
 //!    and disambiguated by the filename in the Local File Header.
 //!
 //! Supported entry compression: stored (0) and DEFLATE (8, via `miniz_oxide`).
-//! Zstandard (93) is rejected with a clear error — our tilers (D3) emit
+//! Zstandard (93) is rejected with a clear error — our tilers emit
 //! stored/deflate only. Inner files are capped at 4 GB by the format (no
 //! per-entry ZIP64 sizes are written by conforming writers); tile content is
-//! MBs, and the tiler asserts the cap at pack time (plan §8).
+//! MBs, and the tiler asserts the cap at pack time.
 
 use md5::{Digest, Md5};
 

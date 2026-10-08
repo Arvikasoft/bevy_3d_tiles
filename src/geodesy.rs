@@ -1,6 +1,6 @@
 //! Minimal WGS84 geodesy — the only math `bevy_3d_tiles` needs to georeference
-//! ECEF/region tilesets. Pure textbook formulas (no external crate, no STDB
-//! dependency); inlined from TurboTwin's `turbotwin_sdk_rs::enu` so the crate is
+//! ECEF/region tilesets. Pure textbook formulas (no external crate, no
+//! database dependency); inlined from TurboTwin's ENU helpers so the crate is
 //! self-contained. Besides geodetic→ECEF and the radius constant used in
 //! horizon culling, [`world_from_ecef`] builds the ECEF→world matrix a
 //! standalone host feeds into [`crate::EcefOrigin`] (a host with its own

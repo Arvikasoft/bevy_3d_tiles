@@ -1,8 +1,8 @@
 //! Platform Draco decode for `KHR_draco_mesh_compression` tile content
-//! (BEVY-3D-TILES T4 — Google Photorealistic 3D Tiles ship Draco-compressed
+//! (Google Photorealistic 3D Tiles ship Draco-compressed
 //! meshes; no published pure-Rust decoder exists yet, 2026-06 survey).
 //!
-//! wasm: calls the `window.__tt_draco_decode` shim (see `index.html`), which
+//! wasm: calls the `window.__tt_draco_decode` shim (see `wasm/shims.js`), which
 //! lazy-loads Google's official `draco_decoder_gltf.wasm` (1.5.7, Apache-2.0)
 //! from the versioned gstatic CDN on first use — the exact decoder CesiumJS
 //! and three.js use for P3DT, so correctness rides Google's own releases.

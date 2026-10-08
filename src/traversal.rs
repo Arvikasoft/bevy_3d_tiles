@@ -1,4 +1,4 @@
-//! Tile-tree model + the per-frame selection algorithm (BEVY-3D-TILES-PLAN §7).
+//! Tile-tree model + the per-frame selection algorithm.
 //!
 //! cesium-native's documented algorithm, adapted to what the basemap streamer
 //! already proved, generalized from quadtree arithmetic to tileset-defined
@@ -7,7 +7,7 @@
 //! 1. DFS from the root; frustum-culled children are skipped.
 //! 2. `sse = geometricError / max(distance_to_bounding_volume, ε) × k_px`.
 //!    Camera **inside** the volume ⇒ distance 0 ⇒ refine — this is what kills
-//!    the whole-file decision-5 degeneracy: the camera is inside the *root*
+//!    the whole-file LOD degeneracy: the camera is inside the *root*
 //!    but outside most *leaves*.
 //! 3. `sse > threshold` → refine into the tileset's children; else render
 //!    this tile. Leaves always render. The threshold is **distance-relaxed**
@@ -24,7 +24,7 @@
 //!    GLBs, so frame-history kicking is the general mechanism.)
 //! 6. Load priorities — Urgent (camera inside volume), then Normal (current
 //!    cut), then Preload (ancestors of the cut) — recomputed every frame; the
-//!    scheduler in `mod.rs` diffs against in-flight requests and drops the
+//!    scheduler in `lib.rs` diffs against in-flight requests and drops the
 //!    ones that fell out of the cut.
 //!
 //! Everything here is pure data + math (no ECS, no IO) so the decision logic
@@ -36,7 +36,7 @@ use super::geo;
 use super::schema::{self, Refine, VolumeKind};
 
 /// Refine when a tile's screen-space error exceeds this many pixels.
-/// CesiumJS's default `maximumScreenSpaceError` — D10 calibration baseline.
+/// CesiumJS's default `maximumScreenSpaceError` — the calibration baseline.
 pub const DEFAULT_SSE_THRESHOLD_PX: f64 = 16.0;
 
 /// Distances under this count as "camera inside the volume" → infinite SSE.
@@ -143,7 +143,7 @@ pub enum TreeFrame {
     /// `world_from_tileset` (usually [`ZUP_TO_BEVY`]) is final, placement
     /// rides the anchor entity. `region` volumes degrade to the parent's.
     Local,
-    /// Georeferenced tileset (T4 — Google P3DT, national open data): tree
+    /// Georeferenced tileset (Google P3DT, national open data): tree
     /// coordinates are **ECEF** (EPSG:4978) f64; `region` volumes convert via
     /// [`geo::region_to_ecef_volume`]. Build with `world_from_tileset =
     /// identity`; the per-frame ENU placement happens in `drive_tiles3d`.
@@ -580,7 +580,7 @@ pub fn select<F: Fn(usize) -> bool>(
 
 /// Priority tie-break key: distance, weighted away from the screen edge —
 /// `dist × (2 − cos θ)` where θ is the angle off the view axis. Center tiles
-/// load first among equals (§7.6). When the camera is within the tile's
+/// load first among equals. When the camera is within the tile's
 /// bounding sphere the center direction says nothing about where its geometry
 /// is on screen (a screen-filling tile can have its center behind the camera),
 /// so the malus is floored there — otherwise such tiles starve in the queue
@@ -658,7 +658,7 @@ fn visit<F: Fn(usize) -> bool>(ctx: &Ctx<'_, F>, i: usize, sel: &mut Selection) 
     // led here was already distance-gated, so far interiors are never reached.)
     let mut wants_refine =
         !node.children.is_empty() && (sse > threshold || node.content_uri.is_none());
-    // Zoom-out protection (§7.4): this tile became the desired cut but its
+    // Zoom-out protection: this tile became the desired cut but its
     // content isn't here yet — keep refining (descendants stay visible) while
     // the coarser content loads.
     if !wants_refine
@@ -914,7 +914,7 @@ mod tests {
         // the same nominal distance but dead ON-axis (and outside its sphere).
         assert_eq!(load_key(&ctx, 1, 7.0), 7.0);
         assert_eq!(load_key(&ctx, 1, 7.0), load_key(&ctx, 2, 7.0));
-        // A genuinely off-axis tile outside its sphere keeps the §7.6
+        // A genuinely off-axis tile outside its sphere keeps the
         // screen-center malus: child 3 (center (-10,0,10)) is ~20 m away,
         // well off the +X view axis.
         assert!(load_key(&ctx, 3, 7.0) > 7.0);

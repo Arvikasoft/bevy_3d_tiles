@@ -6,7 +6,7 @@
 //! [`PointTileMaterial`]); [`TileOwner`] and [`TileGeometry`] run the other way —
 //! the crate stamps them onto spawned geometry for the host to react to.
 //!
-//! In the TurboTwin reference app (`bevy-client`) thin adapter systems map these
+//! In the TurboTwin reference app thin adapter systems map these
 //! to the twin-specific machinery (`ProjectOrigin`, `TwinMeshGroup`, the section
 //! map, the orbit camera) — but a standalone viewer can ignore all of them and
 //! still stream local/relative tilesets.
@@ -63,25 +63,28 @@ pub type TilePrepareFn = dyn for<'a> Fn(
     > + Send
     + Sync;
 
-/// Host-supplied off-thread tile-prepare hook (offthread-decode plan S4/S5).
+/// Host-supplied off-thread tile-prepare hook.
 /// `None` (the default) = today's inline decode, byte-identical. Insert it
 /// *before* `add_plugins(Tiles3dPlugin)` — the same `init_resource` override
 /// contract as `Tiles3dConfig`. The crate clones the `Arc` out per request
 /// and calls it from the fetch task; it never learns what a Worker is.
 ///
 /// A hook returns one of two payload shapes in the same [`PreparedTile`], and
-/// picks by how much work it did off-thread:
-/// * `meshes: None` (S4, [`bevy_3d_tiles_prepare::prepare_tile`]) — prepared
-///   glTF bytes in `glb`; the crate parses them and collects attributes.
-/// * `meshes: Some(_)` (S5,
-///   [`bevy_3d_tiles_prepare::prepare_tile_extracting`]) — typed vertex
-///   buffers; the crate only builds `Mesh` objects and uploads them, and `glb`
-///   is empty. Base-colour textures ride along encoded (decoded here exactly
-///   as inline) or as a host token ([`TileTextureHook`]). Extraction declines
-///   content it cannot reproduce exactly (non-triangle, quantized attributes,
-///   textures the crate cannot decode), which lands back on the first shape —
-///   so a hook can always return the richer call and let the fallbacks sort
-///   it out.
+/// picks by how much work it did off-thread. These are the two *routes* a
+/// hooked tile takes, named the same way throughout the crate:
+/// * **The prepared route** — `meshes: None`
+///   ([`bevy_3d_tiles_prepare::prepare_tile`]): the worker returns a rewritten
+///   (prepared) GLB in `glb`; the main thread parses it and collects
+///   attributes.
+/// * **The extracted route** — `meshes: Some(_)`
+///   ([`bevy_3d_tiles_prepare::prepare_tile_extracting`]): the worker returns
+///   extracted meshes as typed vertex buffers; the crate only builds `Mesh`
+///   objects and uploads them, and `glb` is empty. Base-colour textures ride
+///   along encoded (decoded here exactly as inline) or as a host token
+///   ([`TileTextureHook`]). Extraction declines content it cannot reproduce
+///   exactly (non-triangle, quantized attributes, textures the crate cannot
+///   decode), which lands back on the prepared route — so a hook can always
+///   return the richer call and let the fallbacks sort it out.
 #[derive(Resource, Default, Clone)]
 pub struct TilePrepareHook(pub Option<Arc<TilePrepareFn>>);
 
@@ -230,8 +233,8 @@ pub struct TileGeometry {
     pub set_id: u64,
 }
 
-/// Pick-time feature resolution for a tile mesh entity (`EXT_mesh_features`,
-/// T8) — the Cesium model: ONE mesh per primitive, feature identity resolved
+/// Pick-time feature resolution for a tile mesh entity (`EXT_mesh_features`)
+/// — the Cesium model: ONE mesh per primitive, feature identity resolved
 /// from the HIT, never by splitting geometry per feature. (Splitting was
 /// measured at seconds of main-thread hang per refine wave: a mesh build + GPU
 /// upload per feature per tile. Cesium3DTileFeature works the same way — batch

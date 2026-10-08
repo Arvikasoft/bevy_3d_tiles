@@ -33,10 +33,9 @@ jobs:
         run: |
           cargo test --all-features
           cargo test --manifest-path prepare/Cargo.toml
-      # The whole point of the prepare split (offthread-decode plan S4): the
-      # crate a Web Worker links must never grow a bevy edge. First line of
-      # `cargo tree` is the package itself (whose NAME contains "bevy"), so
-      # skip it before grepping.
+      # The whole point of the prepare split: the crate a Web Worker links must
+      # never grow a bevy edge. First line of `cargo tree` is the package itself
+      # (whose NAME contains "bevy"), so skip it before grepping.
       #
       # `cargo tree` gets its OWN command: steps run under `bash -e` with
       # pipefail OFF, so inside a pipeline its exit status is discarded and a

@@ -1,21 +1,20 @@
-//! Off-thread geometry extraction — the S5 half of the offthread-decode plan.
+//! Off-thread geometry extraction — the extracted route of a host prepare hook.
 //!
-//! [`crate::prepare_tile`] stops at "plain glTF bytes": the consumer still
-//! pays a `gltf::Gltf::from_slice` parse plus a per-primitive attribute
-//! collect on its own thread (measured 2026-07-30 on bevy 0.19: 6-9 ms per
-//! tile on the wasm main thread, worst 137 ms). This module moves both. It
-//! reads the SAME parsed document `prepare_tile` already holds — no second
-//! parse anywhere — and emits plain typed vertex buffers, leaving the
-//! consumer only `Mesh::insert_attribute` + the GPU upload, which cannot move
-//! (plan §5).
+//! [`crate::prepare_tile`] stops at "plain glTF bytes": the consumer still pays
+//! a `gltf::Gltf::from_slice` parse plus a per-primitive attribute collect on
+//! its own thread (measured 2026-07-30 on bevy 0.19: 6-9 ms per tile on the
+//! wasm main thread, worst 137 ms). This module moves both. It reads the SAME
+//! parsed document `prepare_tile` already holds — no second parse anywhere —
+//! and emits plain typed vertex buffers, leaving the consumer only
+//! `Mesh::insert_attribute` + the GPU upload, which cannot move.
 //!
-//! It is deliberately narrow. [`extract_tile_meshes`] **declines**
-//! (`Ok(None)`) anything it cannot reproduce byte-identically to the
-//! consumer's own `gltf`-crate decode — non-triangle content, integer/quantized
-//! attributes, a surviving required extension, any document the `gltf` crate
-//! would reject — and a declined tile takes the S4 route (prepared GLB back,
-//! decoded inline) and renders exactly as it did before. Identical geometry
-//! through every route, or no route at all.
+//! It is deliberately narrow. [`extract_tile_meshes`] **declines** (`Ok(None)`)
+//! anything it cannot reproduce byte-identically to the consumer's own
+//! `gltf`-crate decode — non-triangle content, integer/quantized attributes, a
+//! surviving required extension, any document the `gltf` crate would reject —
+//! and a declined tile takes the prepared route (prepared GLB back, decoded
+//! inline) and renders exactly as it did before. Identical geometry through
+//! every route, or no route at all.
 //!
 //! Textured content extracts too (since prepare 0.3): the base-colour texture
 //! of every material rides [`ExtractedMeshes::textures`] still ENCODED, the
@@ -54,7 +53,7 @@ const IDENTITY: Mat4 = [
 pub struct ExtractOptions {
     /// Extract textured content, carrying base-colour textures in
     /// [`ExtractedMeshes::textures`]. Off = any image or texture declines the
-    /// tile to the S4 route, as before prepare 0.3.
+    /// tile to the prepared route, as before prepare 0.3.
     pub textures: bool,
     /// Fill every primitive that has no `NORMAL` with
     /// [`crate::compute_normals`], so the consumer never computes normals.
@@ -534,8 +533,8 @@ fn extract_materials(
 
 /// One base-colour texture, encoded bytes copied out of the BIN chunk. It
 /// declines where the inline decode errors (a URI image, a buffer outside the
-/// BIN chunk, a MIME type it cannot decode), so the tile goes S4 and inline
-/// reproduces that error.
+/// BIN chunk, a MIME type it cannot decode), so the tile takes the prepared
+/// route and inline reproduces that error.
 fn base_color_texture(
     json: &Value,
     bin: Option<&[u8]>,

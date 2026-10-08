@@ -1,6 +1,6 @@
-//! Serde model for 3D Tiles 1.1 `tileset.json` (BEVY-3D-TILES-PLAN T0).
+//! Serde model for 3D Tiles 1.1 `tileset.json`.
 //!
-//! Deliberately minimal: the fields the runtime traversal needs (D1 — we emit
+//! Deliberately minimal: the fields the runtime traversal needs (we emit
 //! and consume explicit tilesets with glTF content only). Unknown fields are
 //! ignored so externally-produced tilesets (extensions, metadata, implicit
 //! tiling hints) still parse; anything we can't *render* is handled at tree
