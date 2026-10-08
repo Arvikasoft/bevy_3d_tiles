@@ -1071,12 +1071,13 @@ pub struct PreparedTile {
     /// Feature-picking data, when the tile carries `EXT_mesh_features`.
     pub features: Option<PreparedFeatures>,
     /// Why extraction declined this tile (`meshes` is `None` although it was
-    /// asked for): a short, stable phrase naming the first rule the content
-    /// failed, e.g. `"extensionsRequired: KHR_texture_transform"` or
+    /// asked for): a short phrase naming the first rule the content failed,
+    /// e.g. `"extensionsRequired: KHR_texture_transform"` or
     /// `"TEXCOORD_0: integer (normalized) components"`. `None` when the tile
-    /// extracted or extraction was not asked for. Diagnostics only: the tile
-    /// renders the same either way.
-    pub extract_declined: Option<&'static str>,
+    /// extracted or extraction was not asked for. Diagnostic text for a log,
+    /// not a value to match on: the wording may change. The tile renders the
+    /// same either way.
+    pub extract_declined: Option<String>,
 }
 
 /// Would [`prepare_tile`] hand these bytes straight back — either declined
@@ -1858,7 +1859,7 @@ mod tests {
             .expect("prepared");
         assert!(p.meshes.is_none() && !p.glb.is_empty(), "S4");
         assert_eq!(
-            p.extract_declined,
+            p.extract_declined.as_deref(),
             Some("extensionsRequired: KHR_texture_transform")
         );
     }

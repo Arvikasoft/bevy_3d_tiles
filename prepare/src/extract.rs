@@ -268,24 +268,26 @@ pub fn extract_tile_meshes(
 }
 
 /// [`extract_tile_meshes`] with the reason of a decline: `Ok(Err(why))`, `why`
-/// a short stable phrase naming the first rule the document failed.
+/// a short phrase naming the first rule the document failed (diagnostic text).
 pub(crate) fn extract_tile_meshes_why(
     json: &Value,
     bin: Option<&[u8]>,
     opts: ExtractOptions,
-) -> Result<Result<ExtractedMeshes, &'static str>, DecodeError> {
+) -> Result<Result<ExtractedMeshes, String>, DecodeError> {
     match extract(json, bin, opts) {
         Ok(m) => Ok(Ok(m)),
-        Err(Stop::Decline(why)) => Ok(Err(why)),
+        Err(Stop::Decline(why)) => Ok(Err(why.to_owned())),
+        Err(Stop::Required(name)) => Ok(Err(format!("extensionsRequired: {name}"))),
         Err(Stop::Fail(e)) => Err(e),
     }
 }
 
-/// How extraction stops early: a decline with its reason, or a malformed
-/// document.
+/// How extraction stops early: a decline with its reason, a surviving
+/// required extension (by name), or a malformed document.
 #[derive(Debug)]
 enum Stop {
     Decline(&'static str),
+    Required(String),
     Fail(DecodeError),
 }
 use Stop::Decline;
@@ -315,7 +317,8 @@ fn extract(
         .as_array()
         .and_then(|a| a.iter().find(|e| *e != "KHR_materials_unlit"))
     {
-        return Err(Decline(required_why(ext.as_str())));
+        let name = ext.as_str().unwrap_or("an entry that is not a string");
+        return Err(Stop::Required(name.to_owned()));
     }
     let non_empty = |key: &str| json[key].as_array().is_some_and(|a| !a.is_empty());
     if !opts.textures && (non_empty("images") || non_empty("textures")) {
@@ -377,27 +380,6 @@ fn extract(
         return Err(Decline("primitive: material index out of range"));
     }
     Ok(out)
-}
-
-/// The decline reason for a surviving required extension, by name for the
-/// ones the `gltf` crate can be built to accept (the inline route then draws
-/// the tile and only extraction declines it) and for quantized geometry.
-fn required_why(name: Option<&str>) -> &'static str {
-    match name {
-        Some("KHR_texture_transform") => "extensionsRequired: KHR_texture_transform",
-        Some("KHR_mesh_quantization") => "extensionsRequired: KHR_mesh_quantization",
-        Some("KHR_lights_punctual") => "extensionsRequired: KHR_lights_punctual",
-        Some("KHR_materials_pbrSpecularGlossiness") => {
-            "extensionsRequired: KHR_materials_pbrSpecularGlossiness"
-        }
-        Some("KHR_materials_transmission") => "extensionsRequired: KHR_materials_transmission",
-        Some("KHR_materials_ior") => "extensionsRequired: KHR_materials_ior",
-        Some("KHR_materials_emissive_strength") => {
-            "extensionsRequired: KHR_materials_emissive_strength"
-        }
-        Some("EXT_texture_webp") => "extensionsRequired: EXT_texture_webp",
-        _ => "extensionsRequired: another extension",
-    }
 }
 
 /// An OPTIONAL JSON index. `None` = **decline**: present but not an unsigned
@@ -1044,19 +1026,19 @@ mod tests {
         };
         let bin = vec![0u8; 36];
         let ok = doc(serde_json::json!({ "attributes": { "POSITION": 0 } }));
-        assert_eq!(why(&ok, &bin), None, "control extracts");
+        assert_eq!(why(&ok, &bin).as_deref(), None, "control extracts");
 
         let mut required = ok.clone();
         required["extensionsRequired"] =
             serde_json::json!(["KHR_materials_unlit", "KHR_texture_transform"]);
         assert_eq!(
-            why(&required, &bin),
+            why(&required, &bin).as_deref(),
             Some("extensionsRequired: KHR_texture_transform")
         );
         required["extensionsRequired"] = serde_json::json!(["KHR_something_new"]);
         assert_eq!(
-            why(&required, &bin),
-            Some("extensionsRequired: another extension")
+            why(&required, &bin).as_deref(),
+            Some("extensionsRequired: KHR_something_new")
         );
 
         // Accessor 1 is UNSIGNED_SHORT; made VEC2 it is a normalized UV set.
@@ -1064,19 +1046,22 @@ mod tests {
         uv16["accessors"][1]["type"] = serde_json::json!("VEC2");
         uv16["accessors"][1]["normalized"] = serde_json::json!(true);
         assert_eq!(
-            why(&uv16, &bin),
+            why(&uv16, &bin).as_deref(),
             Some("TEXCOORD_0: integer (normalized) components")
         );
         let mut uv_sparse = uv16.clone();
         uv_sparse["accessors"][1]["componentType"] = serde_json::json!(5126);
         uv_sparse["accessors"][1]["sparse"] = serde_json::json!({ "count": 0 });
         assert_eq!(
-            why(&uv_sparse, &bin),
+            why(&uv_sparse, &bin).as_deref(),
             Some("TEXCOORD_0: not a plain FLOAT VEC2 accessor")
         );
 
         let points = doc(serde_json::json!({ "mode": 0, "attributes": { "POSITION": 0 } }));
-        assert_eq!(why(&points, &bin), Some("primitive: mode is not TRIANGLES"));
+        assert_eq!(
+            why(&points, &bin).as_deref(),
+            Some("primitive: mode is not TRIANGLES")
+        );
 
         let off = ExtractOptions {
             textures: false,
@@ -1087,7 +1072,8 @@ mod tests {
         assert_eq!(
             extract_tile_meshes_why(&textured, Some(&bin), off)
                 .unwrap()
-                .err(),
+                .err()
+                .as_deref(),
             Some("textures off (ExtractOptions::textures)")
         );
     }
