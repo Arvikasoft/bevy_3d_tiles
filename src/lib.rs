@@ -2373,7 +2373,7 @@ fn drive_tiles3d(
     // after the loop under the global pool (cross-set fairness).
     let mut candidates: Vec<LoadCandidate> = Vec::new();
     // Hidden-tile respawn budget, GLOBAL across sets like `max_concurrent_loads`
-    // — per set it multiplied by tileset count (23 on a large mining site).
+    // — per set it multiplied by tileset count (tens of sets in a large scene).
     // ponytail: earlier sets in iteration order drain it first; that only delays
     // a later set's refill (its hold keeps the coverage), so the round-robin
     // machinery below is not worth spending on it until a scene actually starves.

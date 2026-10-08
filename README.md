@@ -171,8 +171,8 @@ attribution lines whenever tiles are visible, and bring your own API key
 
 ### 0.4.x → 0.5.0
 
-A performance release for large multi-tileset scenes (measured on a large
-mining site with ~450 resident tiles). Breaking changes:
+A performance release for large multi-tileset scenes (measured on a scene
+with ~450 resident tiles). Breaking changes:
 
 - **Tile meshes are `RenderAssetUsages::RENDER_WORLD`-only.** After their first
   upload `Assets<Mesh>` holds no vertex data for them: `Mesh::attribute()`,
