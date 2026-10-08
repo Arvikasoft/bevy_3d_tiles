@@ -2902,7 +2902,13 @@ pub(crate) mod tests {
         use bevy::tasks::block_on;
 
         set_supported_compressed_formats(CompressedImageFormats::BC);
-        for glb in [textured_fixture(), basisu_fixture()] {
+        // A photorealistic layer lists `KHR_materials_unlit` as REQUIRED on
+        // every tile; this crate's `gltf` enables it, so inline draws it.
+        let unlit_required = textured_fixture_with(|j| {
+            j["extensionsUsed"] = serde_json::json!(["KHR_materials_unlit"]);
+            j["extensionsRequired"] = serde_json::json!(["KHR_materials_unlit"]);
+        });
+        for glb in [textured_fixture(), basisu_fixture(), unlit_required] {
             // The route under test really is the extracted one.
             assert!(
                 prepare_tile_extracting(&glb, false)

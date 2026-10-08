@@ -243,9 +243,10 @@ pub struct ExtractedMeshes {
 /// * `Ok(Some(_))` — the consumer builds meshes straight from the buffers and
 ///   never parses the glTF at all.
 /// * `Ok(None)` — **declined**: content this cannot reproduce byte-identically
-///   (a surviving `extensionsRequired`, non-TRIANGLES primitives, sparse or
-///   non-`FLOAT` vertex attributes, an index past the vertex count, a node
-///   graph deeper than [`MAX_NODE_DEPTH`], a texture setup the `gltf` crate
+///   (a surviving `extensionsRequired` other than `KHR_materials_unlit`,
+///   non-TRIANGLES primitives, sparse or non-`FLOAT` vertex attributes, an
+///   index past the vertex count, a node graph deeper than
+///   [`MAX_NODE_DEPTH`], a texture setup the `gltf` crate
 ///   rejects or the consumer cannot decode, any image or texture at all with
 ///   [`ExtractOptions::textures`] off). Not an error — the caller falls back to
 ///   the glTF-bytes route.
@@ -261,9 +262,14 @@ pub fn extract_tile_meshes(
     opts: ExtractOptions,
 ) -> Result<Option<ExtractedMeshes>, DecodeError> {
     // A surviving required extension is something no pass here handled, and
-    // the `gltf` crate would reject it.
+    // the `gltf` crate would reject it. Except `KHR_materials_unlit`: the
+    // consumer's `gltf` enables it, both routes read it the same way, and a
+    // photorealistic layer requires it on every tile.
     let non_empty = |key: &str| json[key].as_array().is_some_and(|a| !a.is_empty());
-    if non_empty("extensionsRequired")
+    let required_unhandled = json["extensionsRequired"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|e| e != "KHR_materials_unlit"));
+    if required_unhandled
         || (!opts.textures && (non_empty("images") || non_empty("textures")))
         || !textures_valid(json)
     {
@@ -895,6 +901,29 @@ mod tests {
             extract_tile_meshes(&json, None, ExtractOptions::default())
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// `KHR_materials_unlit` may stay required: the consumer's `gltf` enables
+    /// it and both routes read it the same way (a photorealistic layer requires
+    /// it on every tile). Any other surviving required extension still declines.
+    #[test]
+    fn required_unlit_extracts() {
+        let bin = vec![0u8; 36];
+        let mut json = doc(serde_json::json!({ "attributes": { "POSITION": 0 }, "material": 0 }));
+        json["extensionsUsed"] = serde_json::json!(["KHR_materials_unlit"]);
+        json["extensionsRequired"] = serde_json::json!(["KHR_materials_unlit"]);
+        json["materials"] = serde_json::json!([{ "extensions": { "KHR_materials_unlit": {} } }]);
+        let out = extract_tile_meshes(&json, Some(&bin), ExtractOptions::default())
+            .unwrap()
+            .expect("a required KHR_materials_unlit extracts");
+        assert!(out.materials[0].unlit);
+        json["extensionsRequired"] =
+            serde_json::json!(["KHR_materials_unlit", "KHR_texture_transform"]);
+        assert!(
+            extract_tile_meshes(&json, Some(&bin), ExtractOptions::default())
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -1109,7 +1109,10 @@ pub fn prepare_would_decline(bytes: &[u8], georeferenced: bool) -> bool {
 /// round trip (two worker-side copies of a multi-MB GLB) to get its own bytes
 /// back and decode inline — strictly worse than S4. The one decline reason a
 /// marker scan can see, a surviving `extensionsRequired` (`KHR_mesh_quantization`
-/// and anything else no pass here handles), keeps declining here.
+/// and anything else no pass here handles), keeps declining here. The scan
+/// cannot see WHICH extension, so a tile requiring only `KHR_materials_unlit`
+/// (which extracts) declines here too: one skipped extraction, never a wasted
+/// trip.
 ///
 /// Ceiling: the decline reasons that live in *values* rather than keys — a
 /// non-TRIANGLES `mode`, a sparse or non-`FLOAT` attribute, a VEC3 `COLOR_0`, a
@@ -1752,9 +1755,9 @@ mod tests {
 
     /// The shape of a photorealistic-mesh tile (Draco geometry with UVs and no
     /// normals, one JPEG base-colour texture behind a CLAMP sampler, an unlit
-    /// material, a planetary node matrix), written from the format's public
-    /// description: no captured tile bytes. With Draco decoded by the host, it
-    /// extracts: textured, with normals filled in.
+    /// material the document REQUIRES, a planetary node matrix), written from
+    /// the format's public description: no captured tile bytes. With Draco
+    /// decoded by the host, it extracts: textured, with normals filled in.
     #[test]
     fn photorealistic_shaped_textured_draco_tile_extracts() {
         let draco_payload = [0xAAu8; 16];
@@ -1764,7 +1767,7 @@ mod tests {
         let json = serde_json::json!({
             "asset": { "version": "2.0", "copyright": "Data A;Data B" },
             "extensionsUsed": ["KHR_draco_mesh_compression", "KHR_materials_unlit"],
-            "extensionsRequired": ["KHR_draco_mesh_compression"],
+            "extensionsRequired": ["KHR_draco_mesh_compression", "KHR_materials_unlit"],
             "scene": 0, "scenes": [{ "nodes": [0] }],
             "nodes": [{ "mesh": 0, "matrix": [1,0,0,0, 0,0,-1,0, 0,1,0,0, -1.9e6,-5.0e6,3.3e6,1] }],
             "meshes": [{ "primitives": [{
