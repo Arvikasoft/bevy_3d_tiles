@@ -13,7 +13,7 @@ bevy_3d_tiles = { path = ".." }
 # The app/window/render stack the library deliberately doesn't pull.
 # No tonemapping_luts: ~4 MB of embedded KTX2 LUTs; the camera uses a
 # non-LUT tonemapper instead.
-bevy = { version = "=0.19.0", default-features = false, features = [
+bevy = { version = "=0.19.1", default-features = false, features = [
     "default_app",
     "bevy_winit",
     "webgpu",
@@ -24,7 +24,7 @@ console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["Window", "Location", "UrlSearchParams"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-bevy = { version = "=0.19.0", default-features = false, features = ["x11"] }
+bevy = { version = "=0.19.1", default-features = false, features = ["x11"] }
 
 # Size first: the whole point is a small wire download.
 [profile.release]

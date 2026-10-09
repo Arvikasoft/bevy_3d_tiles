@@ -169,6 +169,13 @@ attribution lines whenever tiles are visible, and bring your own API key
 
 ## Upgrading
 
+### 0.5.0 → 0.5.1
+
+- The bevy dependency is a caret range again (`0.19`), so any Bevy 0.19.x
+  resolves. The exact `=0.19.0` pin of 0.3.0–0.5.0 blocked Bevy 0.19.1
+  downstream. No API change. With `points` on Bevy 0.19.1, cargo picks
+  `bevy_pointcloud_x` 0.2.1 or later, which drops the same pin.
+
 ### 0.4.x → 0.5.0
 
 A performance release for large multi-tileset scenes (measured on a scene
