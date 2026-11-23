@@ -1,8 +1,8 @@
 //! Missing vertex normals, computed where the geometry is prepared instead of
 //! on the consumer's frame thread.
 //!
-//! A hand port of bevy_mesh 0.19's `Mesh::compute_normals` (smooth, corner-angle
-//! weighted when indexed; flat when not), together with the glam 0.32 vector
+//! A hand port of bevy_mesh 0.20's `Mesh::compute_normals` (smooth, corner-angle
+//! weighted when indexed; flat when not), together with the glam 0.33 vector
 //! math it calls, so the result is bit-identical: f32 throughout, the same
 //! operation order, no fused multiply-add. `bevy_3d_tiles` pins it against the
 //! real `Mesh::compute_normals` on seeded meshes, so a bevy bump that changes

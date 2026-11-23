@@ -311,7 +311,7 @@ pub struct Tiles3dAttach {
     /// Set it for a set whose meshes something must read in full: an outline
     /// extracted with [`build_submesh`] (it needs real normals), a physics proxy,
     /// bevy_picking's mesh backend, or a bevy_mod_outline `OutlineVolume` on a
-    /// bevy_mod_outline ≤ 0.13 (its pipeline key reads `morph_targets()`). The
+    /// bevy_mod_outline ≤ 0.14 (its pipeline key reads `morph_targets()`). The
     /// main-world indices stay PRISTINE while [`HiddenTileFeatures`] cuts the GPU
     /// copy, so pick through [`TilePickMesh`] even then.
     pub main_world_meshes: bool,
@@ -3625,8 +3625,7 @@ mod tests {
     fn look_away(app: &mut App, camera: Entity, away: bool) {
         let mut frustum = Frustum::default();
         if away {
-            frustum.half_spaces[0] =
-                bevy::math::primitives::HalfSpace::new(Vec4::new(0.0, 0.0, 1.0, -1.0e9));
+            frustum.half_spaces[0] = bevy::shape::HalfSpace::new(Vec4::new(0.0, 0.0, 1.0, -1.0e9));
         }
         *app.world_mut().get_mut::<Frustum>(camera).unwrap() = frustum;
     }
@@ -5132,7 +5131,7 @@ mod tests {
         let want: Vec<Aabb> = items()
             .iter()
             .map(|i| match i {
-                DecodedItem::Mesh(p) => p.mesh.compute_aabb().unwrap(),
+                DecodedItem::Mesh(p) => p.mesh.get_aabb().unwrap(),
                 #[allow(unreachable_patterns)]
                 _ => unreachable!(),
             })

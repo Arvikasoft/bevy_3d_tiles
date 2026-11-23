@@ -98,6 +98,8 @@ jobs:
           cargo check --features points
           cargo check --features splats
           cargo check --target wasm32-unknown-unknown --features points,splats
+          # The web viewer is its own cargo root with exact bevy pins.
+          cargo check --manifest-path viewer/Cargo.toml --target wasm32-unknown-unknown
       - name: package
         run: |
           cargo package --no-verify --manifest-path prepare/Cargo.toml
