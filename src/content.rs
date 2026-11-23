@@ -959,8 +959,8 @@ fn mesh_from_buffers(p: &mut ExtractedPrimitive) -> Mesh {
     // Feature ids ride UV1 so a host material can tint per feature in the
     // fragment stage (see [`TileFeatures`]).
     if let Some(uv1) = p.feature_uv1.take() {
-        // UV1 WITHOUT UV0 is a combination bevy 0.18's pbr shader never
-        // handles: `pbr_fragment.wgsl` declares `var uv` only under
+        // UV1 WITHOUT UV0 is a combination bevy's pbr shader never
+        // handles: `pbr_fragment.wesl` declares `var uv` only under
         // VERTEX_UVS_A but references it in VERTEX_UVS-gated code (defined by
         // EITHER uv set), so pipeline creation fails and the geometry
         // silently vanishes — for ANY StandardMaterial-derived material, not

@@ -164,10 +164,22 @@ attribution lines whenever tiles are visible, and bring your own API key
 
 | `bevy_3d_tiles` | Bevy |
 |---|---|
+| 0.6 | 0.20 |
 | 0.3 – 0.5 | 0.19 |
 | 0.1 – 0.2 | 0.18 |
 
 ## Upgrading
+
+### 0.5.x → 0.6.0
+
+- **Bevy 0.20** (wgpu 30). No `bevy_3d_tiles` API changed — every public type,
+  system set, resource, and component is identical to 0.5.1. The bump is the
+  whole release. The bevy dependency stays a caret range (`0.20`).
+- Optional-feature deps move with it: `points` → `bevy_pointcloud_x` 0.3,
+  `splats` → `bevy_gaussian_splatting` 9.
+- The minimum Rust version is **1.97.1**, the MSRV of Bevy 0.20.
+- bevy_mod_outline 0.14 still reads `morph_targets()` in its pipeline key, so
+  the `main_world_meshes: true` advice of 0.5.0 holds for it too.
 
 ### 0.5.0 → 0.5.1
 
@@ -192,7 +204,7 @@ with ~450 resident tiles). Breaking changes:
   `build_submesh`, a physics proxy, bevy_picking); even then the main-world
   indices stay pristine while hidden features are cut on the GPU only, so pick
   through `TilePickMesh`.
-- **bevy_mod_outline ≤ 0.13 panics on a `RENDER_WORLD` tile entity that carries
+- **bevy_mod_outline ≤ 0.14 panics on a `RENDER_WORLD` tile entity that carries
   an `OutlineVolume`** (its pipeline key calls `morph_targets()`). Use
   `main_world_meshes: true` for those sets, or a bevy_mod_outline that reads
   `try_morph_targets()`.
