@@ -770,7 +770,7 @@ impl Tiles3dSets {
     }
 
     /// Id of the tileset attached to `anchor`, in **any** frame (anchored or
-    /// ECEF/world-layer). It is the same id the crate stamps onto every piece of
+    /// ECEF/world-layer). It is the same id the crate puts on every piece of
     /// that set's geometry as [`TileGeometry::set_id`], so a host can key its own
     /// per-tileset state — materials, clip layers, styling, render layers — off
     /// the anchor it attached and then apply it to the spawned content.

@@ -109,7 +109,7 @@ async fn resolve_pending_textures(items: &mut [DecodedItem]) {
         };
         match transcode_ktx2(&bytes).await {
             Ok(mut img) => {
-                // Stamp the glTF wrap/filter sampler onto the transcoded image
+                // Set the glTF wrap/filter sampler on the transcoded image
                 // (the transcoders return `ImageSampler::Default` = ClampToEdge).
                 img.sampler = ImageSampler::Descriptor(p.material.base_color_sampler.clone());
                 p.material.base_color_image = Some(img);
@@ -227,7 +227,7 @@ pub struct DecodedMaterial {
     pub base_color_ktx2: Option<Vec<u8>>,
     /// Wrap/filter sampler for the base-color texture, read from the glTF
     /// sampler (defaulting to REPEAT per the glTF spec). Carried separately so
-    /// the deferred KTX2 transcode can stamp it onto its `Image` too.
+    /// the deferred KTX2 transcode can set it on its `Image` too.
     pub base_color_sampler: ImageSamplerDescriptor,
     pub metallic: f32,
     pub roughness: f32,
