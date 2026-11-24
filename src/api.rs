@@ -4,7 +4,7 @@
 //! SpacetimeDB) coupling. Most are supplied by the host and read by the crate
 //! ([`EcefOrigin`], [`TileFeatureResolver`], [`Tiles3dCamera`],
 //! [`PointTileMaterial`]); [`TileOwner`] and [`TileGeometry`] run the other way —
-//! the crate stamps them onto spawned geometry for the host to react to.
+//! the crate puts them on spawned geometry for the host to react to.
 //!
 //! In the TurboTwin reference app thin adapter systems map these
 //! to the twin-specific machinery (`ProjectOrigin`, `TwinMeshGroup`, the section
@@ -335,7 +335,7 @@ impl Default for TilePriorityClass {
 /// tuned for a twin (texel≈pixel on a machine you are inspecting) is far too
 /// fine for ground context: measured 2026-07-30 on a settled close orbit, the
 /// ground layers alone put ~4.7 k meshes / 9 Mtri into the main pass, and draw
-/// submission — not triangles — was the frame cost. Stamp `TileSseMultiplier`
+/// submission — not triangles — was the frame cost. Put `TileSseMultiplier`
 /// (with `TilePriorityClass(0)`) on ground/background anchors to buy that back;
 /// the twins keep the sharp default.
 ///
